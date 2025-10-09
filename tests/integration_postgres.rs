@@ -1,6 +1,6 @@
 use anyhow::Result;
 use rillflow::{Event, Expected, Store, projections::ProjectionHandler};
-use serde_json::{Value, json};
+use serde_json::Value;
 use sqlx::{Postgres, Transaction};
 use testcontainers::{
     GenericImage, ImageExt,
