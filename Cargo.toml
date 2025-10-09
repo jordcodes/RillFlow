@@ -1,6 +1,6 @@
 [package]
 name = "rillflow"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Rillflow — a lightweight document + event store for Rust, powered by Postgres."
@@ -10,6 +10,17 @@ documentation = "https://docs.rs/rillflow"
 readme = "README.md"
 keywords = ["postgres", "event-sourcing", "jsonb", "cqrs", "database"]
 categories = ["database", "asynchronous", "data-structures"]
+include = [
+    "Cargo.toml",
+    "README.md",
+    "MIGRATIONS.md",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+    "sql/**",
+    "src/**",
+    "examples/**",
+    "tests/**",
+]
 
 [features]
 default = ["postgres"]
