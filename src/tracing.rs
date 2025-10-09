@@ -53,3 +53,27 @@ impl TraceSink {
         diagram
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::TraceSink;
+    use serde_json::json;
+
+    #[test]
+    fn mermaid_formats_sequence() {
+        let sink = TraceSink::new(4);
+
+        sink.record("t1", "HTTP_IN", "api", json!({"path": "/customers"}));
+        sink.record("t1", "APPEND", "store", json!({"stream": "cust"}));
+        sink.record("t1", "PROJECT", "projection", json!({"name": "read_model"}));
+
+        let mermaid = sink.mermaid("t1");
+
+        assert!(mermaid.contains("sequenceDiagram"));
+        assert!(mermaid.contains("participant HTTP as HTTP"));
+        assert!(mermaid.contains("HTTP->>CMD"));
+        assert!(mermaid.contains("CMD->>ES"));
+        assert!(mermaid.contains("ES-->>PR"));
+        assert!(mermaid.contains("\"path\":\"/customers\""));
+    }
+}
