@@ -2,9 +2,12 @@ use serde_json::json;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
+type TraceEntry = (String, String, serde_json::Value);
+type TraceBuffer = HashMap<String, VecDeque<TraceEntry>>;
+
 #[derive(Clone, Default)]
 pub struct TraceSink {
-    inner: Arc<Mutex<HashMap<String, VecDeque<(String, String, serde_json::Value)>>>>,
+    inner: Arc<Mutex<TraceBuffer>>,
     cap: usize,
 }
 
