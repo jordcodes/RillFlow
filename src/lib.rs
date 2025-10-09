@@ -4,6 +4,7 @@ pub mod documents;
 mod error;
 pub mod events;
 pub mod projections;
+pub mod query;
 pub mod store;
 pub mod testing;
 pub mod tracing;

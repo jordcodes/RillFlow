@@ -22,10 +22,39 @@ cargo test --test integration_postgres
 ## Features
 
 - JSONB document store with optimistic versioning
+- LINQ-like document query DSL (filters, sorting, paging, projections)
 - Event streams with expected-version checks
 - Projection replay and checkpointing helpers
 - Developer tracing breadcrumbs with Mermaid export (dev-only)
 - Integration test harness using Testcontainers (Docker required)
+
+### Document Queries
+
+```rust
+use rillflow::{
+    Store,
+    query::{Predicate, SortDirection},
+};
+
+#[derive(serde::Deserialize)]
+struct Customer {
+    email: String,
+    status: String,
+}
+
+async fn active_customers(store: &Store) -> rillflow::Result<Vec<Customer>> {
+    store
+        .docs()
+        .query::<Customer>()
+        .filter(Predicate::eq("status", "active"))
+        .order_by("email", SortDirection::Asc)
+        .page(1, 25)
+        .fetch_all()
+        .await
+}
+```
+
+See `MIGRATIONS.md` for guidance on adding workload-specific JSONB indexes for query performance.
 
 ## License
 

@@ -1,4 +1,4 @@
-use crate::Result;
+use crate::{Result, query::DocumentQuery};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sqlx::PgPool;
@@ -67,5 +67,9 @@ impl Documents {
                 .await?;
 
         Ok(value.flatten())
+    }
+
+    pub fn query<T>(&self) -> DocumentQuery<T> {
+        DocumentQuery::new(self.pool.clone())
     }
 }

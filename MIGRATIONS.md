@@ -23,3 +23,22 @@ The `sql/0001_init.sql` migration creates:
 
 Ensure your application runs this migration before executing any Rillflow APIs.
 
+### Indexing Guidance
+
+The core migration only creates a GIN index on the `doc` column. This keeps the base schema portable while enabling broad JSONB containment lookups. For production workloads you should add expression indexes tailored to the fields you query most often. Examples:
+
+```
+-- Case-insensitive email lookups
+create index concurrently if not exists docs_email_idx
+    on docs ((lower(doc->>'email')));
+
+-- Numeric range scans on `doc->>'created_at'` stored as timestamptz
+create index concurrently if not exists docs_created_at_idx
+    on docs (((doc->>'created_at')::timestamptz));
+
+-- Array membership checks
+create index concurrently if not exists docs_tags_idx
+    on docs using gin ((doc->'tags'));
+```
+
+Apply these via your own migration files after running the base schema.

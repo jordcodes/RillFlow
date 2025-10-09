@@ -1,5 +1,9 @@
 use anyhow::Result;
-use rillflow::{Event, Expected, Store, projections::ProjectionHandler};
+use rillflow::{
+    Event, Expected, Store,
+    projections::ProjectionHandler,
+    query::{Predicate, SortDirection},
+};
 use serde_json::Value;
 use sqlx::{Postgres, Transaction};
 use testcontainers::{
@@ -89,6 +93,128 @@ async fn roundtrip() -> Result<()> {
         .fetch_one(store.pool())
         .await?;
     assert_eq!(count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn document_query_api_covers_indexed_and_non_indexed_fields() -> Result<()> {
+    let image = GenericImage::new("postgres", "16-alpine")
+        .with_exposed_port(5432.tcp())
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres");
+
+    let container = image.start().await?;
+    let host = container.get_host().await?;
+    let port = container.get_host_port_ipv4(5432).await?;
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres?sslmode=disable");
+
+    let store = Store::connect(&url).await?;
+    rillflow::testing::migrate_core_schema(store.pool()).await?;
+
+    #[derive(serde::Serialize, serde::Deserialize, Clone)]
+    struct Customer {
+        id: Uuid,
+        email: String,
+        first_name: String,
+        last_name: String,
+        age: u32,
+        tags: Vec<String>,
+        active: bool,
+        balance: f64,
+    }
+
+    let base = vec![
+        Customer {
+            id: Uuid::new_v4(),
+            email: "ava@example.com".into(),
+            first_name: "Ava".into(),
+            last_name: "Stone".into(),
+            age: 28,
+            tags: vec!["vip".into(), "beta".into()],
+            active: true,
+            balance: 120.5,
+        },
+        Customer {
+            id: Uuid::new_v4(),
+            email: "li@example.com".into(),
+            first_name: "Li".into(),
+            last_name: "Wei".into(),
+            age: 35,
+            tags: vec!["standard".into()],
+            active: true,
+            balance: 80.0,
+        },
+        Customer {
+            id: Uuid::new_v4(),
+            email: "sam@example.com".into(),
+            first_name: "Sam".into(),
+            last_name: "Taylor".into(),
+            age: 42,
+            tags: vec!["vip".into(), "newsletter".into()],
+            active: false,
+            balance: -15.75,
+        },
+    ];
+
+    for customer in &base {
+        store.docs().upsert(&customer.id, customer).await?;
+    }
+
+    // Simulate consumer-provided index for email lookups.
+    sqlx::query("create index if not exists docs_email_idx on docs ((lower(doc->>'email')))")
+        .execute(store.pool())
+        .await?;
+
+    let vip_customers = store
+        .docs()
+        .query::<serde_json::Value>()
+        .filter(Predicate::eq("active", true))
+        .filter(Predicate::contains("tags", serde_json::json!(["vip"])))
+        .order_by_number("balance", SortDirection::Desc)
+        .select_fields(&[
+            ("email", "email"),
+            ("vip", "active"),
+            ("balance", "balance"),
+        ])
+        .fetch_all()
+        .await?;
+
+    assert_eq!(vip_customers.len(), 1);
+    assert_eq!(vip_customers[0]["email"], "ava@example.com");
+
+    let mut extra = Vec::new();
+    for i in 0..30 {
+        extra.push(Customer {
+            id: Uuid::new_v4(),
+            email: format!("user{i}@example.com"),
+            first_name: format!("User{i}"),
+            last_name: "Example".into(),
+            age: 25 + i,
+            tags: vec!["bulk".into()],
+            active: i % 2 == 0,
+            balance: 60.0 + i as f64,
+        });
+    }
+
+    for customer in &extra {
+        store.docs().upsert(&customer.id, customer).await?;
+    }
+
+    let paged = store
+        .docs()
+        .query::<Customer>()
+        .filter(Predicate::gt("age", 30.0))
+        .order_by("last_name", SortDirection::Asc)
+        .page(2, 5)
+        .fetch_all()
+        .await?;
+
+    assert_eq!(paged.len(), 5);
+    assert!(paged.iter().all(|c| c.age > 30));
 
     Ok(())
 }
