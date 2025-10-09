@@ -77,7 +77,7 @@ impl JsonPath {
                         segments.push(std::mem::take(&mut buffer));
                     }
                     let mut index = String::new();
-                    while let Some(next) = chars.next() {
+                    for next in chars.by_ref() {
                         if next == ']' {
                             break;
                         }
@@ -216,7 +216,7 @@ impl Predicate {
         Self::Exists(path.into())
     }
 
-    pub fn not(predicate: Predicate) -> Self {
+    pub fn negate(predicate: Predicate) -> Self {
         Self::Not(Box::new(predicate))
     }
 
