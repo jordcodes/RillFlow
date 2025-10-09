@@ -8,6 +8,9 @@ Rillflow stores its schema migrations in `sql/`. Apply them with your preferred 
 cargo install sqlx-cli --no-default-features --features rustls,postgres
 export DATABASE_URL=postgres://postgres:postgres@localhost:5432/rillflow_dev
 cargo sqlx migrate run
+
+# optional: run integration tests (requires Docker)
+cargo test --test integration_postgres
 ```
 
 ## First Migration

@@ -22,4 +22,3 @@ pub async fn ensure_counters_table(pool: &Pool<Postgres>) -> Result<()> {
     .await?;
     Ok(())
 }
-

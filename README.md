@@ -12,12 +12,20 @@ cargo sqlx migrate run
 cargo run --example quickstart
 ```
 
+### Integration Tests (requires Docker)
+
+```bash
+docker --version    # ensure Docker daemon is running
+cargo test --test integration_postgres
+```
+
 ## Features
 
 - JSONB document store with optimistic versioning
 - Event streams with expected-version checks
 - Projection replay and checkpointing helpers
 - Developer tracing breadcrumbs with Mermaid export (dev-only)
+- Integration test harness using Testcontainers (Docker required)
 
 ## License
 
