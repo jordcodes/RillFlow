@@ -1,4 +1,7 @@
-use crate::{Result, query::DocumentQuery};
+use crate::{
+    Result,
+    query::{CompiledQuery, DocumentQuery, DocumentQueryContext},
+};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sqlx::PgPool;
@@ -71,5 +74,20 @@ impl Documents {
 
     pub fn query<T>(&self) -> DocumentQuery<T> {
         DocumentQuery::new(self.pool.clone())
+    }
+
+    pub async fn execute_compiled<Q, R>(&self, query: Q) -> Result<Vec<R>>
+    where
+        Q: CompiledQuery<R>,
+        R: serde::de::DeserializeOwned,
+    {
+        let mut ctx = DocumentQueryContext::new();
+        query.configure(&mut ctx);
+        let (pool, mut builder) = ctx.into_spec().build_query(self.pool.clone());
+        let query = builder.build_query_as::<(serde_json::Value,)>();
+        let rows = query.fetch_all(&pool).await?;
+        rows.into_iter()
+            .map(|(value,)| serde_json::from_value(value).map_err(Into::into))
+            .collect()
     }
 }

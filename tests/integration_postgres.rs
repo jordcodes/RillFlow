@@ -2,7 +2,7 @@ use anyhow::Result;
 use rillflow::{
     Event, Expected, Store,
     projections::ProjectionHandler,
-    query::{Predicate, SortDirection},
+    query::{CompiledQuery, DocumentQueryContext, Predicate, SortDirection},
 };
 use serde_json::Value;
 use sqlx::{Postgres, Transaction};
@@ -215,6 +215,21 @@ async fn document_query_api_covers_indexed_and_non_indexed_fields() -> Result<()
 
     assert_eq!(paged.len(), 5);
     assert!(paged.iter().all(|c| c.age > 30));
+
+    struct VipCustomers;
+
+    impl CompiledQuery<serde_json::Value> for VipCustomers {
+        fn configure(&self, ctx: &mut DocumentQueryContext) {
+            ctx.filter(Predicate::eq("active", true))
+                .filter(Predicate::contains("tags", serde_json::json!(["vip"])))
+                .order_by("first_name", SortDirection::Asc)
+                .select_fields(&[("email", "email"), ("status", "active")]);
+        }
+    }
+
+    let compiled = store.docs().execute_compiled(VipCustomers).await?;
+    assert_eq!(compiled.len(), 1);
+    assert_eq!(compiled[0]["email"], "ava@example.com");
 
     Ok(())
 }

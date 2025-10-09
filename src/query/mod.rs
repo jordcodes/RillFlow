@@ -23,25 +23,25 @@ impl SortDirection {
 }
 
 #[derive(Clone, Debug)]
-enum SortKind {
+pub(crate) enum SortKind {
     Text(SortDirection),
     Numeric(SortDirection),
 }
 
 #[derive(Clone, Debug)]
-struct SortSpec {
+pub(crate) struct SortSpec {
     path: JsonPath,
     kind: SortKind,
 }
 
 #[derive(Clone, Debug)]
-enum Selection {
+pub(crate) enum Selection {
     Document,
     Fields(Vec<FieldProjection>),
 }
 
 #[derive(Clone, Debug)]
-struct FieldProjection {
+pub(crate) struct FieldProjection {
     alias: String,
     path: JsonPath,
 }
@@ -53,6 +53,261 @@ impl FieldProjection {
             path: path.into(),
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct QuerySpec {
+    selection: Selection,
+    filters: Vec<Predicate>,
+    sort: Vec<SortSpec>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+impl Default for QuerySpec {
+    fn default() -> Self {
+        Self {
+            selection: Selection::Document,
+            filters: Vec::new(),
+            sort: Vec::new(),
+            limit: None,
+            offset: None,
+        }
+    }
+}
+
+impl QuerySpec {
+    pub(crate) fn push_filter(&mut self, predicate: Predicate) {
+        self.filters.push(predicate);
+    }
+
+    pub(crate) fn filters(&self) -> &[Predicate] {
+        &self.filters
+    }
+
+    pub(crate) fn push_sort(&mut self, spec: SortSpec) {
+        self.sort.push(spec);
+    }
+
+    pub(crate) fn sort(&self) -> &[SortSpec] {
+        &self.sort
+    }
+
+    pub(crate) fn set_selection(&mut self, selection: Selection) {
+        self.selection = selection;
+    }
+
+    pub(crate) fn selection(&self) -> &Selection {
+        &self.selection
+    }
+
+    pub(crate) fn selection_mut(&mut self) -> &mut Selection {
+        &mut self.selection
+    }
+
+    pub(crate) fn set_limit(&mut self, limit: Option<i64>) {
+        self.limit = limit;
+    }
+
+    pub(crate) fn limit(&self) -> Option<i64> {
+        self.limit
+    }
+
+    pub(crate) fn set_offset(&mut self, offset: Option<i64>) {
+        self.offset = offset;
+    }
+
+    pub(crate) fn offset(&self) -> Option<i64> {
+        self.offset
+    }
+
+    pub(crate) fn build_query(self, pool: PgPool) -> (PgPool, QueryBuilder<'static, Postgres>) {
+        let QuerySpec {
+            selection,
+            filters,
+            sort,
+            limit,
+            offset,
+        } = self;
+
+        let mut builder = QueryBuilder::new("select ");
+
+        match selection {
+            Selection::Document => {
+                builder.push("doc");
+            }
+            Selection::Fields(fields) => {
+                if fields.is_empty() {
+                    builder.push("doc");
+                } else {
+                    builder.push("jsonb_build_object(");
+                    let mut first = true;
+                    for field in fields {
+                        if !first {
+                            builder.push(", ");
+                        }
+                        first = false;
+                        builder.push_bind(field.alias);
+                        builder.push(", ");
+                        push_json_expr(&mut builder, &field.path);
+                    }
+                    builder.push(") as doc");
+                }
+            }
+        }
+
+        builder.push(" from docs");
+
+        if !filters.is_empty() {
+            builder.push(" where ");
+            let mut iter = filters.into_iter();
+            if let Some(first) = iter.next() {
+                first.push_sql(&mut builder);
+            }
+            for predicate in iter {
+                builder.push(" and ");
+                predicate.push_sql(&mut builder);
+            }
+        }
+
+        if !sort.is_empty() {
+            builder.push(" order by ");
+            let mut first = true;
+            for spec in sort {
+                if !first {
+                    builder.push(", ");
+                }
+                first = false;
+                match spec.kind {
+                    SortKind::Text(direction) => {
+                        push_text_expr(&mut builder, &spec.path);
+                        builder.push(" ");
+                        builder.push(direction.as_str());
+                    }
+                    SortKind::Numeric(direction) => {
+                        builder.push("((");
+                        push_text_expr(&mut builder, &spec.path);
+                        builder.push(")::numeric) ");
+                        builder.push(direction.as_str());
+                    }
+                }
+            }
+        }
+
+        if let Some(limit) = limit {
+            builder.push(" limit ");
+            builder.push_bind(limit);
+        }
+
+        if let Some(offset) = offset {
+            builder.push(" offset ");
+            builder.push_bind(offset);
+        }
+
+        (pool, builder)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct DocumentQueryContext {
+    spec: QuerySpec,
+}
+
+impl DocumentQueryContext {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn filter(&mut self, predicate: Predicate) -> &mut Self {
+        self.spec.push_filter(predicate);
+        self
+    }
+
+    pub fn filter_if(
+        &mut self,
+        condition: bool,
+        predicate: impl FnOnce() -> Predicate,
+    ) -> &mut Self {
+        if condition {
+            self.spec.push_filter(predicate());
+        }
+        self
+    }
+
+    pub fn order_by(&mut self, path: impl Into<JsonPath>, direction: SortDirection) -> &mut Self {
+        self.spec.push_sort(SortSpec {
+            path: path.into(),
+            kind: SortKind::Text(direction),
+        });
+        self
+    }
+
+    pub fn order_by_number(
+        &mut self,
+        path: impl Into<JsonPath>,
+        direction: SortDirection,
+    ) -> &mut Self {
+        self.spec.push_sort(SortSpec {
+            path: path.into(),
+            kind: SortKind::Numeric(direction),
+        });
+        self
+    }
+
+    pub fn limit(&mut self, limit: i64) -> &mut Self {
+        self.spec.set_limit(Some(limit.max(0)));
+        self
+    }
+
+    pub fn offset(&mut self, offset: i64) -> &mut Self {
+        self.spec.set_offset(Some(offset.max(0)));
+        self
+    }
+
+    pub fn page(&mut self, page: u32, per_page: u32) -> &mut Self {
+        let per_page = per_page.max(1);
+        let page = page.max(1);
+        let offset = (page - 1) as i64 * per_page as i64;
+        self.spec.set_limit(Some(per_page as i64));
+        self.spec.set_offset(Some(offset));
+        self
+    }
+
+    pub fn select_fields(&mut self, fields: &[(&str, &str)]) -> &mut Self {
+        let projections = fields
+            .iter()
+            .map(|(alias, path)| FieldProjection::new(*alias, *path))
+            .collect::<Vec<_>>();
+
+        if projections.is_empty() {
+            self.spec.set_selection(Selection::Document);
+        } else {
+            self.spec.set_selection(Selection::Fields(projections));
+        }
+
+        self
+    }
+
+    pub fn select_field(&mut self, alias: &str, path: &str) -> &mut Self {
+        let projection = FieldProjection::new(alias, path);
+        match self.spec.selection_mut() {
+            Selection::Document => self.spec.set_selection(Selection::Fields(vec![projection])),
+            Selection::Fields(fields) => fields.push(projection),
+        }
+
+        self
+    }
+
+    pub(crate) fn into_spec(self) -> QuerySpec {
+        self.spec
+    }
+}
+
+pub trait CompiledQuery<R>
+where
+    R: DeserializeOwned,
+{
+    fn configure(&self, ctx: &mut DocumentQueryContext);
 }
 
 /// A JSON path expressed as segments compatible with Postgres' `#>` operator.
@@ -344,22 +599,18 @@ fn push_numeric_cmp(
 /// Builder for queryable document projections.
 pub struct DocumentQuery<T> {
     pool: PgPool,
-    selection: Selection,
-    filters: Vec<Predicate>,
-    sort: Vec<SortSpec>,
-    limit: Option<i64>,
-    offset: Option<i64>,
+    spec: QuerySpec,
     _marker: PhantomData<T>,
 }
 
 impl<T> fmt::Debug for DocumentQuery<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DocumentQuery")
-            .field("selection", &self.selection)
-            .field("filters", &self.filters)
-            .field("sort", &self.sort)
-            .field("limit", &self.limit)
-            .field("offset", &self.offset)
+            .field("selection", self.spec.selection())
+            .field("filters", &self.spec.filters())
+            .field("sort", &self.spec.sort())
+            .field("limit", &self.spec.limit())
+            .field("offset", &self.spec.offset())
             .finish()
     }
 }
@@ -368,29 +619,25 @@ impl<T> DocumentQuery<T> {
     pub(crate) fn new(pool: PgPool) -> Self {
         Self {
             pool,
-            selection: Selection::Document,
-            filters: Vec::new(),
-            sort: Vec::new(),
-            limit: None,
-            offset: None,
+            spec: QuerySpec::default(),
             _marker: PhantomData,
         }
     }
 
     pub fn filter(mut self, predicate: Predicate) -> Self {
-        self.filters.push(predicate);
+        self.spec.push_filter(predicate);
         self
     }
 
     pub fn filter_if(mut self, condition: bool, predicate: impl FnOnce() -> Predicate) -> Self {
         if condition {
-            self.filters.push(predicate());
+            self.spec.push_filter(predicate());
         }
         self
     }
 
     pub fn order_by(mut self, path: impl Into<JsonPath>, direction: SortDirection) -> Self {
-        self.sort.push(SortSpec {
+        self.spec.push_sort(SortSpec {
             path: path.into(),
             kind: SortKind::Text(direction),
         });
@@ -398,7 +645,7 @@ impl<T> DocumentQuery<T> {
     }
 
     pub fn order_by_number(mut self, path: impl Into<JsonPath>, direction: SortDirection) -> Self {
-        self.sort.push(SortSpec {
+        self.spec.push_sort(SortSpec {
             path: path.into(),
             kind: SortKind::Numeric(direction),
         });
@@ -406,12 +653,12 @@ impl<T> DocumentQuery<T> {
     }
 
     pub fn limit(mut self, limit: i64) -> Self {
-        self.limit = Some(limit.max(0));
+        self.spec.set_limit(Some(limit.max(0)));
         self
     }
 
     pub fn offset(mut self, offset: i64) -> Self {
-        self.offset = Some(offset.max(0));
+        self.spec.set_offset(Some(offset.max(0)));
         self
     }
 
@@ -419,8 +666,8 @@ impl<T> DocumentQuery<T> {
         let per_page = per_page.max(1);
         let page = page.max(1);
         let offset = (page - 1) as i64 * per_page as i64;
-        self.limit = Some(per_page as i64);
-        self.offset = Some(offset);
+        self.spec.set_limit(Some(per_page as i64));
+        self.spec.set_offset(Some(offset));
         self
     }
 
@@ -431,9 +678,9 @@ impl<T> DocumentQuery<T> {
             .collect::<Vec<_>>();
 
         if projections.is_empty() {
-            self.selection = Selection::Document;
+            self.spec.set_selection(Selection::Document);
         } else {
-            self.selection = Selection::Fields(projections);
+            self.spec.set_selection(Selection::Fields(projections));
         }
 
         self
@@ -441,8 +688,8 @@ impl<T> DocumentQuery<T> {
 
     pub fn select_field(mut self, alias: &str, path: &str) -> Self {
         let projection = FieldProjection::new(alias, path);
-        match &mut self.selection {
-            Selection::Document => self.selection = Selection::Fields(vec![projection]),
+        match self.spec.selection_mut() {
+            Selection::Document => self.spec.set_selection(Selection::Fields(vec![projection])),
             Selection::Fields(fields) => fields.push(projection),
         }
 
@@ -450,91 +697,8 @@ impl<T> DocumentQuery<T> {
     }
 
     fn build_query(self) -> (PgPool, QueryBuilder<'static, Postgres>) {
-        let Self {
-            pool,
-            selection,
-            filters,
-            sort,
-            limit,
-            offset,
-            _marker,
-        } = self;
-
-        let mut builder = QueryBuilder::new("select ");
-
-        match selection {
-            Selection::Document => {
-                builder.push("doc");
-            }
-            Selection::Fields(fields) => {
-                if fields.is_empty() {
-                    builder.push("doc");
-                } else {
-                    builder.push("jsonb_build_object(");
-                    let mut first = true;
-                    for field in fields {
-                        if !first {
-                            builder.push(", ");
-                        }
-                        first = false;
-                        builder.push_bind(field.alias);
-                        builder.push(", ");
-                        push_json_expr(&mut builder, &field.path);
-                    }
-                    builder.push(") as doc");
-                }
-            }
-        }
-
-        builder.push(" from docs");
-
-        if !filters.is_empty() {
-            builder.push(" where ");
-            let mut iter = filters.into_iter();
-            if let Some(first) = iter.next() {
-                first.push_sql(&mut builder);
-            }
-            for predicate in iter {
-                builder.push(" and ");
-                predicate.push_sql(&mut builder);
-            }
-        }
-
-        if !sort.is_empty() {
-            builder.push(" order by ");
-            let mut first = true;
-            for spec in sort {
-                if !first {
-                    builder.push(", ");
-                }
-                first = false;
-                match spec.kind {
-                    SortKind::Text(direction) => {
-                        push_text_expr(&mut builder, &spec.path);
-                        builder.push(" ");
-                        builder.push(direction.as_str());
-                    }
-                    SortKind::Numeric(direction) => {
-                        builder.push("((");
-                        push_text_expr(&mut builder, &spec.path);
-                        builder.push(")::numeric) ");
-                        builder.push(direction.as_str());
-                    }
-                }
-            }
-        }
-
-        if let Some(limit) = limit {
-            builder.push(" limit ");
-            builder.push_bind(limit);
-        }
-
-        if let Some(offset) = offset {
-            builder.push(" offset ");
-            builder.push_bind(offset);
-        }
-
-        (pool, builder)
+        let pool = self.pool.clone();
+        self.spec.build_query(pool)
     }
 }
 
