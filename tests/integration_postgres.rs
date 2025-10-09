@@ -1,6 +1,6 @@
 use anyhow::Result;
 use rillflow::{Event, Expected, Store, projections::ProjectionHandler};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlx::{Postgres, Transaction};
 use testcontainers::{
     GenericImage, ImageExt,
@@ -89,6 +89,44 @@ async fn roundtrip() -> Result<()> {
         .fetch_one(store.pool())
         .await?;
     assert_eq!(count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn expected_version_conflict() -> Result<()> {
+    let image = GenericImage::new("postgres", "16-alpine")
+        .with_exposed_port(5432.tcp())
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres");
+
+    let container = image.start().await?;
+    let host = container.get_host().await?;
+    let port = container.get_host_port_ipv4(5432).await?;
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres?sslmode=disable");
+
+    let store = Store::connect(&url).await?;
+
+    rillflow::testing::migrate_core_schema(store.pool()).await?;
+
+    let stream_id = Uuid::new_v4();
+    let event = Event::new("TestEvent", &serde_json::json!({"k": 1}));
+
+    store
+        .events()
+        .append_stream(stream_id, Expected::Any, vec![event.clone()])
+        .await?;
+
+    let err = store
+        .events()
+        .append_stream(stream_id, Expected::Exact(0), vec![event])
+        .await
+        .expect_err("mismatched expected version should fail");
+
+    assert!(matches!(err, rillflow::Error::VersionConflict));
 
     Ok(())
 }
