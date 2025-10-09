@@ -50,18 +50,8 @@ async fn roundtrip() -> Result<()> {
 
     let store = Store::connect(&url).await?;
 
-    let ddl = std::fs::read_to_string("sql/0001_init.sql")?;
-    for stmt in ddl
-        .split(';')
-        .map(str::trim)
-        .filter(|stmt| !stmt.is_empty())
-    {
-        sqlx::query(stmt).execute(store.pool()).await?;
-    }
-
-    sqlx::query("create table counters (id uuid primary key, count int not null default 0)")
-        .execute(store.pool())
-        .await?;
+    rillflow::testing::migrate_core_schema(store.pool()).await?;
+    rillflow::testing::ensure_counters_table(store.pool()).await?;
 
     #[derive(serde::Serialize, serde::Deserialize)]
     struct Customer {

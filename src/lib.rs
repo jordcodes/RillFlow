@@ -5,6 +5,7 @@ mod error;
 pub mod events;
 pub mod projections;
 pub mod store;
+pub mod testing;
 pub mod tracing;
 
 pub use error::{Error, Result};
@@ -14,4 +15,3 @@ pub use store::Store;
 pub mod prelude {
     pub use crate::{Event, Expected, Result, Store};
 }
-
