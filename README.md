@@ -23,6 +23,7 @@ cargo test --test integration_postgres
 
 - JSONB document store with optimistic versioning
 - LINQ-like document query DSL (filters, sorting, paging, projections)
+- Composable compiled queries for cached predicates and reuse
 - Event streams with expected-version checks
 - Projection replay and checkpointing helpers
 - Developer tracing breadcrumbs with Mermaid export (dev-only)
@@ -55,6 +56,30 @@ async fn active_customers(store: &Store) -> rillflow::Result<Vec<Customer>> {
 ```
 
 See `MIGRATIONS.md` for guidance on adding workload-specific JSONB indexes for query performance.
+
+#### Compiled Queries
+
+```rust
+use rillflow::{
+    Store,
+    query::{CompiledQuery, DocumentQueryContext, Predicate, SortDirection},
+};
+
+struct VipCustomers;
+
+impl CompiledQuery<serde_json::Value> for VipCustomers {
+    fn configure(&self, ctx: &mut DocumentQueryContext) {
+        ctx.filter(Predicate::eq("active", true))
+            .filter(Predicate::contains("tags", serde_json::json!(["vip"])))
+            .order_by("first_name", SortDirection::Asc)
+            .select_fields(&[("email", "email"), ("status", "active")]);
+    }
+}
+
+async fn load_vips(store: &Store) -> rillflow::Result<Vec<serde_json::Value>> {
+    store.docs().execute_compiled(VipCustomers).await
+}
+```
 
 ## License
 
