@@ -5,12 +5,14 @@ mod error;
 pub mod events;
 pub mod projections;
 pub mod query;
+pub mod schema;
 pub mod store;
 pub mod testing;
 pub mod tracing;
 
 pub use error::{Error, Result};
 pub use events::{Event, Expected};
+pub use schema::{SchemaConfig, SchemaManager, SchemaPlan, TenancyMode, TenantSchema};
 pub use store::Store;
 
 pub mod prelude {

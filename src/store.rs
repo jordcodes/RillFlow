@@ -30,6 +30,10 @@ impl Store {
         }
     }
 
+    pub fn schema(&self) -> crate::schema::SchemaManager {
+        crate::schema::SchemaManager::new(self.pool.clone())
+    }
+
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
