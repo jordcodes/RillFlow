@@ -1,3 +1,16 @@
+## 0.1.0-alpha.3
+
+Highlights:
+- Subscriptions: polling API with filters, checkpoints, pause/resume, optional LISTEN/NOTIFY wakeups; CLI admin (create/list/status/pause/resume/reset/tail).
+- Aggregates enrichment: Events AppendBuilder (headers/ids, batching) and pre-commit validator hook; snapshots load/commit helpers.
+- DX: Store builder, unified append_with, typed queries.
+
+Docs:
+- README updates for Store builder, append_with, subscriptions, aggregates enrichment.
+
+Tests:
+- Integration tests for subscriptions (delivery, pause/resume, filters), aggregates repo and snapshots.
+
 ## 0.1.0-alpha.2
 
 Highlights:
