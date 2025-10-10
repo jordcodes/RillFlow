@@ -115,6 +115,41 @@ while let Some(env) = rx.recv().await {
 }
 ```
 
+Consumer groups (checkpoint + leasing per group):
+
+```rust
+use rillflow::subscriptions::{Subscriptions, SubscriptionFilter, SubscriptionOptions};
+
+let subs = Subscriptions::new_with_schema(store.pool().clone(), "public");
+let filter = SubscriptionFilter { event_types: Some(vec!["Ping".into()]), ..Default::default() };
+let mut opts = SubscriptionOptions { start_from: 0, ..Default::default() };
+opts.group = Some("workers-a".to_string());
+let (_h, mut rx) = subs.subscribe("orders", filter, opts).await?;
+```
+
+CLI tail with group:
+
+```bash
+cargo run --features cli --bin rillflow -- subscriptions tail orders --group workers-a --limit 10 --database-url "$DATABASE_URL"
+```
+
+Manual ack mode (explicit checkpointing):
+
+```rust
+use rillflow::subscriptions::{Subscriptions, SubscriptionFilter, SubscriptionOptions, AckMode};
+
+let subs = Subscriptions::new_with_schema(store.pool().clone(), "public");
+let filter = SubscriptionFilter { event_types: Some(vec!["Ping".into()]), ..Default::default() };
+let mut opts = SubscriptionOptions { start_from: 0, ..Default::default() };
+opts.ack_mode = AckMode::Manual; // disable auto checkpointing
+let (handle, mut rx) = subs.subscribe("s1", filter, opts).await?;
+
+while let Some(env) = rx.recv().await {
+    // ... process ...
+    handle.ack(env.global_seq).await?; // checkpoint when done
+}
+```
+
 ### Aggregates
 
 Fold streams into domain state with a simple trait and repository.

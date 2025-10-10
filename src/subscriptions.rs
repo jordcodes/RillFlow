@@ -1,6 +1,6 @@
 use crate::{Result, events::EventEnvelope};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, Row, postgres::PgRow};
+use sqlx::{Acquire, PgPool, Row, postgres::PgRow};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant, sleep};
 use uuid::Uuid;
@@ -19,6 +19,9 @@ pub struct SubscriptionOptions {
     pub start_from: i64,
     pub channel_capacity: usize,
     pub notify_channel: Option<String>,
+    pub group: Option<String>,
+    pub lease_ttl: Duration,
+    pub ack_mode: AckMode,
 }
 
 impl Default for SubscriptionOptions {
@@ -29,8 +32,17 @@ impl Default for SubscriptionOptions {
             start_from: 0,
             channel_capacity: 1024,
             notify_channel: Some("rillflow_events".to_string()),
+            group: None,
+            lease_ttl: Duration::from_secs(30),
+            ack_mode: AckMode::Auto,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum AckMode {
+    Auto,
+    Manual,
 }
 
 pub struct Subscriptions {
@@ -88,6 +100,7 @@ impl Subscriptions {
         let pool = self.pool.clone();
         let schema = self.schema.clone();
         let name_s = name.to_string();
+        let handle_group = opts.group.clone();
         tokio::spawn(async move {
             let mut cursor = opts.start_from;
             // Acquire a dedicated connection and set search_path for consistent schema scoping
@@ -110,6 +123,22 @@ impl Subscriptions {
                 None
             };
             let mut last_checkpoint = Instant::now();
+            let mut last_lease_refresh = Instant::now();
+            // stable unique worker id for lease ownership within this process
+            let worker_id = format!("pid-{}-{}", std::process::id(), Uuid::new_v4());
+            // If running in group mode, initialize cursor from group checkpoint if available
+            if let Some(grp) = &opts.group {
+                if let Ok(Some(seq)) = sqlx::query_scalar::<_, Option<i64>>(
+                    "select last_seq from subscription_groups where name=$1 and grp=$2",
+                )
+                .bind(&name_s)
+                .bind(grp)
+                .fetch_one(&mut *conn)
+                .await
+                {
+                    cursor = seq;
+                }
+            }
             loop {
                 // read pause/backoff
                 if let Ok(Some(paused)) = sqlx::query_scalar::<_, Option<bool>>(
@@ -123,6 +152,75 @@ impl Subscriptions {
                         sleep(opts.poll_interval).await;
                         continue;
                     }
+                }
+
+                // Acquire per-group lease if group mode is enabled
+                if let Some(grp) = &opts.group {
+                    let now = chrono::Utc::now();
+                    let ttl = now + chrono::Duration::from_std(opts.lease_ttl).unwrap();
+                    let id = &worker_id;
+                    // Use an explicit transaction + advisory xact lock to serialize ownership decisions
+                    let key = format!("{}:{}", name_s, grp);
+                    let mut ltx = match conn.begin().await {
+                        Ok(t) => t,
+                        Err(_) => {
+                            sleep(opts.poll_interval).await;
+                            continue;
+                        }
+                    };
+                    let got_lock: Option<bool> = sqlx::query_scalar(
+                        "select pg_try_advisory_xact_lock(hashtext($1)::bigint)",
+                    )
+                    .bind(&key)
+                    .fetch_optional(&mut *ltx)
+                    .await
+                    .ok()
+                    .flatten();
+                    if got_lock != Some(true) {
+                        let _ = ltx.rollback().await;
+                        sleep(opts.poll_interval).await;
+                        continue;
+                    }
+
+                    // Read existing lease under the lock
+                    let existing: Option<(String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+                        "select leased_by, lease_until from subscription_group_leases where name=$1 and grp=$2 for update",
+                    )
+                    .bind(&name_s)
+                    .bind(grp)
+                    .fetch_optional(&mut *ltx)
+                    .await
+                    .ok()
+                    .flatten();
+
+                    let can_take = match existing {
+                        None => true,
+                        Some((ref who, _until)) if id == who => true,
+                        Some((_who, until)) if until <= now => true,
+                        _ => false,
+                    };
+
+                    if !can_take {
+                        let _ = ltx.rollback().await;
+                        sleep(opts.poll_interval).await;
+                        continue;
+                    }
+
+                    // Upsert our lease
+                    let _ = sqlx::query(
+                        r#"
+                        insert into subscription_group_leases(name, grp, leased_by, lease_until)
+                        values ($1,$2,$3,$4)
+                        on conflict (name, grp) do update set leased_by=excluded.leased_by, lease_until=excluded.lease_until, updated_at=now()
+                        "#,
+                    )
+                    .bind(&name_s)
+                    .bind(grp)
+                        .bind(id)
+                    .bind(ttl)
+                    .execute(&mut *ltx)
+                    .await;
+                    let _ = ltx.commit().await;
                 }
 
                 // Build dynamic filter via CASE checks; pass arrays or nulls and rely on ANY/LIKE.
@@ -163,8 +261,10 @@ impl Subscriptions {
                     continue;
                 }
 
+                let mut last_seq_in_batch = cursor;
                 for row in rows {
                     let env = EventEnvelope {
+                        global_seq: row.get("global_seq"),
                         stream_id: row.get("stream_id"),
                         stream_seq: row.get("stream_seq"),
                         typ: row.get("event_type"),
@@ -175,20 +275,68 @@ impl Subscriptions {
                         created_at: row.get("created_at"),
                     };
                     cursor = row.get::<i64, _>("global_seq");
+                    last_seq_in_batch = cursor;
                     if tx.send(env).await.is_err() {
                         return; // receiver dropped
                     }
                 }
 
+                // In group mode with auto ack, checkpoint immediately to minimize duplicate work
+                if let Some(grp) = &opts.group {
+                    if matches!(opts.ack_mode, AckMode::Auto) {
+                        let _ = sqlx::query(
+                            "insert into subscription_groups(name, grp, last_seq) values($1,$2,$3)
+                             on conflict(name,grp) do update set last_seq = excluded.last_seq, updated_at = now()",
+                        )
+                        .bind(&name_s)
+                        .bind(grp)
+                        .bind(last_seq_in_batch)
+                        .execute(&mut *conn)
+                        .await;
+                    }
+                }
+
                 if last_checkpoint.elapsed() >= Duration::from_secs(1) {
-                    let _ = sqlx::query(
-                        "update subscriptions set last_seq = $2, updated_at = now() where name = $1",
-                    )
-                    .bind(&name_s)
-                    .bind(cursor)
-                    .execute(&mut *conn)
-                    .await;
+                    if let Some(grp) = &opts.group {
+                        if matches!(opts.ack_mode, AckMode::Auto) {
+                            let _ = sqlx::query(
+                                "insert into subscription_groups(name, grp, last_seq) values($1,$2,$3)
+                                 on conflict(name,grp) do update set last_seq = excluded.last_seq, updated_at = now()",
+                            )
+                            .bind(&name_s)
+                            .bind(grp)
+                            .bind(cursor)
+                            .execute(&mut *conn)
+                            .await;
+                        }
+                    } else {
+                        if matches!(opts.ack_mode, AckMode::Auto) {
+                            let _ = sqlx::query(
+                                "update subscriptions set last_seq = $2, updated_at = now() where name = $1",
+                            )
+                            .bind(&name_s)
+                            .bind(cursor)
+                            .execute(&mut *conn)
+                            .await;
+                        }
+                    }
                     last_checkpoint = Instant::now();
+                }
+
+                if last_lease_refresh.elapsed() >= Duration::from_secs(5) {
+                    if let Some(grp) = &opts.group {
+                        let ttl = chrono::Utc::now()
+                            + chrono::Duration::from_std(opts.lease_ttl).unwrap();
+                        let _ = sqlx::query(
+                            "update subscription_group_leases set lease_until=$3, updated_at=now() where name=$1 and grp=$2",
+                        )
+                        .bind(&name_s)
+                        .bind(grp)
+                        .bind(ttl)
+                        .execute(&mut *conn)
+                        .await;
+                    }
+                    last_lease_refresh = Instant::now();
                 }
             }
         });
@@ -197,6 +345,7 @@ impl Subscriptions {
             SubscriptionHandle {
                 pool: self.pool.clone(),
                 name: name.to_string(),
+                group: handle_group,
             },
             rx,
         ))
@@ -206,16 +355,38 @@ impl Subscriptions {
 pub struct SubscriptionHandle {
     pool: PgPool,
     name: String,
+    group: Option<String>,
 }
 
 impl SubscriptionHandle {
     pub async fn checkpoint(&self, to_seq: i64) -> Result<()> {
-        sqlx::query("update subscriptions set last_seq = $2, updated_at = now() where name = $1")
-            .bind(&self.name)
-            .bind(to_seq)
-            .execute(&self.pool)
-            .await?;
+        match &self.group {
+            Some(grp) => {
+                sqlx::query(
+                    "insert into subscription_groups(name, grp, last_seq) values($1,$2,$3)
+                     on conflict(name,grp) do update set last_seq = excluded.last_seq, updated_at = now()",
+                )
+                .bind(&self.name)
+                .bind(grp)
+                .bind(to_seq)
+                .execute(&self.pool)
+                .await?;
+            }
+            None => {
+                sqlx::query(
+                    "update subscriptions set last_seq = $2, updated_at = now() where name = $1",
+                )
+                .bind(&self.name)
+                .bind(to_seq)
+                .execute(&self.pool)
+                .await?;
+            }
+        }
         Ok(())
+    }
+
+    pub async fn ack(&self, to_seq: i64) -> Result<()> {
+        self.checkpoint(to_seq).await
     }
 
     pub async fn pause(&self) -> Result<()> {

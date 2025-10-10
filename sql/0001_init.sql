@@ -48,6 +48,27 @@ create table if not exists subscriptions (
     updated_at timestamptz not null default now()
 );
 
+-- subscription consumer groups (per-group checkpoints)
+create table if not exists subscription_groups (
+    name text not null,
+    grp text not null,
+    last_seq bigint not null default 0,
+    paused boolean not null default false,
+    backoff_until timestamptz null,
+    updated_at timestamptz not null default now(),
+    primary key (name, grp)
+);
+
+-- subscription group leases (single worker per group)
+create table if not exists subscription_group_leases (
+    name text not null,
+    grp text not null,
+    leased_by text not null,
+    lease_until timestamptz not null,
+    updated_at timestamptz not null default now(),
+    primary key (name, grp)
+);
+
 -- subscription dead-letter queue
 create table if not exists subscription_dlq (
     id bigserial primary key,

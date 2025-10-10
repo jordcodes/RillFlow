@@ -1,3 +1,14 @@
+## 0.1.0-alpha.4
+
+Highlights:
+- Subscriptions: consumer groups with per-group checkpoints and leasing; manual ack mode with explicit checkpointing; added `global_seq` to `EventEnvelope`.
+- CLI: `subscriptions tail --group` for grouped consumers.
+- Docs: README examples for consumer groups and manual ack.
+
+Tests:
+- Added group leasing test (only one consumer in group receives).
+- Added manual ack test (checkpoint advances only on ack).
+
 ## 0.1.0-alpha.3
 
 Highlights:

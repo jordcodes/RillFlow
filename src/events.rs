@@ -41,6 +41,7 @@ pub struct Events {
 
 #[derive(Clone, Debug)]
 pub struct EventEnvelope {
+    pub global_seq: i64,
     pub stream_id: Uuid,
     pub stream_seq: i32,
     pub typ: String,
@@ -100,6 +101,7 @@ impl Events {
 
     pub async fn read_stream_envelopes(&self, stream_id: Uuid) -> Result<Vec<EventEnvelope>> {
         let rows: Vec<(
+            i64,
             Uuid,
             i32,
             String,
@@ -109,7 +111,7 @@ impl Events {
             Option<Uuid>,
             chrono::DateTime<chrono::Utc>,
         )> = sqlx::query_as(
-            r#"select stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, created_at
+            r#"select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, created_at
                 from events where stream_id = $1 order by stream_seq asc"#,
         )
         .bind(stream_id)
@@ -120,6 +122,7 @@ impl Events {
             .into_iter()
             .map(
                 |(
+                    global_seq,
                     stream_id,
                     stream_seq,
                     typ,
@@ -129,6 +132,7 @@ impl Events {
                     correlation_id,
                     created_at,
                 )| EventEnvelope {
+                    global_seq,
                     stream_id,
                     stream_seq,
                     typ,

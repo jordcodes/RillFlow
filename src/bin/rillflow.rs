@@ -98,6 +98,9 @@ enum SubscriptionsCmd {
         name: String,
         #[arg(long, default_value_t = 10)]
         limit: usize,
+        /// Optional consumer group name
+        #[arg(long)]
+        group: Option<String>,
     },
 }
 
@@ -340,7 +343,7 @@ async fn main() -> rillflow::Result<()> {
                     .await?;
                     println!("reset {} to {}", name, seq);
                 }
-                SubscriptionsCmd::Tail { name, limit } => {
+                SubscriptionsCmd::Tail { name, limit, group } => {
                     // load filter
                     let rec =
                         sqlx::query("select filter, last_seq from subscriptions where name=$1")
@@ -354,6 +357,7 @@ async fn main() -> rillflow::Result<()> {
                     let last_seq: i64 = rec.get::<Option<i64>, _>("last_seq").unwrap_or(0);
                     let opts = SubscriptionOptions {
                         start_from: last_seq,
+                        group,
                         ..Default::default()
                     };
                     let (_h, mut rx) = subs.subscribe(&name, filter, opts).await?;

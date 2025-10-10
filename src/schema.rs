@@ -138,6 +138,22 @@ impl SchemaManager {
             build_snapshots_table_sql,
         );
 
+        // Subscription consumer groups (per-group checkpoints and leases)
+        ensure_table(
+            plan,
+            schema,
+            &existing_tables,
+            "subscription_groups",
+            build_subscription_groups_table_sql,
+        );
+        ensure_table(
+            plan,
+            schema,
+            &existing_tables,
+            "subscription_group_leases",
+            build_subscription_group_leases_table_sql,
+        );
+
         Ok(())
     }
 
@@ -469,6 +485,39 @@ fn build_projection_dlq_table_sql(schema: &str) -> String {
         )
         ",
         table = qualified_name(schema, "projection_dlq"),
+    )
+}
+
+fn build_subscription_groups_table_sql(schema: &str) -> String {
+    formatdoc!(
+        r#"
+        create table if not exists {table} (
+            name text not null,
+            grp text not null,
+            last_seq bigint not null default 0,
+            paused boolean not null default false,
+            backoff_until timestamptz null,
+            updated_at timestamptz not null default now(),
+            primary key (name, grp)
+        )
+        "#,
+        table = qualified_name(schema, "subscription_groups"),
+    )
+}
+
+fn build_subscription_group_leases_table_sql(schema: &str) -> String {
+    formatdoc!(
+        r#"
+        create table if not exists {table} (
+            name text not null,
+            grp text not null,
+            leased_by text not null,
+            lease_until timestamptz not null,
+            updated_at timestamptz not null default now(),
+            primary key (name, grp)
+        )
+        "#,
+        table = qualified_name(schema, "subscription_group_leases"),
     )
 }
 
