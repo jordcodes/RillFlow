@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use crate::{Result, projections::ProjectionHandler};
 use serde_json::Value;
-use sqlx::{PgPool, Row, postgres::PgRow, types::Json};
+use sqlx::{PgPool, types::Json};
 
 #[derive(Clone, Debug)]
 pub struct ProjectionWorkerConfig {
@@ -95,7 +95,7 @@ impl ProjectionDaemon {
             .await?
             .unwrap_or(0);
 
-        let rows: Vec<PgRow> = sqlx::query(
+        let rows: Vec<(i64, String, Value)> = sqlx::query_as(
             "select global_seq, event_type, body from events where global_seq > $1 order by global_seq asc limit $2",
         )
         .bind(last_seq)
@@ -112,11 +112,7 @@ impl ProjectionDaemon {
 
         let mut new_last = last_seq;
         let mut processed: usize = 0;
-        for row in rows {
-            let seq: i64 = row.get("global_seq");
-            let typ: String = row.get("event_type");
-            let body: Value = row.get("body");
-
+        for (seq, typ, body) in rows {
             // apply within the same transaction to keep read model + checkpoint atomic
             if let Err(err) = reg.handler.apply(&typ, &body, &mut tx).await {
                 // record to DLQ, set backoff, advance checkpoint to skip poison pill for now
