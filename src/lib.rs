@@ -9,6 +9,7 @@ pub mod projections;
 pub mod query;
 pub mod schema;
 pub mod store;
+pub mod subscriptions;
 pub mod testing;
 pub mod tracing;
 

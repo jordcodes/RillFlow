@@ -37,3 +37,24 @@ create table if not exists snapshots (
     body jsonb not null,
     created_at timestamptz not null default now()
 );
+
+-- subscriptions (consumer checkpoints)
+create table if not exists subscriptions (
+    name text primary key,
+    last_seq bigint not null default 0,
+    filter jsonb not null default '{}'::jsonb,
+    paused boolean not null default false,
+    backoff_until timestamptz null,
+    updated_at timestamptz not null default now()
+);
+
+-- subscription dead-letter queue
+create table if not exists subscription_dlq (
+    id bigserial primary key,
+    name text not null,
+    global_seq bigint not null,
+    event_type text not null,
+    body jsonb not null,
+    error text not null,
+    failed_at timestamptz not null default now()
+);
