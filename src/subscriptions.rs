@@ -18,6 +18,7 @@ pub struct SubscriptionOptions {
     pub poll_interval: Duration,
     pub start_from: i64,
     pub channel_capacity: usize,
+    pub notify_channel: Option<String>,
 }
 
 impl Default for SubscriptionOptions {
@@ -27,6 +28,7 @@ impl Default for SubscriptionOptions {
             poll_interval: Duration::from_millis(250),
             start_from: 0,
             channel_capacity: 1024,
+            notify_channel: Some("rillflow_events".to_string()),
         }
     }
 }
@@ -95,6 +97,18 @@ impl Subscriptions {
             };
             let set_path = format!("set search_path to \"{}\"", schema.replace('"', "\""));
             let _ = sqlx::query(&set_path).execute(&mut *conn).await;
+            // Start optional listener for NOTIFY wakeups
+            let mut listener = if let Some(chan) = &opts.notify_channel {
+                match sqlx::postgres::PgListener::connect_with(&pool).await {
+                    Ok(mut l) => {
+                        let _ = l.listen(chan).await;
+                        Some(l)
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
             let mut last_checkpoint = Instant::now();
             loop {
                 // read pause/backoff
@@ -140,7 +154,12 @@ impl Subscriptions {
                 .unwrap_or_default();
 
                 if rows.is_empty() {
-                    sleep(opts.poll_interval).await;
+                    if let Some(l) = &mut listener {
+                        // wait for a notify with a timeout fallback
+                        let _ = tokio::time::timeout(opts.poll_interval, l.recv()).await;
+                    } else {
+                        sleep(opts.poll_interval).await;
+                    }
                     continue;
                 }
 

@@ -39,6 +39,7 @@ async fn subscribe_and_receive_events() -> Result<()> {
         poll_interval: Duration::from_millis(100),
         start_from: 0,
         channel_capacity: 16,
+        notify_channel: None,
     };
     let (_handle, mut rx) = subs.subscribe("s1", filter, opts).await?;
 
@@ -83,6 +84,7 @@ async fn pause_and_resume_subscription() -> Result<()> {
     };
     let opts = SubscriptionOptions {
         start_from: 0,
+        notify_channel: None,
         ..Default::default()
     };
     let (handle, mut rx) = subs.subscribe("s2", filter, opts).await?;
@@ -151,6 +153,7 @@ async fn filters_combo_event_type_and_stream_id() -> Result<()> {
     let opts = SubscriptionOptions {
         start_from: 0,
         poll_interval: Duration::from_millis(50),
+        notify_channel: None,
         ..Default::default()
     };
     let (_handle, mut rx) = subs.subscribe("s3", filter, opts).await?;

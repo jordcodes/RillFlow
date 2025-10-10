@@ -58,3 +58,22 @@ create table if not exists subscription_dlq (
     error text not null,
     failed_at timestamptz not null default now()
 );
+
+-- NOTIFY wakeups for new events (optional listener can subscribe to this channel)
+create or replace function rf_notify_event() returns trigger as $$
+begin
+  perform pg_notify('rillflow_events', new.global_seq::text);
+  return null;
+end;
+$$ language plpgsql;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_trigger t
+    join pg_class c on c.oid = t.tgrelid
+    where t.tgname = 'rf_events_notify' and c.relname = 'events'
+  ) then
+    execute 'create trigger rf_events_notify after insert on events for each row execute function rf_notify_event()';
+  end if;
+end$$;
