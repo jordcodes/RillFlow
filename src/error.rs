@@ -15,6 +15,10 @@ pub enum Error {
     IdempotencyConflict,
     #[error("unknown projection: {0}")]
     UnknownProjection(String),
+    #[error("document not found")]
+    DocNotFound,
+    #[error("document version conflict")]
+    DocVersionConflict,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

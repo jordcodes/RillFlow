@@ -289,6 +289,28 @@ async fn active_customers(store: &Store) -> rillflow::Result<Vec<Customer>> {
 }
 ```
 
+### Document Repository (OCC and soft delete)
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Customer { email: String, tier: String }
+
+let id = uuid::Uuid::new_v4();
+
+// put returns new version (starts at 1)
+let v1 = store.docs().put(&id, &Customer { email: "a@x".into(), tier: "free".into() }, None).await?;
+
+// get returns (doc, version)
+let (cust, ver) = store.docs().get::<Customer>(&id).await?.unwrap();
+
+// update with optimistic concurrency
+let v2 = store.docs().update::<Customer, _>(&id, ver, |c| c.tier = "pro".into()).await?;
+
+// soft delete / restore (programmatic or via CLI)
+sqlx::query("update docs set deleted_at = now() where id = $1").bind(id).execute(store.pool()).await?;
+sqlx::query("update docs set deleted_at = null where id = $1").bind(id).execute(store.pool()).await?;
+```
+
 See `MIGRATIONS.md` for guidance on adding workload-specific JSONB indexes for query performance.
 ### Projections Runtime (daemon primitives)
 

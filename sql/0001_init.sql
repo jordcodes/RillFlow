@@ -4,7 +4,8 @@ create table if not exists docs (
     doc jsonb not null,
     version int not null default 0,
     created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now()
+    updated_at timestamptz not null default now(),
+    deleted_at timestamptz null
 );
 
 create index if not exists docs_gin on docs using gin (doc);

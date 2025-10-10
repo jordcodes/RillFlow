@@ -386,7 +386,8 @@ fn build_docs_table_sql(schema: &str) -> String {
             doc jsonb not null,
             version int not null default 0,
             created_at timestamptz not null default now(),
-            updated_at timestamptz not null default now()
+            updated_at timestamptz not null default now(),
+            deleted_at timestamptz null
         )
         ",
         table = qualified_name(schema, "docs"),

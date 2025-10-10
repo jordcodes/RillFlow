@@ -2,6 +2,7 @@ use clap::{ArgAction, Parser, Subcommand};
 use rillflow::projection_runtime::{ProjectionDaemon, ProjectionWorkerConfig};
 use rillflow::subscriptions::{SubscriptionFilter, SubscriptionOptions, Subscriptions};
 use rillflow::{SchemaConfig, Store, TenancyMode, TenantSchema};
+use serde_json::Value as JsonValue;
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -43,6 +44,10 @@ enum Commands {
     /// Stream alias helpers
     #[command(subcommand)]
     Streams(StreamsCmd),
+
+    /// Documents admin commands
+    #[command(subcommand)]
+    Docs(DocsCmd),
 }
 
 #[derive(Subcommand, Debug)]
@@ -118,6 +123,16 @@ enum SubscriptionsCmd {
 enum StreamsCmd {
     /// Resolve or create a stream id for an alias
     Resolve { alias: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum DocsCmd {
+    /// Get a document by id
+    Get { id: String },
+    /// Soft-delete a document (sets deleted_at)
+    SoftDelete { id: String },
+    /// Restore a soft-deleted document (clears deleted_at)
+    Restore { id: String },
 }
 
 #[tokio::main]
@@ -440,6 +455,32 @@ async fn main() -> rillflow::Result<()> {
             StreamsCmd::Resolve { alias } => {
                 let id = store.resolve_stream_alias(&alias).await?;
                 println!("{} -> {}", alias, id);
+            }
+        },
+        Commands::Docs(cmd) => match cmd {
+            DocsCmd::Get { id } => {
+                let id = Uuid::parse_str(&id)?;
+                let doc = store.docs().get::<JsonValue>(&id).await?;
+                match doc {
+                    Some((v, ver)) => println!("version={} doc={}", ver, v),
+                    None => println!("not found"),
+                }
+            }
+            DocsCmd::SoftDelete { id } => {
+                let id = Uuid::parse_str(&id)?;
+                sqlx::query("update docs set deleted_at = now() where id = $1")
+                    .bind(id)
+                    .execute(store.pool())
+                    .await?;
+                println!("soft-deleted {}", id);
+            }
+            DocsCmd::Restore { id } => {
+                let id = Uuid::parse_str(&id)?;
+                sqlx::query("update docs set deleted_at = null where id = $1")
+                    .bind(id)
+                    .execute(store.pool())
+                    .await?;
+                println!("restored {}", id);
             }
         },
     }
