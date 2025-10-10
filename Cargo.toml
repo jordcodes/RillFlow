@@ -26,6 +26,7 @@ include = [
 default = ["postgres"]
 postgres = []
 tracing-dashboard = []
+cli = ["dep:clap"]
 
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
@@ -44,9 +45,14 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2.0.17"
 tracing = "0.1"
 async-trait = "0.1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive"], optional = true }
 indoc = "2"
 itertools = "0.13"
+
+[[bin]]
+name = "rillflow"
+path = "src/bin/rillflow.rs"
+required-features = ["cli"]
 
 [dev-dependencies]
 testcontainers = "0.25.0"

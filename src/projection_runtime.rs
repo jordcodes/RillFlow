@@ -50,6 +50,14 @@ impl ProjectionDaemon {
         }
     }
 
+    pub fn builder(pool: PgPool) -> ProjectionDaemonBuilder {
+        ProjectionDaemonBuilder {
+            pool,
+            config: ProjectionWorkerConfig::default(),
+            registrations: Vec::new(),
+        }
+    }
+
     pub fn register(&mut self, name: impl Into<String>, handler: Arc<dyn ProjectionHandler>) {
         self.registrations.push(ProjectionRegistration {
             name: name.into(),
@@ -147,6 +155,28 @@ impl ProjectionDaemon {
             let _ = self.tick_once(&r.name).await?;
         }
         Ok(())
+    }
+
+    /// Repeatedly tick until no projections have work remaining.
+    pub async fn run_until_idle(&self) -> Result<()> {
+        loop {
+            let before = chrono::Utc::now();
+            let mut did_work = false;
+            for r in &self.registrations {
+                match self.tick_once(&r.name).await? {
+                    TickResult::Processed { count } if count > 0 => did_work = true,
+                    _ => {}
+                }
+            }
+            if !did_work {
+                return Ok(());
+            }
+            // small guard to avoid hot-looping
+            let elapsed = (chrono::Utc::now() - before).num_milliseconds();
+            if elapsed < 5 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
     }
 
     // --- Admin APIs ---
@@ -421,6 +451,50 @@ impl ProjectionDaemon {
         names.sort();
         names.dedup();
         Ok(names)
+    }
+}
+
+pub struct ProjectionDaemonBuilder {
+    pool: PgPool,
+    config: ProjectionWorkerConfig,
+    registrations: Vec<ProjectionRegistration>,
+}
+
+impl ProjectionDaemonBuilder {
+    pub fn schema(mut self, schema: impl Into<String>) -> Self {
+        self.config.schema = schema.into();
+        self
+    }
+    pub fn batch_size(mut self, size: i64) -> Self {
+        self.config.batch_size = size.max(1);
+        self
+    }
+    pub fn lease_ttl(mut self, ttl: Duration) -> Self {
+        self.config.lease_ttl = ttl;
+        self
+    }
+    pub fn backoff(mut self, base: Duration, max: Duration) -> Self {
+        self.config.base_backoff = base;
+        self.config.max_backoff = max;
+        self
+    }
+    pub fn register(
+        mut self,
+        name: impl Into<String>,
+        handler: Arc<dyn ProjectionHandler>,
+    ) -> Self {
+        self.registrations.push(ProjectionRegistration {
+            name: name.into(),
+            handler,
+        });
+        self
+    }
+    pub fn build(self) -> ProjectionDaemon {
+        let mut daemon = ProjectionDaemon::new(self.pool, self.config);
+        for r in self.registrations {
+            daemon.registrations.push(r);
+        }
+        daemon
     }
 }
 
