@@ -155,6 +155,11 @@ enum SnapshotsCmd {
         #[arg(long, default_value_t = 100)]
         batch: i64,
     },
+    /// Show snapshotter metrics (candidate streams and max gap)
+    Metrics {
+        #[arg(long, default_value_t = 100)]
+        threshold: i32,
+    },
 }
 
 #[tokio::main]
@@ -521,6 +526,42 @@ async fn main() -> rillflow::Result<()> {
                     }
                 }
                 println!("compacted total {} stream(s)", total);
+            }
+            SnapshotsCmd::Metrics { threshold } => {
+                let candidates: i64 = sqlx::query_scalar(
+                    r#"
+                     select count(1) from (
+                       select e.stream_id
+                         from events e
+                         left join snapshots s on s.stream_id = e.stream_id
+                        group by e.stream_id, s.version
+                       having max(e.stream_seq) - coalesce(s.version, 0) >= $1
+                     ) t
+                     "#,
+                )
+                .bind(threshold)
+                .fetch_one(store.pool())
+                .await?;
+
+                let max_gap: Option<i32> = sqlx::query_scalar(
+                    r#"
+                     select max(max_seq - coalesce(s.version, 0)) as gap from (
+                       select e.stream_id, max(e.stream_seq) as max_seq
+                         from events e
+                        group by e.stream_id
+                     ) h
+                     left join snapshots s on s.stream_id = h.stream_id
+                     "#,
+                )
+                .fetch_one(store.pool())
+                .await?;
+
+                println!(
+                    "threshold={} candidates={} max_gap={}",
+                    threshold,
+                    candidates,
+                    max_gap.unwrap_or(0).max(0)
+                );
             }
         },
     }

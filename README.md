@@ -269,6 +269,19 @@ repo.commit_and_snapshot(id, &agg, vec![Event::new("Inc", &())], 100).await?;
 let agg: Counter = repo.load_with_snapshot(id).await?;
 ```
 
+Programmatic snapshotter (background compaction):
+
+```rust
+use std::sync::Arc;
+use rillflow::snapshotter::{AggregateFolder, Snapshotter, SnapshotterConfig};
+
+// For an aggregate `Counter` implementing Aggregate + Serialize
+let repo = rillflow::AggregateRepository::new(store.events());
+let folder = AggregateFolder::<Counter>::new(repo);
+let snap = Snapshotter::new(store.pool().clone(), Arc::new(folder), SnapshotterConfig { threshold_events: 200, batch_size: 200, ..Default::default() });
+snap.run_until_idle().await?;
+```
+
 ### Document Queries
 
 ```rust
