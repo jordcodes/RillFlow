@@ -100,6 +100,7 @@ impl Events {
     }
 
     pub async fn read_stream_envelopes(&self, stream_id: Uuid) -> Result<Vec<EventEnvelope>> {
+        #[allow(clippy::type_complexity)]
         let rows: Vec<(
             i64,
             Uuid,

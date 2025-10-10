@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rillflow::{Error, Event, Expected, Store};
+use rillflow::{Error, Event, Store};
 use serde_json::json;
 use testcontainers::{
     GenericImage, ImageExt,

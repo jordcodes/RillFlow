@@ -177,7 +177,6 @@ impl QuerySpec {
         if !include_deleted {
             builder.push(if has_where { " and " } else { " where " });
             builder.push("deleted_at is null");
-            has_where = true;
         }
 
         if !sort.is_empty() {

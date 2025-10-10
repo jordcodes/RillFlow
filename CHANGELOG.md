@@ -1,3 +1,14 @@
+## 0.1.0-alpha.5
+
+Highlights:
+- Snapshotter: background compaction API (`Snapshotter`, `AggregateFolder`), CLI (`snapshots compact-once`, `run-until-idle`), metrics/tracing, README example.
+- Document repo DX: optimistic concurrency (`put`, `update`), versioned `get`, soft delete column and DSL knobs (`include_deleted`, `only_deleted`), CLI for docs.
+- Stream aliases: `stream_aliases` table, `Store::resolve_stream_alias`, CLI `streams resolve`.
+- Projection: metrics command (`projections metrics`).
+
+Tests:
+- Snapshotter test for long streams, docs repo e2e, idempotency conflict, consumer groups and manual ack, stream aliases.
+
 ## 0.1.0-alpha.4
 
 Highlights:

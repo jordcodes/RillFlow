@@ -110,7 +110,7 @@ impl Subscriptions {
                 Ok(c) => c,
                 Err(_) => return,
             };
-            let set_path = format!("set search_path to \"{}\"", schema.replace('"', "\""));
+            let set_path = format!("set search_path to \"{}\"", schema);
             let _ = sqlx::query(&set_path).execute(&mut *conn).await;
             // Start optional listener for NOTIFY wakeups
             let mut listener = if let Some(chan) = &opts.notify_channel {
@@ -312,16 +312,14 @@ impl Subscriptions {
                             .execute(&mut *conn)
                             .await;
                         }
-                    } else {
-                        if matches!(opts.ack_mode, AckMode::Auto) {
-                            let _ = sqlx::query(
-                                "update subscriptions set last_seq = $2, updated_at = now() where name = $1",
-                            )
-                            .bind(&name_s)
-                            .bind(cursor)
-                            .execute(&mut *conn)
-                            .await;
-                        }
+                    } else if matches!(opts.ack_mode, AckMode::Auto) {
+                        let _ = sqlx::query(
+                            "update subscriptions set last_seq = $2, updated_at = now() where name = $1",
+                        )
+                        .bind(&name_s)
+                        .bind(cursor)
+                        .execute(&mut *conn)
+                        .await;
                     }
                     last_checkpoint = Instant::now();
                 }
