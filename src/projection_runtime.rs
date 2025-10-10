@@ -12,6 +12,7 @@ pub struct ProjectionWorkerConfig {
     pub base_backoff: Duration,
     pub max_backoff: Duration,
     pub lease_ttl: Duration,
+    pub schema: String,
 }
 
 impl Default for ProjectionWorkerConfig {
@@ -22,6 +23,7 @@ impl Default for ProjectionWorkerConfig {
             base_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(30),
             lease_ttl: Duration::from_secs(30),
+            schema: "public".to_string(),
         }
     }
 }
@@ -81,6 +83,12 @@ impl ProjectionDaemon {
         }
 
         let mut tx = self.pool.begin().await?;
+        // Scope all table references to configured schema (search_path is local to this tx)
+        let set_search_path = format!(
+            "set local search_path to {}",
+            quote_ident(&self.config.schema)
+        );
+        sqlx::query(&set_search_path).execute(&mut *tx).await?;
         let last_seq: i64 = sqlx::query_scalar("select last_seq from projections where name = $1")
             .bind(name)
             .fetch_optional(&mut *tx)
@@ -248,13 +256,12 @@ impl ProjectionDaemon {
     // --- internals ---
 
     async fn is_paused(&self, name: &str) -> Result<bool> {
-        let paused = sqlx::query_scalar::<_, bool>(
-            "select paused from projection_control where name = $1",
-        )
-        .bind(name)
-        .fetch_optional(&self.pool)
-        .await?
-        .unwrap_or(false);
+        let paused =
+            sqlx::query_scalar::<_, bool>("select paused from projection_control where name = $1")
+                .bind(name)
+                .fetch_optional(&self.pool)
+                .await?
+                .unwrap_or(false);
         Ok(paused)
     }
 
@@ -406,4 +413,9 @@ pub enum TickResult {
     Backoff,
     LeasedByOther,
     Processed { count: u32 },
+}
+
+fn quote_ident(value: &str) -> String {
+    let escaped = value.replace('"', "\"\"");
+    format!("\"{}\"", escaped)
 }
