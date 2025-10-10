@@ -20,7 +20,7 @@ async fn main() -> rillflow::Result<()> {
     };
 
     store.docs().upsert(&customer.id, &customer).await?;
-    let fetched: Option<Customer> = store.docs().get(&customer.id).await?;
+    let fetched = store.docs().get::<Customer>(&customer.id).await?;
     println!("Fetched: {fetched:?}");
 
     store

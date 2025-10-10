@@ -70,7 +70,7 @@ async fn roundtrip() -> Result<()> {
     };
 
     store.docs().upsert(&id, &customer).await?;
-    let fetched: Option<Customer> = store.docs().get(&id).await?;
+    let fetched = store.docs().get::<Customer>(&id).await?;
     assert!(fetched.is_some());
 
     store

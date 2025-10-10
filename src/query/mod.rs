@@ -62,6 +62,7 @@ pub(crate) struct QuerySpec {
     sort: Vec<SortSpec>,
     limit: Option<i64>,
     offset: Option<i64>,
+    include_deleted: bool,
 }
 
 impl Default for QuerySpec {
@@ -72,6 +73,7 @@ impl Default for QuerySpec {
             sort: Vec::new(),
             limit: None,
             offset: None,
+            include_deleted: false,
         }
     }
 }
@@ -128,6 +130,7 @@ impl QuerySpec {
             sort,
             limit,
             offset,
+            include_deleted,
         } = self;
 
         let mut builder = QueryBuilder::new("select ");
@@ -158,8 +161,10 @@ impl QuerySpec {
 
         builder.push(" from docs");
 
+        let mut has_where = false;
         if !filters.is_empty() {
             builder.push(" where ");
+            has_where = true;
             let mut iter = filters.into_iter();
             if let Some(first) = iter.next() {
                 first.push_sql(&mut builder);
@@ -168,6 +173,11 @@ impl QuerySpec {
                 builder.push(" and ");
                 predicate.push_sql(&mut builder);
             }
+        }
+        if !include_deleted {
+            builder.push(if has_where { " and " } else { " where " });
+            builder.push("deleted_at is null");
+            has_where = true;
         }
 
         if !sort.is_empty() {
@@ -270,6 +280,17 @@ impl DocumentQueryContext {
         let offset = (page - 1) as i64 * per_page as i64;
         self.spec.set_limit(Some(per_page as i64));
         self.spec.set_offset(Some(offset));
+        self
+    }
+
+    pub fn include_deleted(&mut self) -> &mut Self {
+        self.spec.include_deleted = true;
+        self
+    }
+
+    pub fn only_deleted(&mut self) -> &mut Self {
+        self.spec.include_deleted = true;
+        self.spec.push_filter(Predicate::exists("deleted_at"));
         self
     }
 
@@ -668,6 +689,17 @@ impl<T> DocumentQuery<T> {
         let offset = (page - 1) as i64 * per_page as i64;
         self.spec.set_limit(Some(per_page as i64));
         self.spec.set_offset(Some(offset));
+        self
+    }
+
+    pub fn include_deleted(mut self) -> Self {
+        self.spec.include_deleted = true;
+        self
+    }
+
+    pub fn only_deleted(mut self) -> Self {
+        self.spec.include_deleted = true;
+        self.spec.push_filter(Predicate::exists("deleted_at"));
         self
     }
 
