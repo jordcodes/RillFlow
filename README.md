@@ -149,6 +149,14 @@ store
   .await?;
 ```
 
+### Choosing your defaults
+
+- Single-tenant vs multi-tenant: use `SchemaConfig::single_tenant()` for `public`, or `TenancyMode::SchemaPerTenant` to create per-tenant schemas via the CLI/API.
+- Projection schema: set `ProjectionDaemon::builder(...).schema("app")` if you don’t use `public`.
+- Advisory locks: keep projection lease locks on (default). Enable append advisory locks only if you see writer contention on streams.
+- Indexes: start with the default GIN on `doc`, then add expression indexes for hot paths (emails, timestamps, numeric ranges). See `MIGRATIONS.md` for examples.
+- Examples: see `examples/projection_run_once.rs` for a runnable projection demo end-to-end.
+
 
 #### Compiled Queries
 
