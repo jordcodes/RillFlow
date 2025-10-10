@@ -37,6 +37,14 @@ cargo run --bin rillflow -- projections reset-checkpoint my_projection 0 --datab
 cargo run --bin rillflow -- projections rebuild my_projection --database-url "$DATABASE_URL"
 cargo run --bin rillflow -- projections run-once --database-url "$DATABASE_URL"            # tick all
 cargo run --bin rillflow -- projections run-once --name my_projection --database-url "$DATABASE_URL"
+# run until idle (all or one)
+cargo run --bin rillflow -- projections run-until-idle --database-url "$DATABASE_URL"
+cargo run --bin rillflow -- projections run-until-idle --name my_projection --database-url "$DATABASE_URL"
+
+# DLQ admin
+cargo run --bin rillflow -- projections dlq-list my_projection --database-url "$DATABASE_URL" --limit 100
+cargo run --bin rillflow -- projections dlq-requeue my_projection --id 123 --database-url "$DATABASE_URL"
+cargo run --bin rillflow -- projections dlq-delete my_projection --id 123 --database-url "$DATABASE_URL"
 ```
 
 Feature flag: the CLI is gated behind the `cli` feature. Enable it when building/running:

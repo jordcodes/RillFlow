@@ -198,6 +198,56 @@ impl ProjectionDaemon {
         Ok(out)
     }
 
+    /// List DLQ items for a projection (most recent first)
+    pub async fn dlq_list(&self, name: &str, limit: i64) -> Result<Vec<ProjectionDlqItem>> {
+        let rows: Vec<(i64, i64, String, chrono::DateTime<chrono::Utc>, String)> = sqlx::query_as(
+            r#"select id, global_seq, event_type, failed_at, error
+                from projection_dlq where name = $1
+                order by id desc limit $2"#,
+        )
+        .bind(name)
+        .bind(limit.max(1))
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(id, seq, typ, failed_at, error)| ProjectionDlqItem {
+                id,
+                seq,
+                event_type: typ,
+                failed_at,
+                error,
+            })
+            .collect())
+    }
+
+    /// Delete a single DLQ item
+    pub async fn dlq_delete(&self, name: &str, id: i64) -> Result<()> {
+        sqlx::query("delete from projection_dlq where name = $1 and id = $2")
+            .bind(name)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Requeue a DLQ item by setting checkpoint to seq-1 and deleting the DLQ row
+    pub async fn dlq_requeue(&self, name: &str, id: i64) -> Result<()> {
+        let rec: Option<i64> =
+            sqlx::query_scalar("select global_seq from projection_dlq where name = $1 and id = $2")
+                .bind(name)
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        if let Some(seq) = rec {
+            let reset_to = seq.saturating_sub(1);
+            self.reset_checkpoint(name, reset_to).await?;
+            self.dlq_delete(name, id).await?;
+        }
+        Ok(())
+    }
+
     pub async fn status(&self, name: &str) -> Result<ProjectionStatus> {
         let last_seq: Option<i64> =
             sqlx::query_scalar("select last_seq from projections where name = $1")
@@ -516,6 +566,15 @@ pub enum TickResult {
     Backoff,
     LeasedByOther,
     Processed { count: u32 },
+}
+
+#[derive(Clone, Debug)]
+pub struct ProjectionDlqItem {
+    pub id: i64,
+    pub seq: i64,
+    pub event_type: String,
+    pub failed_at: chrono::DateTime<chrono::Utc>,
+    pub error: String,
 }
 
 fn quote_ident(value: &str) -> String {

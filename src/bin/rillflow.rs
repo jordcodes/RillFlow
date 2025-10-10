@@ -57,6 +57,18 @@ enum ProjectionsCmd {
     Rebuild { name: String },
     /// Run a single processing tick for one projection (by name) or all registered if omitted
     RunOnce { name: Option<String> },
+    /// Run until idle (no projection has work)
+    RunUntilIdle { name: Option<String> },
+    /// Dead Letter Queue: list recent failures
+    DlqList {
+        name: String,
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+    },
+    /// Dead Letter Queue: requeue one item by id (sets checkpoint to id's seq - 1)
+    DlqRequeue { name: String, id: i64 },
+    /// Dead Letter Queue: delete one item by id
+    DlqDelete { name: String, id: i64 },
 }
 
 #[derive(Subcommand, Debug)]
@@ -194,6 +206,40 @@ async fn main() -> rillflow::Result<()> {
                         daemon.tick_all_once().await?;
                         println!("tick-all executed");
                     }
+                }
+                ProjectionsCmd::RunUntilIdle { name } => {
+                    if let Some(n) = name {
+                        // run only this projection until idle
+                        loop {
+                            let res = daemon.tick_once(&n).await?;
+                            match res {
+                                rillflow::projection_runtime::TickResult::Processed { count }
+                                    if count > 0 => {}
+                                _ => break,
+                            }
+                        }
+                        println!("{}: idle", n);
+                    } else {
+                        daemon.run_until_idle().await?;
+                        println!("all projections idle");
+                    }
+                }
+                ProjectionsCmd::DlqList { name, limit } => {
+                    let items = daemon.dlq_list(&name, limit).await?;
+                    for i in items {
+                        println!(
+                            "id={} seq={} type={} failed_at={} error={}",
+                            i.id, i.seq, i.event_type, i.failed_at, i.error
+                        );
+                    }
+                }
+                ProjectionsCmd::DlqRequeue { name, id } => {
+                    daemon.dlq_requeue(&name, id).await?;
+                    println!("requeued {}:{}", name, id);
+                }
+                ProjectionsCmd::DlqDelete { name, id } => {
+                    daemon.dlq_delete(&name, id).await?;
+                    println!("deleted {}:{}", name, id);
                 }
             }
         }
