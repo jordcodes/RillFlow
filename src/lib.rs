@@ -1,5 +1,6 @@
 //! Rillflow — document + event store for Rust, powered by Postgres.
 
+pub mod aggregates;
 pub mod documents;
 mod error;
 pub mod events;
@@ -11,6 +12,7 @@ pub mod store;
 pub mod testing;
 pub mod tracing;
 
+pub use aggregates::{Aggregate, AggregateRepository};
 pub use error::{Error, Result};
 pub use events::EventEnvelope;
 pub use events::{Event, Expected};
