@@ -85,6 +85,28 @@ store
   .await?;
 ```
 
+### Subscriptions (polling)
+
+Create a subscription with filters, then tail events.
+
+```bash
+cargo run --features cli --bin rillflow -- subscriptions create s1 --event-type Ping --start-from 0
+cargo run --features cli --bin rillflow -- subscriptions tail s1 --limit 10
+```
+
+Programmatic:
+
+```rust
+use rillflow::subscriptions::{Subscriptions, SubscriptionFilter, SubscriptionOptions};
+let subs = Subscriptions::new_with_schema(store.pool().clone(), "public");
+let filter = SubscriptionFilter { event_types: Some(vec!["Ping".into()]), ..Default::default() };
+let opts = SubscriptionOptions { start_from: 0, ..Default::default() };
+let (_handle, mut rx) = subs.subscribe("s1", filter, opts).await?;
+while let Some(env) = rx.recv().await {
+    println!("{} {} {}", env.stream_id, env.stream_seq, env.typ);
+}
+```
+
 ### Aggregates
 
 Fold streams into domain state with a simple trait and repository.

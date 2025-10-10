@@ -33,11 +33,22 @@ impl Default for SubscriptionOptions {
 
 pub struct Subscriptions {
     pool: PgPool,
+    schema: String,
 }
 
 impl Subscriptions {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            schema: "public".to_string(),
+        }
+    }
+
+    pub fn new_with_schema(pool: PgPool, schema: impl Into<String>) -> Self {
+        Self {
+            pool,
+            schema: schema.into(),
+        }
     }
 
     /// Create or update a subscription checkpoint and filter.
@@ -73,9 +84,17 @@ impl Subscriptions {
 
         let (tx, rx) = mpsc::channel::<EventEnvelope>(opts.channel_capacity);
         let pool = self.pool.clone();
+        let schema = self.schema.clone();
         let name_s = name.to_string();
         tokio::spawn(async move {
             let mut cursor = opts.start_from;
+            // Acquire a dedicated connection and set search_path for consistent schema scoping
+            let mut conn = match pool.acquire().await {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let set_path = format!("set search_path to \"{}\"", schema.replace('"', "\""));
+            let _ = sqlx::query(&set_path).execute(&mut *conn).await;
             let mut last_checkpoint = Instant::now();
             loop {
                 // read pause/backoff
@@ -83,7 +102,7 @@ impl Subscriptions {
                     "select paused from subscriptions where name = $1",
                 )
                 .bind(&name_s)
-                .fetch_one(&pool)
+                .fetch_one(&mut *conn)
                 .await
                 {
                     if paused {
@@ -116,7 +135,7 @@ impl Subscriptions {
                 .bind(filter.stream_ids.clone())
                 .bind(filter.stream_prefix.clone())
                 .bind(opts.batch_size)
-                .fetch_all(&pool)
+                .fetch_all(&mut *conn)
                 .await
                 .unwrap_or_default();
 
@@ -148,7 +167,7 @@ impl Subscriptions {
                     )
                     .bind(&name_s)
                     .bind(cursor)
-                    .execute(&pool)
+                    .execute(&mut *conn)
                     .await;
                     last_checkpoint = Instant::now();
                 }
