@@ -51,6 +51,7 @@ cargo run --features cli --bin rillflow -- schema-plan --database-url "$DATABASE
 - LINQ-like document query DSL (filters, sorting, paging, projections)
 - Composable compiled queries for cached predicates and reuse
 - Event streams with expected-version checks
+  - Envelopes: headers, causation_id, correlation_id, created_at (API: read envelopes, append with headers)
 - Projection replay and checkpointing helpers
 - Projection runtime (daemon-ready primitives): per-projection checkpoints, leases, DLQ; CLI admin
 - Developer tracing breadcrumbs with Mermaid export (dev-only)

@@ -19,6 +19,7 @@ The `sql/0001_init.sql` migration creates:
 
 - `docs`: JSONB document store with optimistic version column
 - `events`: append-only event store with global and stream sequence numbers
+  - Columns include `headers jsonb`, `causation_id uuid`, `correlation_id uuid`, and `created_at`.
 - `projections`: checkpoint table for projection processors
 
 Rillflow's schema manager (CLI) can also create projection runtime support tables:

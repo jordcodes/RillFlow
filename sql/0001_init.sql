@@ -16,6 +16,9 @@ create table if not exists events (
     stream_seq int not null,
     event_type text not null,
     body jsonb not null,
+    headers jsonb not null default '{}'::jsonb,
+    causation_id uuid null,
+    correlation_id uuid null,
     created_at timestamptz not null default now(),
     unique (stream_id, stream_seq)
 );
@@ -26,4 +29,3 @@ create table if not exists projections (
     last_seq bigint not null default 0,
     updated_at timestamptz not null default now()
 );
-

@@ -368,6 +368,9 @@ fn build_events_table_sql(schema: &str) -> String {
             stream_seq int not null,
             event_type text not null,
             body jsonb not null,
+            headers jsonb not null default '{{}}'::jsonb,
+            causation_id uuid null,
+            correlation_id uuid null,
             created_at timestamptz not null default now(),
             unique (stream_id, stream_seq)
         )

@@ -12,6 +12,7 @@ pub mod testing;
 pub mod tracing;
 
 pub use error::{Error, Result};
+pub use events::EventEnvelope;
 pub use events::{Event, Expected};
 pub use schema::{SchemaConfig, SchemaManager, SchemaPlan, TenancyMode, TenantSchema};
 pub use store::Store;
