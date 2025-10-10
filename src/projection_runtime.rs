@@ -4,6 +4,7 @@ use std::time::Duration;
 use crate::{Error, Result, projections::ProjectionHandler};
 use serde_json::Value;
 use sqlx::{PgPool, types::Json};
+use tracing::{info, instrument, warn};
 
 #[derive(Clone, Debug)]
 pub struct ProjectionWorkerConfig {
@@ -57,6 +58,7 @@ impl ProjectionDaemon {
     }
 
     /// Execute one processing tick for the given projection name (if registered).
+    #[instrument(skip_all, fields(projection = %name, schema = %self.config.schema))]
     pub async fn tick_once(&self, name: &str) -> Result<TickResult> {
         let reg = self
             .registrations
@@ -114,6 +116,7 @@ impl ProjectionDaemon {
             // apply within the same transaction to keep read model + checkpoint atomic
             if let Err(err) = reg.handler.apply(&typ, &body, &mut tx).await {
                 // record to DLQ, set backoff, advance checkpoint to skip poison pill for now
+                warn!(error = %err, seq = seq, event_type = %typ, "projection handler failed; sending to DLQ and backing off");
                 self.insert_dlq(&mut tx, name, seq, &typ, &body, &format!("{}", err))
                     .await?;
                 self.increment_attempts_and_set_backoff(name).await?;
@@ -129,6 +132,11 @@ impl ProjectionDaemon {
         tx.commit().await?;
         self.refresh_lease(name).await?;
 
+        info!(
+            processed = processed,
+            last_seq = new_last,
+            "tick processed batch"
+        );
         Ok(TickResult::Processed {
             count: processed as u32,
         })
@@ -209,6 +217,7 @@ impl ProjectionDaemon {
         })
     }
 
+    #[instrument(skip_all, fields(projection = %name))]
     pub async fn pause(&self, name: &str) -> Result<()> {
         sqlx::query(
             r#"insert into projection_control(name, paused) values($1, true)
@@ -220,6 +229,7 @@ impl ProjectionDaemon {
         Ok(())
     }
 
+    #[instrument(skip_all, fields(projection = %name))]
     pub async fn resume(&self, name: &str) -> Result<()> {
         sqlx::query(
             r#"insert into projection_control(name, paused, backoff_until) values($1, false, null)
@@ -231,11 +241,13 @@ impl ProjectionDaemon {
         Ok(())
     }
 
+    #[instrument(skip_all, fields(projection = %name, seq = seq))]
     pub async fn reset_checkpoint(&self, name: &str, seq: i64) -> Result<()> {
         self.persist_checkpoint(&mut self.pool.begin().await?, name, seq)
             .await
     }
 
+    #[instrument(skip_all, fields(projection = %name))]
     pub async fn rebuild(&self, name: &str) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         self.persist_checkpoint(&mut tx, name, 0).await?;
