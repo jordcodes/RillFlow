@@ -10,6 +10,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("version conflict")]
     VersionConflict,
+    #[error("unknown projection: {0}")]
+    UnknownProjection(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

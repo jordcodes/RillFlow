@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::{Result, projections::ProjectionHandler};
+use crate::{Error, Result, projections::ProjectionHandler};
 use serde_json::Value;
 use sqlx::{PgPool, types::Json};
 
@@ -62,9 +62,7 @@ impl ProjectionDaemon {
             .registrations
             .iter()
             .find(|r| r.name == name)
-            .ok_or_else(|| {
-                sqlx::Error::Protocol(format!("unknown projection `{}`", name).into())
-            })?;
+            .ok_or_else(|| Error::UnknownProjection(name.to_string()))?;
 
         if self.is_paused(name).await? {
             return Ok(TickResult::Paused);
