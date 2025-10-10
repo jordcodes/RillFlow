@@ -33,6 +33,7 @@ pub struct AppendOptions {
     pub correlation_id: Option<Uuid>,
 }
 
+#[derive(Clone)]
 pub struct Events {
     pub(crate) pool: PgPool,
     pub(crate) use_advisory_lock: bool,
@@ -200,5 +201,61 @@ impl Events {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    pub fn builder(&self, stream_id: Uuid) -> AppendBuilder {
+        AppendBuilder {
+            events: Vec::new(),
+            opts: AppendOptions::default(),
+            expected: Expected::Any,
+            stream_id,
+            inner: self.clone(),
+        }
+    }
+}
+
+pub struct AppendBuilder {
+    inner: Events,
+    stream_id: Uuid,
+    expected: Expected,
+    opts: AppendOptions,
+    events: Vec<Event>,
+}
+
+impl AppendBuilder {
+    pub fn expected(mut self, expected: Expected) -> Self {
+        self.expected = expected;
+        self
+    }
+
+    pub fn headers(mut self, headers: serde_json::Value) -> Self {
+        self.opts.headers = Some(headers);
+        self
+    }
+
+    pub fn causation_id(mut self, id: Uuid) -> Self {
+        self.opts.causation_id = Some(id);
+        self
+    }
+
+    pub fn correlation_id(mut self, id: Uuid) -> Self {
+        self.opts.correlation_id = Some(id);
+        self
+    }
+
+    pub fn push(mut self, event: Event) -> Self {
+        self.events.push(event);
+        self
+    }
+
+    pub fn extend<I: IntoIterator<Item = Event>>(mut self, iter: I) -> Self {
+        self.events.extend(iter);
+        self
+    }
+
+    pub async fn send(self) -> Result<()> {
+        self.inner
+            .append_with(self.stream_id, self.expected, self.events, &self.opts)
+            .await
     }
 }

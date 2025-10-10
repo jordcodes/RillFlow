@@ -127,6 +127,32 @@ repo.commit(id, rillflow::Expected::Any, vec![Event::new("Inc", &())]).await?;
 let agg: Counter = repo.load(id).await?;
 ```
 
+Append builder and validator hook:
+
+```rust
+use serde_json::json;
+
+// Fluent append with headers/ids and batching
+store
+  .events()
+  .builder(id)
+  .headers(json!({"req_id": "abc-123"}))
+  .push(Event::new("Inc", &json!({})))
+  .expected(rillflow::Expected::Any)
+  .send()
+  .await?;
+
+// Optional pre-commit validator (receives aggregate state as JSON)
+fn validate(state: &serde_json::Value) -> rillflow::Result<()> {
+  // example: reject negative counters
+  if state.get("n").and_then(|v| v.as_i64()).unwrap_or(0) < 0 { return Err(rillflow::Error::VersionConflict); }
+  Ok(())
+}
+
+let repo = rillflow::AggregateRepository::new(store.events())
+  .with_validator(validate);
+```
+
 ### Snapshots
 
 Persist aggregate state every N events to speed up loads.

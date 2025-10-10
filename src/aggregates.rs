@@ -19,11 +19,23 @@ pub trait Aggregate: Sized {
 /// Repository for loading and committing event-sourced aggregates.
 pub struct AggregateRepository {
     events: Events,
+    validator: Option<fn(&serde_json::Value) -> crate::Result<()>>,
 }
 
 impl AggregateRepository {
     pub fn new(events: Events) -> Self {
-        Self { events }
+        Self {
+            events,
+            validator: None,
+        }
+    }
+
+    pub fn with_validator(
+        mut self,
+        validator: fn(&serde_json::Value) -> crate::Result<()>,
+    ) -> Self {
+        self.validator = Some(validator);
+        self
     }
 
     /// Load an aggregate by folding its stream envelopes in order.
@@ -93,6 +105,10 @@ impl AggregateRepository {
         snapshot_every: i32,
     ) -> Result<()> {
         let new_version = aggregate.version() + events.len() as i32;
+        if let Some(v) = self.validator {
+            let snapshot = serde_json::to_value(aggregate)?;
+            v(&snapshot)?;
+        }
         self.commit_for_aggregate(stream_id, aggregate, events)
             .await?;
         if new_version % snapshot_every == 0 {
