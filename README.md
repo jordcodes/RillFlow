@@ -45,6 +45,8 @@ cargo run --bin rillflow -- projections run-until-idle --name my_projection --da
 cargo run --bin rillflow -- projections dlq-list my_projection --database-url "$DATABASE_URL" --limit 100
 cargo run --bin rillflow -- projections dlq-requeue my_projection --id 123 --database-url "$DATABASE_URL"
 cargo run --bin rillflow -- projections dlq-delete my_projection --id 123 --database-url "$DATABASE_URL"
+# metrics
+cargo run --bin rillflow -- projections metrics my_projection --database-url "$DATABASE_URL"
 ```
 
 Feature flag: the CLI is gated behind the `cli` feature. Enable it when building/running:
@@ -144,6 +146,10 @@ CLI tail with group:
 
 ```bash
 cargo run --features cli --bin rillflow -- subscriptions tail orders --group workers-a --limit 10 --database-url "$DATABASE_URL"
+
+# group admin
+cargo run --features cli --bin rillflow -- subscriptions groups orders --database-url "$DATABASE_URL"
+cargo run --features cli --bin rillflow -- subscriptions group-status orders --group workers-a --database-url "$DATABASE_URL"
 ```
 
 Manual ack mode (explicit checkpointing):

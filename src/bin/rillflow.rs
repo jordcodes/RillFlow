@@ -69,6 +69,8 @@ enum ProjectionsCmd {
     DlqRequeue { name: String, id: i64 },
     /// Dead Letter Queue: delete one item by id
     DlqDelete { name: String, id: i64 },
+    /// Show basic metrics (lag, last_seq, dlq)
+    Metrics { name: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -102,6 +104,10 @@ enum SubscriptionsCmd {
         #[arg(long)]
         group: Option<String>,
     },
+    /// Group admin: list groups for a subscription
+    Groups { name: String },
+    /// Group admin: show a group status (checkpoint and lease)
+    GroupStatus { name: String, group: String },
 }
 
 #[tokio::main]
@@ -244,6 +250,13 @@ async fn main() -> rillflow::Result<()> {
                     daemon.dlq_delete(&name, id).await?;
                     println!("deleted {}:{}", name, id);
                 }
+                ProjectionsCmd::Metrics { name } => {
+                    let m = daemon.metrics(&name).await?;
+                    println!(
+                        "{} last_seq={} head_seq={} lag={} dlq_count={}",
+                        m.name, m.last_seq, m.head_seq, m.lag, m.dlq_count
+                    );
+                }
             }
         }
         Commands::Subscriptions(cmd) => {
@@ -369,6 +382,47 @@ async fn main() -> rillflow::Result<()> {
                             break;
                         }
                     }
+                }
+                SubscriptionsCmd::Groups { name } => {
+                    let rows = sqlx::query(
+                        "select grp, last_seq from subscription_groups where name=$1 order by grp",
+                    )
+                    .bind(&name)
+                    .fetch_all(store.pool())
+                    .await?;
+                    for r in rows {
+                        let grp: String = r.get("grp");
+                        let last_seq: i64 = r.get::<Option<i64>, _>("last_seq").unwrap_or(0);
+                        println!("{}:{} last_seq={}", name, grp, last_seq);
+                    }
+                }
+                SubscriptionsCmd::GroupStatus { name, group } => {
+                    let last_seq: i64 = sqlx::query_scalar(
+                        "select last_seq from subscription_groups where name=$1 and grp=$2",
+                    )
+                    .bind(&name)
+                    .bind(&group)
+                    .fetch_optional(store.pool())
+                    .await?
+                    .unwrap_or(0);
+                    let leased_by: Option<String> = sqlx::query_scalar(
+                        "select leased_by from subscription_group_leases where name=$1 and grp=$2",
+                    )
+                    .bind(&name)
+                    .bind(&group)
+                    .fetch_optional(store.pool())
+                    .await?;
+                    let lease_until: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+                        "select lease_until from subscription_group_leases where name=$1 and grp=$2",
+                    )
+                    .bind(&name)
+                    .bind(&group)
+                    .fetch_optional(store.pool())
+                    .await?;
+                    println!(
+                        "{}:{} last_seq={} leased_by={:?} lease_until={:?}",
+                        name, group, last_seq, leased_by, lease_until
+                    );
                 }
             }
         }

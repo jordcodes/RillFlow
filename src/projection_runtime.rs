@@ -297,6 +297,33 @@ impl ProjectionDaemon {
         })
     }
 
+    /// Compute simple metrics: last checkpoint, head of events, lag and DLQ size.
+    pub async fn metrics(&self, name: &str) -> Result<ProjectionMetrics> {
+        let last_seq: i64 = sqlx::query_scalar("select last_seq from projections where name = $1")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?
+            .unwrap_or(0);
+
+        let head_seq: i64 = sqlx::query_scalar("select coalesce(max(global_seq), 0) from events")
+            .fetch_one(&self.pool)
+            .await?;
+
+        let dlq_count: i64 =
+            sqlx::query_scalar("select count(1) from projection_dlq where name = $1")
+                .bind(name)
+                .fetch_one(&self.pool)
+                .await?;
+
+        Ok(ProjectionMetrics {
+            name: name.to_string(),
+            last_seq,
+            head_seq,
+            lag: (head_seq - last_seq).max(0),
+            dlq_count,
+        })
+    }
+
     #[instrument(skip_all, fields(projection = %name))]
     pub async fn pause(&self, name: &str) -> Result<()> {
         sqlx::query(
@@ -556,6 +583,15 @@ pub struct ProjectionStatus {
     pub backoff_until: Option<chrono::DateTime<chrono::Utc>>,
     pub leased_by: Option<String>,
     pub lease_until: Option<chrono::DateTime<chrono::Utc>>,
+    pub dlq_count: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProjectionMetrics {
+    pub name: String,
+    pub last_seq: i64,
+    pub head_seq: i64,
+    pub lag: i64,
     pub dlq_count: i64,
 }
 
