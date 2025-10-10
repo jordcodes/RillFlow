@@ -39,6 +39,10 @@ enum Commands {
     /// Subscriptions admin commands
     #[command(subcommand)]
     Subscriptions(SubscriptionsCmd),
+
+    /// Stream alias helpers
+    #[command(subcommand)]
+    Streams(StreamsCmd),
 }
 
 #[derive(Subcommand, Debug)]
@@ -108,6 +112,12 @@ enum SubscriptionsCmd {
     Groups { name: String },
     /// Group admin: show a group status (checkpoint and lease)
     GroupStatus { name: String, group: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum StreamsCmd {
+    /// Resolve or create a stream id for an alias
+    Resolve { alias: String },
 }
 
 #[tokio::main]
@@ -426,6 +436,12 @@ async fn main() -> rillflow::Result<()> {
                 }
             }
         }
+        Commands::Streams(cmd) => match cmd {
+            StreamsCmd::Resolve { alias } => {
+                let id = store.resolve_stream_alias(&alias).await?;
+                println!("{} -> {}", alias, id);
+            }
+        },
     }
 
     Ok(())

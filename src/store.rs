@@ -43,6 +43,34 @@ impl Store {
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
+
+    /// Resolve a human alias to a stream_id UUID, creating if missing.
+    pub async fn resolve_stream_alias(&self, alias: &str) -> crate::Result<uuid::Uuid> {
+        if let Some(id) = sqlx::query_scalar::<_, uuid::Uuid>(
+            "select stream_id from stream_aliases where alias=$1",
+        )
+        .bind(alias)
+        .fetch_optional(&self.pool)
+        .await?
+        {
+            return Ok(id);
+        }
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "insert into stream_aliases(alias, stream_id) values($1,$2) on conflict (alias) do nothing",
+        )
+        .bind(alias)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        let resolved = sqlx::query_scalar::<_, uuid::Uuid>(
+            "select stream_id from stream_aliases where alias=$1",
+        )
+        .bind(alias)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(resolved)
+    }
 }
 
 pub struct StoreBuilder {

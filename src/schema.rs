@@ -138,6 +138,15 @@ impl SchemaManager {
             build_snapshots_table_sql,
         );
 
+        // Stream aliases
+        ensure_table(
+            plan,
+            schema,
+            &existing_tables,
+            "stream_aliases",
+            build_stream_aliases_table_sql,
+        );
+
         // Subscription consumer groups (per-group checkpoints and leases)
         ensure_table(
             plan,
@@ -485,6 +494,19 @@ fn build_projection_dlq_table_sql(schema: &str) -> String {
         )
         ",
         table = qualified_name(schema, "projection_dlq"),
+    )
+}
+
+fn build_stream_aliases_table_sql(schema: &str) -> String {
+    formatdoc!(
+        r#"
+        create table if not exists {table} (
+            alias text primary key,
+            stream_id uuid not null,
+            created_at timestamptz not null default now()
+        )
+        "#,
+        table = qualified_name(schema, "stream_aliases"),
     )
 }
 

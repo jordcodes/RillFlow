@@ -49,6 +49,11 @@ cargo run --bin rillflow -- projections dlq-delete my_projection --id 123 --data
 cargo run --bin rillflow -- projections metrics my_projection --database-url "$DATABASE_URL"
 ```
 
+- Streams
+```bash
+cargo run --bin rillflow -- streams resolve orders:42 --database-url "$DATABASE_URL"
+```
+
 Feature flag: the CLI is gated behind the `cli` feature. Enable it when building/running:
 
 ```bash
@@ -207,6 +212,18 @@ let repo = AggregateRepository::new(store.events());
 let id = uuid::Uuid::new_v4();
 repo.commit(id, rillflow::Expected::Any, vec![Event::new("Inc", &())]).await?;
 let agg: Counter = repo.load(id).await?;
+```
+
+### Stream Aliases
+
+Resolve a human-friendly alias to a `Uuid`, creating it on first use.
+
+```rust
+let id = store.resolve_stream_alias("orders:42").await?;
+store
+  .events()
+  .append_stream(id, rillflow::Expected::Any, vec![Event::new("OrderPlaced", &serde_json::json!({}))])
+  .await?;
 ```
 
 Append builder and validator hook:

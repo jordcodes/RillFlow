@@ -29,6 +29,13 @@ create unique index if not exists events_idemp_key_uq on events (
 )
 where (headers ? 'idempotency_key');
 
+-- stream aliases (human key to stream_id)
+create table if not exists stream_aliases (
+    alias text primary key,
+    stream_id uuid not null,
+    created_at timestamptz not null default now()
+);
+
 -- projection checkpoints
 create table if not exists projections (
     name text primary key,
