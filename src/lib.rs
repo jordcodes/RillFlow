@@ -8,6 +8,7 @@ pub mod projection_runtime;
 pub mod projections;
 pub mod query;
 pub mod schema;
+pub mod snapshotter;
 pub mod store;
 pub mod subscriptions;
 pub mod testing;

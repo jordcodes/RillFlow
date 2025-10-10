@@ -48,6 +48,10 @@ enum Commands {
     /// Documents admin commands
     #[command(subcommand)]
     Docs(DocsCmd),
+
+    /// Snapshots compaction
+    #[command(subcommand)]
+    Snapshots(SnapshotsCmd),
 }
 
 #[derive(Subcommand, Debug)]
@@ -133,6 +137,24 @@ enum DocsCmd {
     SoftDelete { id: String },
     /// Restore a soft-deleted document (clears deleted_at)
     Restore { id: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum SnapshotsCmd {
+    /// Write snapshots for streams where head - snapshot.version >= threshold (version-only body)
+    CompactOnce {
+        #[arg(long, default_value_t = 100)]
+        threshold: i32,
+        #[arg(long, default_value_t = 100)]
+        batch: i64,
+    },
+    /// Repeatedly compact until no more streams exceed the threshold
+    RunUntilIdle {
+        #[arg(long, default_value_t = 100)]
+        threshold: i32,
+        #[arg(long, default_value_t = 100)]
+        batch: i64,
+    },
 }
 
 #[tokio::main]
@@ -483,6 +505,24 @@ async fn main() -> rillflow::Result<()> {
                 println!("restored {}", id);
             }
         },
+        Commands::Snapshots(cmd) => match cmd {
+            SnapshotsCmd::CompactOnce { threshold, batch } => {
+                let n = compact_snapshots_once(store.pool(), &cli.schema, threshold, batch).await?;
+                println!("compacted {} stream(s)", n);
+            }
+            SnapshotsCmd::RunUntilIdle { threshold, batch } => {
+                let mut total = 0u64;
+                loop {
+                    let n =
+                        compact_snapshots_once(store.pool(), &cli.schema, threshold, batch).await?;
+                    total += n as u64;
+                    if n == 0 {
+                        break;
+                    }
+                }
+                println!("compacted total {} stream(s)", total);
+            }
+        },
     }
 
     Ok(())
@@ -506,4 +546,54 @@ fn print_plan(plan: &rillflow::SchemaPlan) {
         println!("{}. {}", i + 1, action.description());
         println!("{}\n", action.sql());
     }
+}
+
+async fn compact_snapshots_once(
+    pool: &sqlx::PgPool,
+    schema: &str,
+    threshold: i32,
+    batch: i64,
+) -> rillflow::Result<u32> {
+    let set_search_path = format!("set local search_path to {}", quote_ident(schema));
+    let mut tx = pool.begin().await?;
+    sqlx::query(&set_search_path).execute(&mut *tx).await?;
+    let rows: Vec<(uuid::Uuid, i32)> = sqlx::query_as(
+        r#"
+        select e.stream_id,
+               max(e.stream_seq) as head
+          from events e
+          left join snapshots s on s.stream_id = e.stream_id
+         group by e.stream_id, s.version
+        having max(e.stream_seq) - coalesce(s.version, 0) >= $1
+         limit $2
+        "#,
+    )
+    .bind(threshold)
+    .bind(batch)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    if rows.is_empty() {
+        tx.commit().await?;
+        return Ok(0);
+    }
+
+    for (stream_id, head) in rows {
+        sqlx::query(
+            r#"insert into snapshots(stream_id, version, body)
+                values ($1, $2, '{}'::jsonb)
+                on conflict (stream_id) do update set version = excluded.version, body = excluded.body, created_at = now()"#,
+        )
+        .bind(stream_id)
+        .bind(head)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(rows.len() as u32)
+}
+
+fn quote_ident(value: &str) -> String {
+    let escaped = value.replace('"', "\"\"");
+    format!("\"{}\"", escaped)
 }

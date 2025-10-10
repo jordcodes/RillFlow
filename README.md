@@ -54,6 +54,12 @@ cargo run --bin rillflow -- projections metrics my_projection --database-url "$D
 cargo run --bin rillflow -- streams resolve orders:42 --database-url "$DATABASE_URL"
 ```
 
+- Snapshots
+```bash
+cargo run --bin rillflow -- snapshots compact-once --threshold 200 --batch 200 --database-url "$DATABASE_URL" --schema public
+cargo run --bin rillflow -- snapshots run-until-idle --threshold 200 --batch 200 --database-url "$DATABASE_URL" --schema public
+```
+
 Feature flag: the CLI is gated behind the `cli` feature. Enable it when building/running:
 
 ```bash
