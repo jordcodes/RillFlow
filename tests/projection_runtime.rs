@@ -83,7 +83,10 @@ async fn projection_tick_and_pause_resume() -> Result<()> {
     // pause then tick — should be Paused, count unchanged
     daemon.pause("counter").await?;
     let res = daemon.tick_once("counter").await?;
-    matches!(res, rillflow::projection_runtime::TickResult::Paused);
+    assert!(matches!(
+        res,
+        rillflow::projection_runtime::TickResult::Paused
+    ));
 
     // resume and append one more event; tick processes it
     daemon.resume("counter").await?;

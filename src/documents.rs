@@ -14,31 +14,20 @@ pub struct Documents {
 impl Documents {
     pub async fn upsert<T: Serialize>(&self, id: &Uuid, doc: &T) -> Result<()> {
         let json = serde_json::to_value(doc)?;
-        let mut tx = self.pool.begin().await?;
-
-        let current_version: Option<i32> =
-            sqlx::query_scalar("select version from docs where id = $1 for update")
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await?;
-
-        if current_version.is_some() {
-            sqlx::query(
-                "update docs set doc = $2, version = version + 1, updated_at = now() where id = $1",
-            )
-            .bind(id)
-            .bind(&json)
-            .execute(&mut *tx)
-            .await?;
-        } else {
-            sqlx::query("insert into docs (id, doc, version) values ($1, $2, 0)")
-                .bind(id)
-                .bind(&json)
-                .execute(&mut *tx)
-                .await?;
-        }
-
-        tx.commit().await?;
+        sqlx::query(
+            r#"
+            insert into docs (id, doc, version)
+            values ($1, $2, 0)
+            on conflict (id) do update
+              set doc = excluded.doc,
+                  version = docs.version + 1,
+                  updated_at = now()
+            "#,
+        )
+        .bind(id)
+        .bind(&json)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
