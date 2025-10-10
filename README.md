@@ -19,6 +19,26 @@ docker --version    # ensure Docker daemon is running
 cargo test --test integration_postgres
 ```
 
+### CLI
+
+- Schema
+```bash
+cargo run --bin rillflow -- schema-plan --database-url "$DATABASE_URL" --schema public
+cargo run --bin rillflow -- schema-sync  --database-url "$DATABASE_URL" --schema public
+```
+
+- Projections admin
+```bash
+cargo run --bin rillflow -- projections list --database-url "$DATABASE_URL"
+cargo run --bin rillflow -- projections status my_projection --database-url "$DATABASE_URL"
+cargo run --bin rillflow -- projections pause my_projection --database-url "$DATABASE_URL"
+cargo run --bin rillflow -- projections resume my_projection --database-url "$DATABASE_URL"
+cargo run --bin rillflow -- projections reset-checkpoint my_projection 0 --database-url "$DATABASE_URL"
+cargo run --bin rillflow -- projections rebuild my_projection --database-url "$DATABASE_URL"
+cargo run --bin rillflow -- projections run-once --database-url "$DATABASE_URL"            # tick all
+cargo run --bin rillflow -- projections run-once --name my_projection --database-url "$DATABASE_URL"
+```
+
 ## Features
 
 - JSONB document store with optimistic versioning
@@ -26,6 +46,7 @@ cargo test --test integration_postgres
 - Composable compiled queries for cached predicates and reuse
 - Event streams with expected-version checks
 - Projection replay and checkpointing helpers
+- Projection runtime (daemon-ready primitives): per-projection checkpoints, leases, DLQ; CLI admin
 - Developer tracing breadcrumbs with Mermaid export (dev-only)
 - Integration test harness using Testcontainers (Docker required)
 
@@ -56,6 +77,47 @@ async fn active_customers(store: &Store) -> rillflow::Result<Vec<Customer>> {
 ```
 
 See `MIGRATIONS.md` for guidance on adding workload-specific JSONB indexes for query performance.
+### Projections Runtime (daemon primitives)
+
+Minimal runtime to process events into read models with leases, backoff, DLQ and admin CLI.
+
+Programmatic usage:
+
+```rust
+use std::sync::Arc;
+use rillflow::{Store, SchemaConfig};
+use rillflow::projection_runtime::{ProjectionDaemon, ProjectionWorkerConfig};
+use rillflow::projections::ProjectionHandler;
+
+struct MyProjection;
+
+#[async_trait::async_trait]
+impl ProjectionHandler for MyProjection {
+    async fn apply(
+        &self,
+        event_type: &str,
+        body: &serde_json::Value,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> rillflow::Result<()> {
+        // mutate your read model using tx
+        Ok(())
+    }
+}
+
+#[tokio::main]
+async fn main() -> rillflow::Result<()> {
+    let store = Store::connect(&std::env::var("DATABASE_URL")?).await?;
+    store.schema().sync(&SchemaConfig::single_tenant()).await?; // ensure tables
+
+    let mut daemon = ProjectionDaemon::new(store.pool().clone(), ProjectionWorkerConfig::default());
+    daemon.register("my_projection", Arc::new(MyProjection));
+    let _ = daemon.tick_once("my_projection").await?; // or loop/timer
+    Ok(())
+}
+```
+
+See runnable example: `examples/projection_run_once.rs`.
+
 
 #### Compiled Queries
 

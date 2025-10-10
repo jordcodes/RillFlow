@@ -21,6 +21,12 @@ The `sql/0001_init.sql` migration creates:
 - `events`: append-only event store with global and stream sequence numbers
 - `projections`: checkpoint table for projection processors
 
+Rillflow's schema manager (CLI) can also create projection runtime support tables:
+
+- `projection_control`: per-projection pause flags and backoff windows
+- `projection_leases`: cooperative leases to avoid double processing in multi-worker setups
+- `projection_dlq`: dead-letter queue of failed events for operator review
+
 Ensure your application runs this migration before executing any Rillflow APIs.
 
 ### Indexing Guidance

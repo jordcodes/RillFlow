@@ -106,6 +106,29 @@ impl SchemaManager {
             build_docs_index_sql,
         );
 
+        // Projection runtime tables (control, leases, DLQ)
+        ensure_table(
+            plan,
+            schema,
+            &existing_tables,
+            "projection_control",
+            build_projection_control_table_sql,
+        );
+        ensure_table(
+            plan,
+            schema,
+            &existing_tables,
+            "projection_leases",
+            build_projection_leases_table_sql,
+        );
+        ensure_table(
+            plan,
+            schema,
+            &existing_tables,
+            "projection_dlq",
+            build_projection_dlq_table_sql,
+        );
+
         Ok(())
     }
 
@@ -372,8 +395,53 @@ fn build_docs_index_sql(schema: &str) -> String {
         create index if not exists {index} on {table}
             using gin (doc)
         ",
-        index = qualified_name(schema, "docs_gin"),
+        index = quote_ident("docs_gin"),
         table = qualified_name(schema, "docs"),
+    )
+}
+
+fn build_projection_control_table_sql(schema: &str) -> String {
+    formatdoc!(
+        "
+        create table if not exists {table} (
+            name text primary key,
+            paused boolean not null default false,
+            backoff_until timestamptz null,
+            updated_at timestamptz not null default now()
+        )
+        ",
+        table = qualified_name(schema, "projection_control"),
+    )
+}
+
+fn build_projection_leases_table_sql(schema: &str) -> String {
+    formatdoc!(
+        "
+        create table if not exists {table} (
+            name text primary key,
+            leased_by text not null,
+            lease_until timestamptz not null,
+            updated_at timestamptz not null default now()
+        )
+        ",
+        table = qualified_name(schema, "projection_leases"),
+    )
+}
+
+fn build_projection_dlq_table_sql(schema: &str) -> String {
+    formatdoc!(
+        "
+        create table if not exists {table} (
+            id bigserial primary key,
+            name text not null,
+            global_seq bigint not null,
+            event_type text not null,
+            body jsonb not null,
+            error text not null,
+            failed_at timestamptz not null default now()
+        )
+        ",
+        table = qualified_name(schema, "projection_dlq"),
     )
 }
 
