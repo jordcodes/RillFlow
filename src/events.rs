@@ -189,7 +189,7 @@ impl Events {
             .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
         for event in events {
             seq += 1;
-            sqlx::query(
+            let res = sqlx::query(
                 r#"insert into events (stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id)
                     values ($1, $2, $3, $4, $5, $6, $7)"#,
             )
@@ -201,7 +201,20 @@ impl Events {
             .bind(opts.causation_id)
             .bind(opts.correlation_id)
             .execute(&mut *tx)
-            .await?;
+            .await;
+
+            if let Err(e) = res {
+                // Detect idempotency unique index violation by looking at constraint name/type
+                if let sqlx::Error::Database(db_err) = &e {
+                    let msg = db_err.message().to_lowercase();
+                    if msg.contains("events_idemp_key_uq")
+                        || msg.contains("unique") && msg.contains("idempotency_key")
+                    {
+                        return Err(Error::IdempotencyConflict);
+                    }
+                }
+                return Err(e.into());
+            }
         }
         tx.commit().await?;
         Ok(())
@@ -234,6 +247,19 @@ impl AppendBuilder {
 
     pub fn headers(mut self, headers: serde_json::Value) -> Self {
         self.opts.headers = Some(headers);
+        self
+    }
+
+    pub fn idempotency_key(mut self, key: impl Into<String>) -> Self {
+        let mut h = self
+            .opts
+            .headers
+            .take()
+            .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+        if let Value::Object(ref mut m) = h {
+            m.insert("idempotency_key".to_string(), Value::String(key.into()));
+        }
+        self.opts.headers = Some(h);
         self
     }
 

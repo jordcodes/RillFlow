@@ -102,6 +102,7 @@ async fn subscribe_and_receive_events() -> Result<()> {
         group: None,
         lease_ttl: Duration::from_secs(30),
         ack_mode: rillflow::subscriptions::AckMode::Auto,
+        max_in_flight: 1024,
     };
     let (_handle, mut rx) = subs.subscribe("s1", filter, opts).await?;
 

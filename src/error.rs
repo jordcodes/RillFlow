@@ -11,6 +11,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("version conflict")]
     VersionConflict,
+    #[error("idempotency conflict")]
+    IdempotencyConflict,
     #[error("unknown projection: {0}")]
     UnknownProjection(String),
 }

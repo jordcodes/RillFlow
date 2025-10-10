@@ -93,6 +93,19 @@ store
   .await?;
 ```
 
+Idempotent appends:
+
+```rust
+store
+  .events()
+  .builder(stream_id)
+  .idempotency_key("req-123")
+  .push(Event::new("OrderPlaced", &json!({"order_id": 42})))
+  .send()
+  .await?;
+// a second call with the same idempotency key will return Error::IdempotencyConflict
+```
+
 ### Subscriptions (polling)
 
 Create a subscription with filters, then tail events.
@@ -147,6 +160,26 @@ let (handle, mut rx) = subs.subscribe("s1", filter, opts).await?;
 while let Some(env) = rx.recv().await {
     // ... process ...
     handle.ack(env.global_seq).await?; // checkpoint when done
+}
+```
+
+Transactional ack (exactly-once-ish):
+
+```rust
+use sqlx::{Postgres, Transaction};
+use rillflow::subscriptions::{AckMode, SubscriptionOptions};
+
+let mut opts = SubscriptionOptions { start_from: 0, ..Default::default() };
+opts.ack_mode = AckMode::Manual; // we will ack inside our DB tx
+let (handle, mut rx) = subs.subscribe("orders", filter, opts).await?;
+
+while let Some(env) = rx.recv().await {
+  let mut tx: Transaction<'_, Postgres> = store.pool().begin().await?;
+  // 1) apply side effects in the same transaction
+  // ... your writes using &mut *tx ...
+  // 2) ack the subscription checkpoint in the same transaction
+  handle.ack_in_tx(&mut tx, env.global_seq).await?;
+  tx.commit().await?;
 }
 ```
 

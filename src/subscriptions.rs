@@ -1,6 +1,6 @@
 use crate::{Result, events::EventEnvelope};
 use serde::{Deserialize, Serialize};
-use sqlx::{Acquire, PgPool, Row, postgres::PgRow};
+use sqlx::{Acquire, PgPool, Postgres, Row, Transaction, postgres::PgRow};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant, sleep};
 use uuid::Uuid;
@@ -22,6 +22,7 @@ pub struct SubscriptionOptions {
     pub group: Option<String>,
     pub lease_ttl: Duration,
     pub ack_mode: AckMode,
+    pub max_in_flight: usize,
 }
 
 impl Default for SubscriptionOptions {
@@ -35,6 +36,7 @@ impl Default for SubscriptionOptions {
             group: None,
             lease_ttl: Duration::from_secs(30),
             ack_mode: AckMode::Auto,
+            max_in_flight: 1024,
         }
     }
 }
@@ -225,6 +227,7 @@ impl Subscriptions {
 
                 // Build dynamic filter via CASE checks; pass arrays or nulls and rely on ANY/LIKE.
 
+                let limit = std::cmp::min(opts.batch_size, opts.max_in_flight as i64);
                 let rows: Vec<PgRow> = sqlx::query(
                     r#"
                     with f as (
@@ -246,7 +249,7 @@ impl Subscriptions {
                 .bind(filter.event_types.clone())
                 .bind(filter.stream_ids.clone())
                 .bind(filter.stream_prefix.clone())
-                .bind(opts.batch_size)
+                .bind(limit)
                 .fetch_all(&mut *conn)
                 .await
                 .unwrap_or_default();
@@ -387,6 +390,32 @@ impl SubscriptionHandle {
 
     pub async fn ack(&self, to_seq: i64) -> Result<()> {
         self.checkpoint(to_seq).await
+    }
+
+    pub async fn ack_in_tx(&self, tx: &mut Transaction<'_, Postgres>, to_seq: i64) -> Result<()> {
+        match &self.group {
+            Some(grp) => {
+                sqlx::query(
+                    "insert into subscription_groups(name, grp, last_seq) values($1,$2,$3)
+                     on conflict(name,grp) do update set last_seq = excluded.last_seq, updated_at = now()",
+                )
+                .bind(&self.name)
+                .bind(grp)
+                .bind(to_seq)
+                .execute(&mut **tx)
+                .await?;
+            }
+            None => {
+                sqlx::query(
+                    "update subscriptions set last_seq = $2, updated_at = now() where name = $1",
+                )
+                .bind(&self.name)
+                .bind(to_seq)
+                .execute(&mut **tx)
+                .await?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn pause(&self) -> Result<()> {

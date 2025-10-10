@@ -23,6 +23,12 @@ create table if not exists events (
     unique (stream_id, stream_seq)
 );
 
+-- optional idempotency: unique header key if present (partial unique index)
+create unique index if not exists events_idemp_key_uq on events (
+    (headers ->> 'idempotency_key')
+)
+where (headers ? 'idempotency_key');
+
 -- projection checkpoints
 create table if not exists projections (
     name text primary key,
