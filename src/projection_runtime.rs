@@ -116,7 +116,7 @@ impl ProjectionDaemon {
                 // record to DLQ, set backoff, advance checkpoint to skip poison pill for now
                 self.insert_dlq(&mut tx, name, seq, &typ, &body, &format!("{}", err))
                     .await?;
-                self.set_backoff(name, 1).await?;
+                self.increment_attempts_and_set_backoff(name).await?;
                 new_last = seq;
                 break;
             }
@@ -269,16 +269,27 @@ impl ProjectionDaemon {
         Ok(ts.flatten())
     }
 
-    async fn set_backoff(&self, name: &str, attempts: u32) -> Result<()> {
-        let mut delay = self.config.base_backoff * attempts;
+    async fn increment_attempts_and_set_backoff(&self, name: &str) -> Result<()> {
+        let attempts: i64 = sqlx::query_scalar(
+            r#"insert into projection_control(name, attempts)
+                   values ($1, 1)
+                 on conflict (name) do update
+                   set attempts = projection_control.attempts + 1,
+                       updated_at = now()
+                 returning attempts"#,
+        )
+        .bind(name)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let exp = attempts.saturating_sub(1).clamp(0, 16) as u32;
+        let mut delay = self.config.base_backoff * (1u32 << exp);
         if delay > self.config.max_backoff {
             delay = self.config.max_backoff;
         }
         let until = chrono::Utc::now() + chrono::Duration::from_std(delay).unwrap();
         sqlx::query(
-            r#"insert into projection_control(name, backoff_until)
-                values ($1, $2)
-                on conflict (name) do update set backoff_until = excluded.backoff_until, updated_at = now()"#,
+            r#"update projection_control set backoff_until = $2, updated_at = now() where name = $1"#,
         )
         .bind(name)
         .bind(until)
@@ -325,6 +336,12 @@ impl ProjectionDaemon {
         )
         .bind(name)
         .bind(ttl)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            r#"update projection_control set attempts = 0, backoff_until = null, updated_at = now() where name = $1"#,
+        )
+        .bind(name)
         .execute(&self.pool)
         .await?;
         Ok(())

@@ -406,6 +406,7 @@ fn build_projection_control_table_sql(schema: &str) -> String {
         create table if not exists {table} (
             name text primary key,
             paused boolean not null default false,
+            attempts int not null default 0,
             backoff_until timestamptz null,
             updated_at timestamptz not null default now()
         )
