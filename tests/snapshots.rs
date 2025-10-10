@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rillflow::{Aggregate, AggregateRepository, Event, Expected, Store};
+use rillflow::{Aggregate, AggregateRepository, Event, Store};
 use serde_json::json;
 use testcontainers::{
     GenericImage, ImageExt,

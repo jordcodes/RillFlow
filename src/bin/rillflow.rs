@@ -1,6 +1,9 @@
 use clap::{ArgAction, Parser, Subcommand};
 use rillflow::projection_runtime::{ProjectionDaemon, ProjectionWorkerConfig};
+use rillflow::subscriptions::{SubscriptionFilter, SubscriptionOptions, Subscriptions};
 use rillflow::{SchemaConfig, Store, TenancyMode, TenantSchema};
+use sqlx::Row;
+use uuid::Uuid;
 
 #[derive(Parser, Debug)]
 #[command(name = "rillflow", version, about = "Rillflow CLI")]
@@ -32,6 +35,10 @@ enum Commands {
     /// Projection admin commands
     #[command(subcommand)]
     Projections(ProjectionsCmd),
+
+    /// Subscriptions admin commands
+    #[command(subcommand)]
+    Subscriptions(SubscriptionsCmd),
 }
 
 #[derive(Subcommand, Debug)]
@@ -50,6 +57,36 @@ enum ProjectionsCmd {
     Rebuild { name: String },
     /// Run a single processing tick for one projection (by name) or all registered if omitted
     RunOnce { name: Option<String> },
+}
+
+#[derive(Subcommand, Debug)]
+enum SubscriptionsCmd {
+    /// Create or update a subscription checkpoint and filter
+    Create {
+        name: String,
+        #[arg(long, action = ArgAction::Append)]
+        event_type: Vec<String>,
+        #[arg(long, action = ArgAction::Append)]
+        stream_id: Vec<String>,
+        #[arg(long, default_value_t = 0)]
+        start_from: i64,
+    },
+    /// List subscriptions and checkpoints
+    List,
+    /// Show a subscription status
+    Status { name: String },
+    /// Pause a subscription
+    Pause { name: String },
+    /// Resume a subscription
+    Resume { name: String },
+    /// Reset checkpoint to a specific sequence
+    Reset { name: String, seq: i64 },
+    /// Tail a subscription (prints incoming events)
+    Tail {
+        name: String,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
 }
 
 #[tokio::main]
@@ -156,6 +193,131 @@ async fn main() -> rillflow::Result<()> {
                     } else {
                         daemon.tick_all_once().await?;
                         println!("tick-all executed");
+                    }
+                }
+            }
+        }
+        Commands::Subscriptions(cmd) => {
+            let subs = Subscriptions::new(store.pool().clone());
+            match cmd {
+                SubscriptionsCmd::Create {
+                    name,
+                    event_type,
+                    stream_id,
+                    start_from,
+                } => {
+                    let ids: Vec<Uuid> = stream_id
+                        .into_iter()
+                        .filter_map(|s| Uuid::parse_str(&s).ok())
+                        .collect();
+                    let filter = SubscriptionFilter {
+                        event_types: if event_type.is_empty() {
+                            None
+                        } else {
+                            Some(event_type)
+                        },
+                        stream_ids: if ids.is_empty() { None } else { Some(ids) },
+                        stream_prefix: None,
+                    };
+                    subs.create_or_update(&name, &filter, start_from).await?;
+                    println!("subscription '{}' upserted (from={})", name, start_from);
+                }
+                SubscriptionsCmd::List => {
+                    let rows = sqlx::query(
+                        "select name, last_seq, paused, backoff_until, filter from subscriptions order by name",
+                    )
+                    .fetch_all(store.pool())
+                    .await?;
+                    for r in rows {
+                        let name: String = r.get("name");
+                        let last_seq: i64 = r.get::<Option<i64>, _>("last_seq").unwrap_or(0);
+                        let paused: bool = r.get::<Option<bool>, _>("paused").unwrap_or(false);
+                        let backoff_until =
+                            r.get::<Option<chrono::DateTime<chrono::Utc>>, _>("backoff_until");
+                        let filter = r
+                            .get::<Option<serde_json::Value>, _>("filter")
+                            .unwrap_or(serde_json::json!({}));
+                        println!(
+                            "{} last_seq={} paused={} backoff_until={:?} filter={}",
+                            name, last_seq, paused, backoff_until, filter,
+                        );
+                    }
+                }
+                SubscriptionsCmd::Status { name } => {
+                    let r = sqlx::query(
+                        "select name, last_seq, paused, backoff_until, filter from subscriptions where name = $1",
+                    )
+                    .bind(&name)
+                    .fetch_optional(store.pool())
+                    .await?;
+                    if let Some(r) = r {
+                        let last_seq: i64 = r.get::<Option<i64>, _>("last_seq").unwrap_or(0);
+                        let paused: bool = r.get::<Option<bool>, _>("paused").unwrap_or(false);
+                        let backoff_until =
+                            r.get::<Option<chrono::DateTime<chrono::Utc>>, _>("backoff_until");
+                        let filter = r
+                            .get::<Option<serde_json::Value>, _>("filter")
+                            .unwrap_or(serde_json::json!({}));
+                        println!(
+                            "{} last_seq={} paused={} backoff_until={:?} filter={}",
+                            name, last_seq, paused, backoff_until, filter,
+                        );
+                    } else {
+                        println!("subscription '{}' not found", name);
+                    }
+                }
+                SubscriptionsCmd::Pause { name } => {
+                    sqlx::query(
+                        "insert into subscriptions(name, paused) values($1,true) on conflict (name) do update set paused=true, updated_at=now()",
+                    )
+                    .bind(&name)
+                    .execute(store.pool())
+                    .await?;
+                    println!("paused {}", name);
+                }
+                SubscriptionsCmd::Resume { name } => {
+                    sqlx::query(
+                        "update subscriptions set paused=false, backoff_until=null, updated_at=now() where name=$1",
+                    )
+                    .bind(&name)
+                    .execute(store.pool())
+                    .await?;
+                    println!("resumed {}", name);
+                }
+                SubscriptionsCmd::Reset { name, seq } => {
+                    sqlx::query(
+                        "update subscriptions set last_seq=$2, updated_at=now() where name=$1",
+                    )
+                    .bind(&name)
+                    .bind(seq)
+                    .execute(store.pool())
+                    .await?;
+                    println!("reset {} to {}", name, seq);
+                }
+                SubscriptionsCmd::Tail { name, limit } => {
+                    // load filter
+                    let rec =
+                        sqlx::query("select filter, last_seq from subscriptions where name=$1")
+                            .bind(&name)
+                            .fetch_one(store.pool())
+                            .await?;
+                    let filter: SubscriptionFilter = rec
+                        .get::<Option<serde_json::Value>, _>("filter")
+                        .and_then(|v| serde_json::from_value(v).ok())
+                        .unwrap_or_default();
+                    let last_seq: i64 = rec.get::<Option<i64>, _>("last_seq").unwrap_or(0);
+                    let opts = SubscriptionOptions {
+                        start_from: last_seq,
+                        ..Default::default()
+                    };
+                    let (_h, mut rx) = subs.subscribe(&name, filter, opts).await?;
+                    let mut n = 0usize;
+                    while let Some(env) = rx.recv().await {
+                        println!("{} {} {}", env.stream_id, env.stream_seq, env.typ);
+                        n += 1;
+                        if n >= limit {
+                            break;
+                        }
                     }
                 }
             }
