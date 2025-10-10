@@ -57,6 +57,34 @@ cargo run --features cli --bin rillflow -- schema-plan --database-url "$DATABASE
 - Developer tracing breadcrumbs with Mermaid export (dev-only)
 - Integration test harness using Testcontainers (Docker required)
 
+### Store builder
+
+```rust
+use std::time::Duration;
+let store = rillflow::Store::builder(std::env::var("DATABASE_URL")?)
+    .max_connections(20)
+    .connect_timeout(Duration::from_secs(5))
+    .build()
+    .await?;
+```
+
+### Append with options (headers/causation/correlation)
+
+```rust
+use rillflow::{Event, Expected};
+use serde_json::json;
+
+let opts = rillflow::events::AppendOptions {
+    headers: Some(json!({"req_id": "r-123"})),
+    causation_id: None,
+    correlation_id: None,
+};
+store
+  .events()
+  .append_with(stream_id, Expected::Any, vec![Event::new("E1", &json!({}))], &opts)
+  .await?;
+```
+
 ### Aggregates
 
 Fold streams into domain state with a simple trait and repository.
