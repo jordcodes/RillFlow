@@ -57,6 +57,37 @@ cargo run --features cli --bin rillflow -- schema-plan --database-url "$DATABASE
 - Developer tracing breadcrumbs with Mermaid export (dev-only)
 - Integration test harness using Testcontainers (Docker required)
 
+### Aggregates
+
+Fold streams into domain state with a simple trait and repository.
+
+```rust
+use rillflow::{Aggregate, AggregateRepository, Event};
+
+struct Counter { n: i32 }
+impl Aggregate for Counter {
+    fn new() -> Self { Self { n: 0 } }
+    fn apply(&mut self, e: &rillflow::EventEnvelope) { if e.typ == "Inc" { self.n += 1; } }
+    fn version(&self) -> i32 { self.n }
+}
+
+let repo = AggregateRepository::new(store.events());
+let id = uuid::Uuid::new_v4();
+repo.commit(id, rillflow::Expected::Any, vec![Event::new("Inc", &())]).await?;
+let agg: Counter = repo.load(id).await?;
+```
+
+### Snapshots
+
+Persist aggregate state every N events to speed up loads.
+
+```rust
+// write snapshot every 100 events
+repo.commit_and_snapshot(id, &agg, vec![Event::new("Inc", &())], 100).await?;
+// fast load using snapshot + tail
+let agg: Counter = repo.load_with_snapshot(id).await?;
+```
+
 ### Document Queries
 
 ```rust

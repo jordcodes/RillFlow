@@ -21,6 +21,7 @@ The `sql/0001_init.sql` migration creates:
 - `events`: append-only event store with global and stream sequence numbers
   - Columns include `headers jsonb`, `causation_id uuid`, `correlation_id uuid`, and `created_at`.
 - `projections`: checkpoint table for projection processors
+ - `snapshots`: snapshotting table for aggregates (`stream_id uuid pk, version int, body jsonb, created_at timestamptz`).
 
 Rillflow's schema manager (CLI) can also create projection runtime support tables:
 

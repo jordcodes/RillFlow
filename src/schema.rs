@@ -129,6 +129,15 @@ impl SchemaManager {
             build_projection_dlq_table_sql,
         );
 
+        // Snapshots support
+        ensure_table(
+            plan,
+            schema,
+            &existing_tables,
+            "snapshots",
+            build_snapshots_table_sql,
+        );
+
         Ok(())
     }
 
@@ -400,6 +409,20 @@ fn build_docs_index_sql(schema: &str) -> String {
         ",
         index = quote_ident("docs_gin"),
         table = qualified_name(schema, "docs"),
+    )
+}
+
+fn build_snapshots_table_sql(schema: &str) -> String {
+    formatdoc!(
+        "
+        create table if not exists {table} (
+            stream_id uuid primary key,
+            version int not null,
+            body jsonb not null,
+            created_at timestamptz not null default now()
+        )
+        ",
+        table = qualified_name(schema, "snapshots"),
     )
 }
 

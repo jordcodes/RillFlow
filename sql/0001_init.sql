@@ -29,3 +29,11 @@ create table if not exists projections (
     last_seq bigint not null default 0,
     updated_at timestamptz not null default now()
 );
+
+-- snapshots
+create table if not exists snapshots (
+    stream_id uuid primary key,
+    version int not null,
+    body jsonb not null,
+    created_at timestamptz not null default now()
+);
