@@ -39,6 +39,12 @@ cargo run --bin rillflow -- projections run-once --database-url "$DATABASE_URL" 
 cargo run --bin rillflow -- projections run-once --name my_projection --database-url "$DATABASE_URL"
 ```
 
+Feature flag: the CLI is gated behind the `cli` feature. Enable it when building/running:
+
+```bash
+cargo run --features cli --bin rillflow -- schema-plan --database-url "$DATABASE_URL"
+```
+
 ## Features
 
 - JSONB document store with optimistic versioning
@@ -117,6 +123,31 @@ async fn main() -> rillflow::Result<()> {
 ```
 
 See runnable example: `examples/projection_run_once.rs`.
+
+Builder usage and idle runner:
+
+```rust
+use std::sync::Arc;
+use rillflow::projection_runtime::{ProjectionDaemon, ProjectionWorkerConfig};
+
+let daemon = ProjectionDaemon::builder(store.pool().clone())
+    .schema("public")
+    .batch_size(500)
+    .register("my_projection", Arc::new(MyProjection))
+    .build();
+
+daemon.run_until_idle().await?;
+```
+
+Advisory locks (optional) for append:
+
+```rust
+store
+  .events()
+  .with_advisory_locks()
+  .append_stream(stream_id, rillflow::Expected::Any, vec![evt])
+  .await?;
+```
 
 
 #### Compiled Queries
