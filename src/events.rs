@@ -28,9 +28,15 @@ impl Event {
 
 pub struct Events {
     pub(crate) pool: PgPool,
+    pub(crate) use_advisory_lock: bool,
 }
 
 impl Events {
+    pub fn with_advisory_locks(mut self) -> Self {
+        self.use_advisory_lock = true;
+        self
+    }
+
     pub async fn append_stream(
         &self,
         stream_id: Uuid,
@@ -42,6 +48,15 @@ impl Events {
         }
 
         let mut tx = self.pool.begin().await?;
+
+        if self.use_advisory_lock {
+            // Serialize writers per stream using a transaction-scoped advisory lock
+            let key = stream_id.to_string();
+            sqlx::query("select pg_advisory_xact_lock(hashtext($1)::bigint)")
+                .bind(&key)
+                .execute(&mut *tx)
+                .await?;
+        }
 
         let current: i32 = sqlx::query_scalar::<_, Option<i32>>(
             "select max(stream_seq) from events where stream_id = $1",

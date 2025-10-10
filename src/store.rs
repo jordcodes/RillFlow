@@ -21,6 +21,7 @@ impl Store {
     pub fn events(&self) -> Events {
         Events {
             pool: self.pool.clone(),
+            use_advisory_lock: false,
         }
     }
 

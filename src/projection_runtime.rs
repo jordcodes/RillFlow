@@ -314,6 +314,12 @@ impl ProjectionDaemon {
         let id = format!("pid-{}", std::process::id());
         let ttl = chrono::Utc::now() + chrono::Duration::from_std(self.config.lease_ttl).unwrap();
 
+        // Optional advisory lock per projection name to reduce stampedes
+        let _ = sqlx::query("select pg_try_advisory_xact_lock(hashtext($1)::bigint)")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+
         // Try to insert or update if expired
         let rows = sqlx::query(
             r#"
