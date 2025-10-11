@@ -487,6 +487,28 @@ impl DocumentSession {
         self
     }
 
+    pub fn enqueue_event(
+        &mut self,
+        stream_id: Uuid,
+        expected: Expected,
+        event: Event,
+    ) -> Result<()> {
+        self.enqueue_events(stream_id, expected, vec![event])
+    }
+
+    pub fn enqueue_events<I>(
+        &mut self,
+        stream_id: Uuid,
+        expected: Expected,
+        events: I,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = Event>,
+    {
+        let overrides = AppendOptions::default();
+        self.append_events_with(stream_id, expected, events, overrides)
+    }
+
     pub fn enable_event_advisory_locks(&mut self) -> &mut Self {
         self.events_api.use_advisory_lock = true;
         self
@@ -502,7 +524,7 @@ impl DocumentSession {
     where
         I: IntoIterator<Item = Event>,
     {
-        self.append_events_with(stream_id, expected, events, AppendOptions::default())
+        self.enqueue_events(stream_id, expected, events)
     }
 
     /// Stage events with per-call override options (headers/ids).

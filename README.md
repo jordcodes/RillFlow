@@ -504,10 +504,10 @@ let store = Store::builder(&url)
 let mut session = store.session();
 let customer = Customer { id, email: "new@example.com".into(), tier: "starter".into() };
 session.store(id, &customer)?;
-session.append_events(
+session.enqueue_event(
     id,
     rillflow::Expected::Any,
-    vec![rillflow::Event::new("CustomerRegistered", &customer)],
+    rillflow::Event::new("CustomerRegistered", &customer),
 )?;
 session.save_changes().await?;
 ```

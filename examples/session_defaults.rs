@@ -41,10 +41,10 @@ async fn main() -> rillflow::Result<()> {
         tier: "starter".into(),
     };
     session.store(customer_id, &customer)?;
-    session.append_events(
+    session.enqueue_event(
         customer_id,
         rillflow::Expected::Any,
-        vec![rillflow::Event::new("CustomerRegistered", &customer)],
+        rillflow::Event::new("CustomerRegistered", &customer),
     )?;
     session.save_changes().await?;
 
@@ -60,13 +60,10 @@ async fn main() -> rillflow::Result<()> {
         .context_mut()
         .merge_headers(json!({"upgraded": true}));
     session.context_mut().correlation_id = Some(Uuid::new_v4());
-    session.append_events(
+    session.enqueue_event(
         customer_id,
         rillflow::Expected::Any,
-        vec![rillflow::Event::new(
-            "CustomerTierChanged",
-            &json!({"tier": "pro"}),
-        )],
+        rillflow::Event::new("CustomerTierChanged", &json!({"tier": "pro"})),
     )?;
     session.save_changes().await?;
 

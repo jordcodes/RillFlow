@@ -161,10 +161,10 @@ async fn session_load_store_delete_roundtrip() -> Result<()> {
         },
     )?;
     session.set_event_idempotency_key("req-123");
-    session.append_events(
+    session.enqueue_event(
         id,
         Expected::Any,
-        vec![Event::new("CustomerUpgraded", &json!({"tier": "plus"}))],
+        Event::new("CustomerUpgraded", &json!({"tier": "plus"})),
     )?;
     session.save_changes().await?;
 
@@ -182,13 +182,10 @@ async fn session_load_store_delete_roundtrip() -> Result<()> {
         },
     )?;
     session.set_event_idempotency_key("req-124");
-    session.append_events(
+    session.enqueue_event(
         id,
         Expected::Exact(1),
-        vec![Event::new(
-            "CustomerTierChanged",
-            &json!({"tier": "platinum"}),
-        )],
+        Event::new("CustomerTierChanged", &json!({"tier": "platinum"})),
     )?;
     session.save_changes().await?;
 
@@ -202,10 +199,10 @@ async fn session_load_store_delete_roundtrip() -> Result<()> {
     )?;
     session2.merge_event_headers(json!({"source": "test"}));
     session2.set_event_idempotency_key("req-125");
-    session2.append_events(
+    session2.enqueue_event(
         id,
         Expected::Exact(2),
-        vec![Event::new("CustomerTierChanged", &json!({"tier": "gold"}))],
+        Event::new("CustomerTierChanged", &json!({"tier": "gold"})),
     )?;
     let err = session2
         .save_changes()
