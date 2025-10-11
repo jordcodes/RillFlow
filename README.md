@@ -81,6 +81,19 @@ cargo run --bin rillflow -- snapshots compact-once --threshold 200 --batch 200 -
 cargo run --bin rillflow -- snapshots run-until-idle --threshold 200 --batch 200 --database-url "$DATABASE_URL" --schema public
 ```
 
+
+### Tenants health check
+
+```bash
+# Drift detection across all known tenants
+cargo run --features cli --bin rillflow -- health schema --all-tenants \
+  --database-url "$DATABASE_URL"
+
+# Single tenant check
+cargo run --features cli --bin rillflow -- health schema --tenant acme \
+  --database-url "$DATABASE_URL"
+```
+
 Feature flag: the CLI is gated behind the `cli` feature. Enable it when building/running:
 
 ```bash
@@ -567,6 +580,40 @@ assert!(globex.load::<Customer>(&customer_id).await?.is_none());
 // If you forget to provision a tenant before calling save_changes(), the
 // session will fail fast with rillflow::Error::TenantNotFound("tenant_acme").
 ```
+
+#### Upgrading from single-tenant to schema-per-tenant
+
+1. **Prerequisites**
+   - Ensure the base schema (`public` by default) is fully migrated (`schema-sync`).
+   - Take a database backup.
+   - Identify the tenant identifiers you plan to introduce (e.g. `acme`, `globex`).
+
+2. **Run schema provisioning**
+   - Create the per-tenant schemas using the CLI or API:
+     ```bash
+     cargo run --features cli --bin rillflow -- tenants ensure acme --database-url "$DATABASE_URL"
+     cargo run --features cli --bin rillflow -- tenants ensure globex --database-url "$DATABASE_URL"
+     ```
+
+3. **Backfill data**
+   - For each tenant, copy existing documents/events into the new schema (custom SQL/backfill job).
+   - Use the snapshots/export helpers if you plan to archive or migrate historical tenants.
+
+4. **Validate drift**
+   - Run the health command to make sure each tenant schema matches the latest migrations:
+     ```bash
+     cargo run --features cli --bin rillflow -- health schema --all-tenants --database-url "$DATABASE_URL"
+     ```
+   - Fix any drift before enabling the new strategy.
+
+5. **Enable schema-per-tenant**
+   - Update your `Store::builder` to call `.tenant_strategy(TenantStrategy::SchemaPerTenant)` and provide a resolver (per-request tenant lookup).
+   - Restart application nodes; watch logs for `tenant required` errors.
+
+6. **Post-migration checks**
+   - Verify metrics/traces include tenant labels.
+   - Run smoke tests against each tenant (documents/events/projections).
+   - Optionally remove the legacy single-tenant data once confirmed.
 
 ## License
 
