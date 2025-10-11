@@ -1,4 +1,21 @@
-## 0.1.0-alpha.7 (unreleased)
+## 0.1.0-alpha.8
+
+Highlights:
+- Multi-tenant sessions: tenant strategy/resolver now flows through document sessions, events, projections, subscriptions, and snapshotter; metrics export tags per-tenant counters.
+- Tenant-aware CLI: `projections`, `subscriptions`, `docs`, and `snapshots` accept `--tenant` / `--all-tenants`, reusing the same resolver wiring as the runtime.
+- Schema drift guardrail: new `health schema` command surfaces migrations-in-plan mode per tenant and flags drift before jobs run.
+- Background workers: projection daemon and snapshot compaction respect tenant selection and set `search_path` locally.
+
+Docs:
+- README upgrade guide covering single-tenant → schema-per-tenant rollout, health checks, and CLI examples for `health schema`.
+
+Tests:
+- Added integration coverage for tenant-aware subscription CLI commands; suite remains green (`cargo test`).
+
+Tooling:
+- `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` clean.
+
+## 0.1.0-alpha.7
 
 Highlights:
 - Added `Store::session()` that returns a session preconfigured from store defaults; `document_session()` deprecated.
