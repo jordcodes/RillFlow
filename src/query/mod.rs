@@ -43,6 +43,7 @@ pub(crate) enum Selection {
 
 #[derive(Clone, Debug)]
 pub(crate) struct FieldProjection {
+    source: Option<String>,
     alias: String,
     path: JsonPath,
 }
@@ -50,6 +51,18 @@ pub(crate) struct FieldProjection {
 impl FieldProjection {
     fn new(alias: impl Into<String>, path: impl Into<JsonPath>) -> Self {
         Self {
+            source: None,
+            alias: alias.into(),
+            path: path.into(),
+        }
+    }
+    fn from_source(
+        source: impl Into<String>,
+        alias: impl Into<String>,
+        path: impl Into<JsonPath>,
+    ) -> Self {
+        Self {
+            source: Some(source.into()),
             alias: alias.into(),
             path: path.into(),
         }
@@ -66,6 +79,7 @@ pub(crate) struct QuerySpec {
     include_deleted: bool,
     group_by: Vec<JsonPath>,
     aggregates: Vec<AggregateSpec>,
+    includes: Vec<IncludeSpec>,
 }
 
 impl Default for QuerySpec {
@@ -79,6 +93,7 @@ impl Default for QuerySpec {
             include_deleted: false,
             group_by: Vec::new(),
             aggregates: Vec::new(),
+            includes: Vec::new(),
         }
     }
 }
@@ -119,6 +134,9 @@ impl QuerySpec {
     pub(crate) fn push_aggregate(&mut self, agg: AggregateSpec) {
         self.aggregates.push(agg);
     }
+    pub(crate) fn push_include(&mut self, inc: IncludeSpec) {
+        self.includes.push(inc);
+    }
 
     pub(crate) fn set_limit(&mut self, limit: Option<i64>) {
         self.limit = limit;
@@ -146,6 +164,7 @@ impl QuerySpec {
             include_deleted,
             group_by,
             aggregates,
+            includes,
         } = self;
 
         let mut builder = QueryBuilder::new("select ");
@@ -167,7 +186,13 @@ impl QuerySpec {
                         first = false;
                         builder.push_bind(field.alias);
                         builder.push(", ");
-                        push_json_expr(&mut builder, &field.path);
+                        if let Some(src) = field.source {
+                            builder.push(&src);
+                            builder.push(" #> ");
+                            builder.push_bind(field.path.parts().to_vec());
+                        } else {
+                            push_json_expr(&mut builder, &field.path);
+                        }
                     }
                     builder.push(") as doc");
                 }
@@ -195,6 +220,10 @@ impl QuerySpec {
         }
 
         builder.push(" from docs");
+        // includes
+        for inc in &includes {
+            inc.push_join(&mut builder);
+        }
 
         let mut has_where = false;
         if !filters.is_empty() {
@@ -437,6 +466,37 @@ impl DocumentQueryContext {
 
     pub(crate) fn into_spec(self) -> QuerySpec {
         self.spec
+    }
+
+    pub fn include(
+        &mut self,
+        table: &str,
+        local_path: impl Into<JsonPath>,
+        foreign_key: &str,
+        alias: &str,
+    ) -> &mut Self {
+        self.spec.push_include(IncludeSpec {
+            table: table.to_string(),
+            local_path: local_path.into(),
+            foreign_key: foreign_key.to_string(),
+            alias: alias.to_string(),
+            select_fields: vec![],
+        });
+        self
+    }
+
+    pub fn select_from(&mut self, source_alias: &str, alias: &str, path: &str) -> &mut Self {
+        let projection = FieldProjection::from_source(
+            source_alias.to_string(),
+            alias.to_string(),
+            JsonPath::from(path),
+        );
+        match self.spec.selection_mut() {
+            Selection::Document => self.spec.set_selection(Selection::Fields(vec![projection])),
+            Selection::Fields(fields) => fields.push(projection),
+            Selection::Aggregates(_) => {}
+        }
+        self
     }
 }
 
@@ -851,6 +911,31 @@ impl AggregateSpec {
                 builder.push(alias.as_str());
             }
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct IncludeSpec {
+    table: String,
+    local_path: JsonPath,
+    foreign_key: String,
+    alias: String,
+    select_fields: Vec<(String, String)>,
+}
+
+impl IncludeSpec {
+    fn push_join(&self, builder: &mut QueryBuilder<'_, Postgres>) {
+        builder.push(" left join ");
+        builder.push(&self.table);
+        builder.push(" ");
+        builder.push(&self.alias);
+        builder.push(" on ");
+        builder.push(&self.alias);
+        builder.push(".");
+        builder.push(&self.foreign_key);
+        builder.push(" = (");
+        push_text_expr(builder, &self.local_path);
+        builder.push(")::uuid");
     }
 }
 
