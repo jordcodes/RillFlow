@@ -84,6 +84,15 @@ enum ProjectionsCmd {
     DlqDelete { name: String, id: i64 },
     /// Show basic metrics (lag, last_seq, dlq)
     Metrics { name: String },
+    /// Run long-lived projection loop
+    RunLoop {
+        /// Use LISTEN/NOTIFY to wake immediately on new events
+        #[arg(long, default_value_t = true)]
+        use_notify: bool,
+        /// Optional health HTTP bind, e.g. 0.0.0.0:8080
+        #[arg(long)]
+        health_bind: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -308,6 +317,28 @@ async fn main() -> rillflow::Result<()> {
                         "{} last_seq={} head_seq={} lag={} dlq_count={}",
                         m.name, m.last_seq, m.head_seq, m.lag, m.dlq_count
                     );
+                }
+                ProjectionsCmd::RunLoop {
+                    use_notify,
+                    health_bind,
+                } => {
+                    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let stop2 = stop.clone();
+                    tokio::spawn(async move {
+                        let _ = tokio::signal::ctrl_c().await;
+                        stop2.store(true, std::sync::atomic::Ordering::Relaxed);
+                    });
+
+                    if let Some(addr) = health_bind {
+                        let stop_health = stop.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) = serve_health(addr, stop_health).await {
+                                eprintln!("health server error: {err}");
+                            }
+                        });
+                    }
+
+                    daemon.run_loop(use_notify, stop).await?;
                 }
             }
         }
@@ -586,6 +617,28 @@ fn print_plan(plan: &rillflow::SchemaPlan) {
     for (i, action) in plan.actions().iter().enumerate() {
         println!("{}. {}", i + 1, action.description());
         println!("{}\n", action.sql());
+    }
+}
+
+async fn serve_health(
+    addr: String,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> rillflow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    let listener = TcpListener::bind(&addr).await?;
+    loop {
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+        let (mut sock, _) = match listener.accept().await {
+            Ok(x) => x,
+            Err(_) => continue,
+        };
+        let mut _buf = [0u8; 1024];
+        let _ = sock.read(&_buf).await;
+        let resp = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\ncontent-type: text/plain\r\n\r\nok";
+        let _ = sock.write_all(resp).await;
     }
 }
 

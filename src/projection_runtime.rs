@@ -14,6 +14,7 @@ pub struct ProjectionWorkerConfig {
     pub max_backoff: Duration,
     pub lease_ttl: Duration,
     pub schema: String,
+    pub notify_channel: Option<String>,
 }
 
 impl Default for ProjectionWorkerConfig {
@@ -25,6 +26,7 @@ impl Default for ProjectionWorkerConfig {
             max_backoff: Duration::from_secs(30),
             lease_ttl: Duration::from_secs(30),
             schema: "public".to_string(),
+            notify_channel: Some("rillflow_events".to_string()),
         }
     }
 }
@@ -63,6 +65,49 @@ impl ProjectionDaemon {
             name: name.into(),
             handler,
         });
+    }
+
+    /// Long-running loop: ticks all projections, optionally LISTENs for event notifications to wake up.
+    /// Stops when the provided stop flag becomes true.
+    #[instrument(skip_all, fields(schema = %self.config.schema))]
+    pub async fn run_loop(
+        &self,
+        use_notify: bool,
+        stop_flag: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
+        let mut listener = if use_notify {
+            match sqlx::postgres::PgListener::connect_with(&self.pool).await {
+                Ok(mut l) => {
+                    if let Some(chan) = &self.config.notify_channel {
+                        let _ = l.listen(chan).await;
+                    }
+                    Some(l)
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        loop {
+            if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok(());
+            }
+            let mut did_work = false;
+            for r in &self.registrations {
+                match self.tick_once(&r.name).await? {
+                    TickResult::Processed { count } if count > 0 => did_work = true,
+                    _ => {}
+                }
+            }
+            if !did_work {
+                if let Some(l) = &mut listener {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), l.recv()).await;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            }
+        }
     }
 
     /// Execute one processing tick for the given projection name (if registered).
