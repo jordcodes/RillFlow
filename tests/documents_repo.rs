@@ -394,3 +394,59 @@ async fn session_multi_tenant_isolation() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn store_ensure_tenant_concurrency() -> Result<()> {
+    let image = GenericImage::new("postgres", "16-alpine")
+        .with_exposed_port(5432.tcp())
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres");
+    let container = image.start().await?;
+    let host = container.get_host().await?;
+    let port = container.get_host_port_ipv4(5432).await?;
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres?sslmode=disable");
+
+    let store = Store::builder(&url)
+        .tenant_strategy(rillflow::store::TenantStrategy::SchemaPerTenant)
+        .build()
+        .await?;
+
+    let tenant = "acme_concurrent";
+    let iterations = 16;
+    let mut handles = Vec::with_capacity(iterations);
+
+    for _ in 0..iterations {
+        let store = store.clone();
+        let tenant = tenant.to_string();
+        handles.push(tokio::spawn(
+            async move { store.ensure_tenant(&tenant).await },
+        ));
+    }
+
+    for handle in handles {
+        handle.await.expect("task join").expect("ensure tenant");
+    }
+
+    let schema_name = format!(
+        "tenant_{}",
+        tenant.replace(|c: char| !c.is_ascii_alphanumeric() && c != '_', "_")
+    );
+    let schemas: i64 = sqlx::query_scalar(
+        "select count(*) from information_schema.schemata where schema_name = $1",
+    )
+    .bind(&schema_name)
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(schemas, 1, "tenant schema must exist once");
+
+    teardown_tenant(&store, tenant).await?;
+    Ok(())
+}
+
+async fn teardown_tenant(store: &Store, tenant: &str) -> Result<()> {
+    store.drop_tenant(tenant).await?;
+    Ok(())
+}
