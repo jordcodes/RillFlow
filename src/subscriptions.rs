@@ -1,9 +1,15 @@
-use crate::{Result, events::EventEnvelope};
+use crate::{
+    Error, Result,
+    events::EventEnvelope,
+    schema,
+    store::{TenantStrategy, tenant_schema_name},
+};
 use serde::{Deserialize, Serialize};
 use sqlx::{Acquire, PgPool, Postgres, Row, Transaction, postgres::PgRow};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant, sleep};
-use tracing::info;
+use tracing::{error, info};
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -50,21 +56,51 @@ pub enum AckMode {
 
 pub struct Subscriptions {
     pool: PgPool,
-    schema: String,
+    tenant_strategy: TenantStrategy,
+    tenant_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
 }
 
 impl Subscriptions {
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
-            schema: "public".to_string(),
+            tenant_strategy: TenantStrategy::Single,
+            tenant_resolver: None,
         }
     }
 
     pub fn new_with_schema(pool: PgPool, schema: impl Into<String>) -> Self {
+        let schema = schema.into();
+        Self::new_with_strategy(
+            pool,
+            TenantStrategy::SchemaPerTenant,
+            Some(Arc::new(move || Some(schema.clone()))),
+        )
+    }
+
+    pub(crate) fn new_with_strategy(
+        pool: PgPool,
+        tenant_strategy: TenantStrategy,
+        tenant_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
+    ) -> Self {
         Self {
             pool,
-            schema: schema.into(),
+            tenant_strategy,
+            tenant_resolver,
+        }
+    }
+
+    fn resolve_schema(&self) -> Result<Option<String>> {
+        match self.tenant_strategy {
+            TenantStrategy::Single => Ok(None),
+            TenantStrategy::SchemaPerTenant => {
+                if let Some(resolver) = &self.tenant_resolver {
+                    if let Some(tenant) = (resolver)() {
+                        return Ok(Some(tenant_schema_name(&tenant)));
+                    }
+                }
+                Err(Error::TenantRequired)
+            }
         }
     }
 
@@ -101,18 +137,47 @@ impl Subscriptions {
 
         let (tx, rx) = mpsc::channel::<EventEnvelope>(opts.channel_capacity);
         let pool = self.pool.clone();
-        let schema = self.schema.clone();
+        let schema_name = self.resolve_schema()?;
+        let schema_ident = schema_name.as_ref().map(|s| schema::quote_ident(s));
         let name_s = name.to_string();
         let handle_group = opts.group.clone();
+        let tenant_strategy = self.tenant_strategy;
+        let tenant_resolver = self.tenant_resolver.clone();
         tokio::spawn(async move {
             let mut cursor = opts.start_from;
-            // Acquire a dedicated connection and set search_path for consistent schema scoping
             let mut conn = match pool.acquire().await {
                 Ok(c) => c,
-                Err(_) => return,
+                Err(err) => {
+                    error!(?err, "subscription failed to acquire connection");
+                    return;
+                }
             };
-            let set_path = format!("set search_path to \"{}\"", schema);
-            let _ = sqlx::query(&set_path).execute(&mut *conn).await;
+            if let Some(ref quoted) = schema_ident {
+                let stmt = format!("set search_path to {}, public", quoted);
+                if let Err(err) = sqlx::query(&stmt).execute(&mut *conn).await {
+                    error!(?err, "subscription failed to set search_path");
+                    return;
+                }
+            } else if matches!(tenant_strategy, TenantStrategy::SchemaPerTenant) {
+                if let Some(resolver) = tenant_resolver.as_ref() {
+                    if let Some(tenant) = (resolver)() {
+                        let stmt = format!(
+                            "set search_path to {}, public",
+                            schema::quote_ident(&tenant_schema_name(&tenant))
+                        );
+                        if let Err(err) = sqlx::query(&stmt).execute(&mut *conn).await {
+                            error!(
+                                ?err,
+                                tenant, "subscription failed to set search_path from resolver"
+                            );
+                            return;
+                        }
+                    } else {
+                        error!("tenant resolver returned none for subscription");
+                        return;
+                    }
+                }
+            }
             // Start optional listener for NOTIFY wakeups
             let mut listener = if let Some(chan) = &opts.notify_channel {
                 match sqlx::postgres::PgListener::connect_with(&pool).await {
@@ -416,6 +481,7 @@ impl Subscriptions {
                 pool: self.pool.clone(),
                 name: name.to_string(),
                 group: handle_group,
+                schema: schema_name,
             },
             rx,
         ))
@@ -426,10 +492,21 @@ pub struct SubscriptionHandle {
     pool: PgPool,
     name: String,
     group: Option<String>,
+    schema: Option<String>,
 }
 
 impl SubscriptionHandle {
+    async fn configure_conn(&self, conn: &mut sqlx::pool::PoolConnection<Postgres>) -> Result<()> {
+        if let Some(ref schema) = self.schema {
+            let stmt = format!("set search_path to {}, public", schema::quote_ident(schema));
+            sqlx::query(&stmt).execute(&mut **conn).await?;
+        }
+        Ok(())
+    }
+
     pub async fn checkpoint(&self, to_seq: i64) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        self.configure_conn(&mut conn).await?;
         match &self.group {
             Some(grp) => {
                 sqlx::query(
@@ -439,7 +516,7 @@ impl SubscriptionHandle {
                 .bind(&self.name)
                 .bind(grp)
                 .bind(to_seq)
-                .execute(&self.pool)
+                .execute(&mut *conn)
                 .await?;
             }
             None => {
@@ -448,7 +525,7 @@ impl SubscriptionHandle {
                 )
                 .bind(&self.name)
                 .bind(to_seq)
-                .execute(&self.pool)
+                .execute(&mut *conn)
                 .await?;
             }
         }
@@ -486,21 +563,25 @@ impl SubscriptionHandle {
     }
 
     pub async fn pause(&self) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        self.configure_conn(&mut conn).await?;
         sqlx::query(
             "insert into subscriptions(name, paused) values($1, true) on conflict (name) do update set paused = true, updated_at = now()",
         )
         .bind(&self.name)
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await?;
         Ok(())
     }
 
     pub async fn resume(&self) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        self.configure_conn(&mut conn).await?;
         sqlx::query(
             "update subscriptions set paused = false, backoff_until = null, updated_at = now() where name = $1",
         )
         .bind(&self.name)
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await?;
         Ok(())
     }

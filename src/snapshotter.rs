@@ -1,16 +1,21 @@
 use std::sync::Arc;
 
-use crate::{Aggregate, AggregateRepository, Result};
+use crate::{
+    Aggregate, AggregateRepository, Result,
+    store::{TenantStrategy, tenant_schema_name},
+};
 use serde_json::Value;
 use sqlx::PgPool;
 use tracing::{info, instrument};
 use uuid::Uuid;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SnapshotterConfig {
     pub threshold_events: i32,
     pub batch_size: i64,
-    pub schema: String,
+    pub schema: Option<String>,
+    pub tenant_strategy: TenantStrategy,
+    pub tenant_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
 }
 
 impl Default for SnapshotterConfig {
@@ -18,7 +23,9 @@ impl Default for SnapshotterConfig {
         Self {
             threshold_events: 100,
             batch_size: 100,
-            schema: "public".to_string(),
+            schema: None,
+            tenant_strategy: TenantStrategy::Single,
+            tenant_resolver: None,
         }
     }
 }
@@ -69,15 +76,41 @@ impl<F: SnapshotFolder> Snapshotter<F> {
         }
     }
 
+    fn schema_label(&self) -> String {
+        match self.config.schema.as_ref() {
+            Some(s) => s.clone(),
+            None => match self.config.tenant_strategy {
+                TenantStrategy::Single => "public".to_string(),
+                TenantStrategy::SchemaPerTenant => "<resolver>".to_string(),
+            },
+        }
+    }
+
+    fn resolve_schema(&self) -> Result<Option<String>> {
+        match self.config.tenant_strategy {
+            TenantStrategy::Single => Ok(self.config.schema.clone()),
+            TenantStrategy::SchemaPerTenant => {
+                if let Some(ref explicit) = self.config.schema {
+                    return Ok(Some(explicit.clone()));
+                }
+                if let Some(ref resolver) = self.config.tenant_resolver {
+                    if let Some(tenant) = (resolver)() {
+                        return Ok(Some(tenant_schema_name(&tenant)));
+                    }
+                }
+                Err(crate::Error::TenantRequired)
+            }
+        }
+    }
+
     /// Find streams exceeding the snapshot threshold and write snapshots for a batch.
-    #[instrument(skip_all, fields(schema = %self.config.schema, threshold = self.config.threshold_events, batch = self.config.batch_size))]
+    #[instrument(skip_all, fields(schema = %self.schema_label(), threshold = self.config.threshold_events, batch = self.config.batch_size))]
     pub async fn tick_once(&self) -> Result<u32> {
         let mut tx = self.pool.begin().await?;
-        let set_search_path = format!(
-            "set local search_path to {}",
-            quote_ident(&self.config.schema)
-        );
-        sqlx::query(&set_search_path).execute(&mut *tx).await?;
+        if let Some(schema) = self.resolve_schema()? {
+            let stmt = format!("set local search_path to {}", quote_ident(&schema));
+            sqlx::query(&stmt).execute(&mut *tx).await?;
+        }
 
         let rows: Vec<(Uuid, i32, i32)> = sqlx::query_as(
             r#"
@@ -120,13 +153,16 @@ impl<F: SnapshotFolder> Snapshotter<F> {
             info!(stream_id = %stream_id, head = head, snap_version = snap_ver, new_version = version, "snapshot written");
             // re-open a short transaction for search_path on next loop
             tx = self.pool.begin().await?;
-            sqlx::query(&set_search_path).execute(&mut *tx).await?;
+            if let Some(schema) = self.resolve_schema()? {
+                let stmt = format!("set local search_path to {}", quote_ident(&schema));
+                sqlx::query(&stmt).execute(&mut *tx).await?;
+            }
         }
         tx.commit().await?;
         Ok(processed)
     }
 
-    #[instrument(skip_all, fields(schema = %self.config.schema))]
+    #[instrument(skip_all, fields(schema = %self.schema_label()))]
     pub async fn run_until_idle(&self) -> Result<()> {
         loop {
             let n = self.tick_once().await?;

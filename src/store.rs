@@ -5,6 +5,7 @@ use crate::{
     events::{AppendOptions, Events},
     projections::Projections,
     schema::{SchemaConfig, TenancyMode, TenantSchema},
+    subscriptions::Subscriptions,
 };
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use sqlx::{PgPool, postgres::PgPoolOptions};
@@ -256,9 +257,19 @@ impl Store {
     }
 
     pub fn projections(&self) -> Projections {
-        Projections {
-            pool: self.pool.clone(),
-        }
+        Projections::new(
+            self.pool.clone(),
+            self.tenant_strategy,
+            self.tenant_resolver.clone(),
+        )
+    }
+
+    pub fn subscriptions(&self) -> Subscriptions {
+        Subscriptions::new_with_strategy(
+            self.pool.clone(),
+            self.tenant_strategy,
+            self.tenant_resolver.clone(),
+        )
     }
 
     pub fn schema(&self) -> crate::schema::SchemaManager {
