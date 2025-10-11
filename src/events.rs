@@ -120,8 +120,16 @@ impl Events {
             Option<String>,
             chrono::DateTime<chrono::Utc>,
         )> = sqlx::query_as(
-            r#"select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, tenant_id, user_id, created_at
-                from events where stream_id = $1 order by stream_seq asc"#,
+            r#"
+            with combined as (
+              select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, tenant_id, user_id, created_at
+              from events where stream_id = $1
+              union all
+              select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, tenant_id, user_id, created_at
+              from events_archive where stream_id = $1
+            )
+            select * from combined order by stream_seq asc
+            "#,
         )
         .bind(stream_id)
         .fetch_all(&self.pool)
@@ -298,6 +306,38 @@ impl Events {
             stream_id,
             inner: self.clone(),
         }
+    }
+
+    pub async fn archive_stream_before(
+        &self,
+        stream_id: Uuid,
+        before: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        // Move rows to archive
+        let moved = sqlx::query(
+            r#"
+            insert into events_archive (global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, tenant_id, user_id, created_at)
+            select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, tenant_id, user_id, created_at
+            from events where stream_id = $1 and created_at < $2
+            on conflict (global_seq) do nothing
+            "#,
+        )
+        .bind(stream_id)
+        .bind(before)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        // Delete moved rows from live
+        let _ = sqlx::query("delete from events where stream_id = $1 and created_at < $2")
+            .bind(stream_id)
+            .bind(before)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(moved)
     }
 }
 

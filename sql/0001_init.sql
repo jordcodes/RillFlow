@@ -116,6 +116,22 @@ create table if not exists events (
     unique (stream_id, stream_seq)
 );
 
+-- archived events (moved from events)
+create table if not exists events_archive (
+    global_seq bigint primary key,
+    stream_id uuid not null,
+    stream_seq int not null,
+    event_type text not null,
+    body jsonb not null,
+    headers jsonb not null default '{}'::jsonb,
+    causation_id uuid null,
+    correlation_id uuid null,
+    event_version int not null default 1,
+    tenant_id text null,
+    user_id text null,
+    created_at timestamptz not null
+);
+
 -- optional idempotency: unique header key if present (partial unique index)
 create unique index if not exists events_idemp_key_uq on events (
     (headers ->> 'idempotency_key')

@@ -95,6 +95,13 @@ impl SchemaManager {
             plan,
             schema,
             &existing_tables,
+            "events_archive",
+            build_events_archive_table_sql,
+        );
+        ensure_table(
+            plan,
+            schema,
+            &existing_tables,
             "projections",
             build_projections_table_sql,
         );
@@ -476,6 +483,29 @@ fn build_events_table_sql(schema: &str) -> String {
         )
         ",
         table = qualified_name(schema, "events"),
+    )
+}
+
+fn build_events_archive_table_sql(schema: &str) -> String {
+    formatdoc!(
+        "
+        create table if not exists {table} (
+            global_seq bigint not null,
+            stream_id uuid not null,
+            stream_seq int not null,
+            event_type text not null,
+            body jsonb not null,
+            headers jsonb not null default '{{}}'::jsonb,
+            causation_id uuid null,
+            correlation_id uuid null,
+            event_version int not null default 1,
+            tenant_id text null,
+            user_id text null,
+            created_at timestamptz not null,
+            primary key (global_seq)
+        )
+        ",
+        table = qualified_name(schema, "events_archive"),
     )
 }
 
