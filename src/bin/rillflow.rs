@@ -482,7 +482,13 @@ async fn main() -> rillflow::Result<()> {
                 }
                 SubscriptionsCmd::Groups { name } => {
                     let rows = sqlx::query(
-                        "select grp, last_seq from subscription_groups where name=$1 order by grp",
+                        "select g.grp, g.last_seq, coalesce(h.head, 0) as head
+                           from subscription_groups g
+                           left join (
+                                select stream_id, max(global_seq) as head from events group by stream_id
+                           ) h on true
+                          where g.name=$1
+                          order by g.grp",
                     )
                     .bind(&name)
                     .fetch_all(store.pool())
@@ -490,7 +496,12 @@ async fn main() -> rillflow::Result<()> {
                     for r in rows {
                         let grp: String = r.get("grp");
                         let last_seq: i64 = r.get::<Option<i64>, _>("last_seq").unwrap_or(0);
-                        println!("{}:{} last_seq={}", name, grp, last_seq);
+                        let head: i64 = r.get::<Option<i64>, _>("head").unwrap_or(0);
+                        let lag = (head - last_seq).max(0);
+                        println!(
+                            "{}:{} last_seq={} head={} lag={}",
+                            name, grp, last_seq, head, lag
+                        );
                     }
                 }
                 SubscriptionsCmd::GroupStatus { name, group } => {
@@ -502,6 +513,10 @@ async fn main() -> rillflow::Result<()> {
                     .fetch_optional(store.pool())
                     .await?
                     .unwrap_or(0);
+                    let head: i64 =
+                        sqlx::query_scalar("select coalesce(max(global_seq), 0) from events")
+                            .fetch_one(store.pool())
+                            .await?;
                     let leased_by: Option<String> = sqlx::query_scalar(
                         "select leased_by from subscription_group_leases where name=$1 and grp=$2",
                     )
@@ -516,9 +531,10 @@ async fn main() -> rillflow::Result<()> {
                     .bind(&group)
                     .fetch_optional(store.pool())
                     .await?;
+                    let lag = (head - last_seq).max(0);
                     println!(
-                        "{}:{} last_seq={} leased_by={:?} lease_until={:?}",
-                        name, group, last_seq, leased_by, lease_until
+                        "{}:{} last_seq={} head={} lag={} leased_by={:?} lease_until={:?}",
+                        name, group, last_seq, head, lag, leased_by, lease_until
                     );
                 }
             }

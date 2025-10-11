@@ -167,6 +167,7 @@ cargo run --features cli --bin rillflow -- subscriptions tail orders --group wor
 # group admin
 cargo run --features cli --bin rillflow -- subscriptions groups orders --database-url "$DATABASE_URL"
 cargo run --features cli --bin rillflow -- subscriptions group-status orders --group workers-a --database-url "$DATABASE_URL"
+# outputs include last_seq, head and lag per group for quick capacity checks
 ```
 
 Manual ack mode (explicit checkpointing):

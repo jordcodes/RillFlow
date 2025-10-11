@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Acquire, PgPool, Postgres, Row, Transaction, postgres::PgRow};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant, sleep};
+use tracing::info;
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -265,6 +266,8 @@ impl Subscriptions {
                 }
 
                 let mut last_seq_in_batch = cursor;
+                let batch_start = Instant::now();
+                let mut delivered = 0usize;
                 for row in rows {
                     let env = EventEnvelope {
                         global_seq: row.get("global_seq"),
@@ -282,6 +285,7 @@ impl Subscriptions {
                     if tx.send(env).await.is_err() {
                         return; // receiver dropped
                     }
+                    delivered += 1;
                 }
 
                 // In group mode with auto ack, checkpoint immediately to minimize duplicate work
@@ -322,6 +326,17 @@ impl Subscriptions {
                         .await;
                     }
                     last_checkpoint = Instant::now();
+                }
+
+                // tracing: batch delivery stats
+                let elapsed_ms = batch_start.elapsed().as_millis() as u64;
+                if delivered > 0 {
+                    info!(
+                        delivered = delivered,
+                        last_seq = last_seq_in_batch,
+                        elapsed_ms = elapsed_ms,
+                        "subscription batch delivered",
+                    );
                 }
 
                 if last_lease_refresh.elapsed() >= Duration::from_secs(5) {
