@@ -1,3 +1,14 @@
+## 0.1.0-alpha.7 (unreleased)
+
+Highlights:
+- Added `Store::session()` that returns a session preconfigured from store defaults; `document_session()` deprecated.
+- `StoreBuilder::session_defaults` and `.session_advisory_locks` let you configure session metadata at startup (no runtime mutation required).
+- Document sessions now merge idempotency keys into existing default headers and examples/README updated with the session defaults workflow.
+- New example `session_defaults` demonstrates configuring defaults and using `store.session()`.
+
+Tooling:
+- `cargo clippy --all-targets -- -D warnings` clean.
+
 ## 0.1.0-alpha.6
 
 Highlights:

@@ -37,6 +37,6 @@ async fn run_loop_stops_on_flag() -> Result<()> {
     // let it start
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     stop.store(true, Ordering::Relaxed);
-    let res = jh.await??;
-    Ok(res)
+    jh.await??;
+    Ok(())
 }
