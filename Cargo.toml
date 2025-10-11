@@ -1,6 +1,6 @@
 [package]
 name = "rillflow"
-version = "0.1.0-alpha.5"
+version = "0.1.0-alpha.6"
 edition = "2024"
 rust-version = "1.85"
 description = "Rillflow — a lightweight document + event store for Rust, powered by Postgres."

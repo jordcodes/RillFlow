@@ -1,3 +1,16 @@
+## 0.1.0-alpha.6
+
+Highlights:
+- Metrics export: Prometheus-style metrics at `/metrics` on the health server (docs reads/writes/conflicts, projection events processed, subscription deliveries/pending, snapshotter candidates/max_gap).
+- Subscriptions scalability: per-group lag in CLI, backpressure tuning with `--max-in-flight`, persistent `subscription_groups.max_in_flight`, and throttle when pending exceeds limit; batch delivery tracing.
+- Projection daemon long-run mode: `projections run-loop` with optional NOTIFY wakeups and Ctrl-C shutdown; simple health endpoint.
+- Tenants CLI: create/sync/list schemas for schema-per-tenant.
+- Document partial updates: `docs.patch` / `docs.patch_fields` with nested `jsonb_set`; README examples.
+- Docs index advisor CLI: suggest GIN and expression indexes (DDL hints).
+
+Tests:
+- Added tests for snapshotter, docs patch, projection run loop flag, plus existing suites remain green.
+
 ## 0.1.0-alpha.5
 
 Highlights:
