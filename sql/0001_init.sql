@@ -154,6 +154,15 @@ create table if not exists projections (
     updated_at timestamptz not null default now()
 );
 
+-- event schema registry
+create table if not exists event_schemas (
+    event_type text not null,
+    version int not null,
+    schema jsonb not null,
+    created_at timestamptz not null default now(),
+    primary key(event_type, version)
+);
+
 -- snapshots
 create table if not exists snapshots (
     stream_id uuid primary key,

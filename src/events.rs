@@ -147,7 +147,7 @@ impl Events {
                     headers,
                     causation_id,
                     correlation_id,
-                    mut event_version,
+                    event_version,
                     tenant_id,
                     user_id,
                     created_at,
@@ -256,6 +256,28 @@ impl Events {
             .clone()
             .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
         for event in events {
+            // JSON Schema validation if a schema exists
+            if let Some((schema_value, ver)) = sqlx::query_as::<_, (Value, i32)>(
+                "select schema, version from event_schemas where event_type = $1 order by version desc limit 1",
+            )
+            .bind(&event.typ)
+            .fetch_optional(&mut **tx)
+            .await?
+            {
+                // validate against latest schema
+                let compiled = match jsonschema::validator_for(&schema_value) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return Err(Error::QueryError { query: "compile event schema".into(), context: e.to_string() });
+                    }
+                };
+                let result = compiled.validate(&event.body);
+                if let Err(error) = result {
+                    return Err(Error::QueryError { query: "event schema validation".into(), context: error.to_string() });
+                }
+                let _v = ver; // reserved for future use (recording)
+            }
+
             seq += 1;
             let res = sqlx::query(
                 r#"insert into events (stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, tenant_id, user_id)

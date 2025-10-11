@@ -48,6 +48,7 @@ async-trait = "0.1"
 clap = { version = "4", features = ["derive"], optional = true }
 indoc = "2"
 itertools = "0.13"
+jsonschema = "0.33"
 
 [[bin]]
 name = "rillflow"

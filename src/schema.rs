@@ -106,6 +106,15 @@ impl SchemaManager {
             build_projections_table_sql,
         );
 
+        // event schema registry
+        ensure_table(
+            plan,
+            schema,
+            &existing_tables,
+            "event_schemas",
+            build_event_schemas_table_sql,
+        );
+
         let existing_indexes = if schema_exists {
             self.existing_indexes(schema).await?
         } else {
@@ -696,6 +705,21 @@ fn build_projection_dlq_table_sql(schema: &str) -> String {
         )
         ",
         table = qualified_name(schema, "projection_dlq"),
+    )
+}
+
+fn build_event_schemas_table_sql(schema: &str) -> String {
+    formatdoc!(
+        r#"
+        create table if not exists {table} (
+            event_type text not null,
+            version int not null,
+            schema jsonb not null,
+            created_at timestamptz not null default now(),
+            primary key(event_type, version)
+        )
+        "#,
+        table = qualified_name(schema, "event_schemas"),
     )
 }
 
