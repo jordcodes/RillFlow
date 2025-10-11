@@ -549,6 +549,10 @@ let store = Store::builder(&url)
 store.ensure_tenant("acme").await?;
 store.ensure_tenant("globex").await?;
 
+// ensure_tenant() is idempotent and guarded by a Postgres advisory lock so
+// concurrent app instances won't double-run migrations. Once a tenant is
+// provisioned it is cached in-process for fast session spins.
+
 let mut acme = store.session();
 acme.context_mut().tenant = Some("acme".into());
 acme.store(customer_id, &customer_body)?;
@@ -557,6 +561,9 @@ acme.save_changes().await?;
 let mut globex = store.session();
 globex.context_mut().tenant = Some("globex".into());
 assert!(globex.load::<Customer>(&customer_id).await?.is_none());
+
+// If you forget to provision a tenant before calling save_changes(), the
+// session will fail fast with rillflow::Error::TenantNotFound("tenant_acme").
 ```
 
 ## License
