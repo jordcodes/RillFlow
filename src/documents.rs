@@ -11,7 +11,6 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sqlx::{Acquire, PgPool, Postgres, QueryBuilder, Transaction, types::Json};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
@@ -54,9 +53,7 @@ impl Documents {
                 return Ok(None);
             }
             let doc: T = serde_json::from_value(value)?;
-            crate::metrics::metrics()
-                .doc_reads_total
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            metrics::record_doc_read(None);
             Ok(Some((doc, version)))
         } else {
             Ok(None)
@@ -82,14 +79,10 @@ impl Documents {
                 .execute(&self.pool)
                 .await?;
                 if rows.rows_affected() == 1 {
-                    crate::metrics::metrics()
-                        .doc_writes_total
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    metrics::record_doc_write(None, 1);
                     Ok(ver + 1)
                 } else {
-                    crate::metrics::metrics()
-                        .doc_conflicts_total
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    metrics::record_doc_conflict(None);
                     Err(Error::DocVersionConflict)
                 }
             }
@@ -200,14 +193,10 @@ impl Documents {
 
         let query = qb.build_query_as::<(i32,)>();
         if let Some((new_ver,)) = query.fetch_optional(&self.pool).await? {
-            crate::metrics::metrics()
-                .doc_writes_total
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            metrics::record_doc_write(None, 1);
             Ok(new_ver)
         } else if expected.is_some() {
-            crate::metrics::metrics()
-                .doc_conflicts_total
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            metrics::record_doc_conflict(None);
             Err(Error::DocVersionConflict)
         } else {
             Err(Error::DocNotFound)
@@ -453,9 +442,7 @@ impl DocumentSession {
                     entry.dirty = false;
                     return Ok(None);
                 }
-                metrics::metrics()
-                    .doc_reads_total
-                    .fetch_add(1, Ordering::Relaxed);
+                metrics::record_doc_read(self.context.tenant.as_deref());
                 let doc_json = value.clone();
                 self.mark_loaded(*id, value, version);
                 let doc: T = serde_json::from_value(doc_json)?;
@@ -706,9 +693,7 @@ impl DocumentSession {
                         match rec {
                             Some((ver,)) => ver,
                             None => {
-                                metrics::metrics()
-                                    .doc_conflicts_total
-                                    .fetch_add(1, Ordering::Relaxed);
+                                metrics::record_doc_conflict(self.context.tenant.as_deref());
                                 return Err(Error::DocVersionConflict);
                             }
                         }
@@ -747,9 +732,7 @@ impl DocumentSession {
                         .execute(&mut *tx)
                         .await?;
                         if result.rows_affected() == 0 {
-                            metrics::metrics()
-                                .doc_conflicts_total
-                                .fetch_add(1, Ordering::Relaxed);
+                            metrics::record_doc_conflict(self.context.tenant.as_deref());
                             return Err(Error::DocVersionConflict);
                         }
                     } else {
@@ -774,9 +757,7 @@ impl DocumentSession {
                     .await;
                 if let Err(err) = result {
                     if matches!(err, Error::VersionConflict | Error::IdempotencyConflict) {
-                        metrics::metrics()
-                            .event_conflicts_total
-                            .fetch_add(1, Ordering::Relaxed);
+                        metrics::record_event_conflict(self.context.tenant.as_deref());
                     }
                     self.event_ops = event_ops;
                     self.snapshot_ops = snapshot_ops;
@@ -809,14 +790,10 @@ impl DocumentSession {
         tx.commit().await?;
 
         if write_count > 0 {
-            metrics::metrics()
-                .doc_writes_total
-                .fetch_add(write_count, Ordering::Relaxed);
+            metrics::record_doc_write(self.context.tenant.as_deref(), write_count);
         }
         if events_written > 0 {
-            metrics::metrics()
-                .event_appends_total
-                .fetch_add(events_written, Ordering::Relaxed);
+            metrics::record_event_appends(self.context.tenant.as_deref(), events_written);
         }
 
         for mutation in mutations {

@@ -2,7 +2,6 @@ use crate::{Error, Result, metrics};
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, Transaction};
-use std::sync::atomic::Ordering;
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug)]
@@ -166,15 +165,11 @@ impl Events {
         match res {
             Ok(()) => {
                 tx.commit().await?;
-                metrics::metrics()
-                    .event_appends_total
-                    .fetch_add(events.len() as u64, Ordering::Relaxed);
+                metrics::record_event_appends(None, events.len() as u64);
                 Ok(())
             }
             Err(err) => {
-                metrics::metrics()
-                    .event_conflicts_total
-                    .fetch_add(1, Ordering::Relaxed);
+                metrics::record_event_conflict(None);
                 Err(err)
             }
         }

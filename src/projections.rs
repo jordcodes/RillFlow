@@ -98,8 +98,12 @@ impl Projections {
     {
         let mut tx = self.pool.begin().await?;
         let context = SessionContext::default();
-        if let Some(schema) = self.resolve_schema(&context)? {
-            Self::set_local_search_path(&mut tx, &schema).await?;
+        let schema = self.resolve_schema(&context)?;
+        let schema_tenant = schema
+            .as_ref()
+            .and_then(|s| s.strip_prefix("tenant_").map(str::to_string));
+        if let Some(ref schema_name) = schema {
+            Self::set_local_search_path(&mut tx, schema_name).await?;
         }
         let last_seq = Self::load_last_seq(&mut tx, name).await?;
 
@@ -118,6 +122,7 @@ impl Projections {
             let global_seq: i64 = row.get("global_seq");
 
             handler.apply(&event_type, &body, &mut tx).await?;
+            crate::metrics::record_proj_events_processed(schema_tenant.as_deref(), 1);
             new_last = global_seq;
         }
 
@@ -127,7 +132,10 @@ impl Projections {
         Ok(())
     }
 
-    async fn set_local_search_path(tx: &mut Transaction<'_, Postgres>, schema_name: &str) -> Result<()> {
+    async fn set_local_search_path(
+        tx: &mut Transaction<'_, Postgres>,
+        schema_name: &str,
+    ) -> Result<()> {
         let stmt = format!(
             "set local search_path to {}, public",
             schema::quote_ident(schema_name)

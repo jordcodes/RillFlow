@@ -402,9 +402,7 @@ impl Subscriptions {
                         elapsed_ms = elapsed_ms,
                         "subscription batch delivered",
                     );
-                    crate::metrics::metrics()
-                        .subs_delivered_total
-                        .fetch_add(delivered as u64, std::sync::atomic::Ordering::Relaxed);
+                    crate::metrics::record_subs_delivered(None, delivered as u64);
                 }
 
                 // Backpressure: if unacknowledged (cursor - persisted) exceeds max_in_flight, throttle
@@ -429,9 +427,7 @@ impl Subscriptions {
                     .unwrap_or(0)
                 };
                 let pending = (cursor - persisted_seq).max(0);
-                crate::metrics::metrics()
-                    .subs_pending_gauge
-                    .store(pending as u64, std::sync::atomic::Ordering::Relaxed);
+                crate::metrics::record_subs_pending(None, pending as u64);
                 // Allow a stored group-specific limit to override runtime option if present
                 let group_limit: Option<i32> = if let Some(grp) = &opts.group {
                     sqlx::query_scalar::<_, Option<i32>>(

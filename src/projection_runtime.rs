@@ -179,9 +179,7 @@ impl ProjectionDaemon {
 
             new_last = seq;
             processed += 1;
-            crate::metrics::metrics()
-                .proj_events_processed_total
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::metrics::record_proj_events_processed(None, 1);
         }
 
         self.persist_checkpoint(&mut tx, name, new_last).await?;

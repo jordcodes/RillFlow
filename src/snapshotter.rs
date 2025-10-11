@@ -205,12 +205,23 @@ impl<F: SnapshotFolder> Snapshotter<F> {
             candidates,
             max_gap: max_gap.unwrap_or(0).max(0),
         };
-        crate::metrics::metrics()
-            .snapshot_candidates_gauge
-            .store(out.candidates as u64, std::sync::atomic::Ordering::Relaxed);
-        crate::metrics::metrics()
-            .snapshot_max_gap_gauge
-            .store(out.max_gap as u64, std::sync::atomic::Ordering::Relaxed);
+        let tenant_label = self
+            .config
+            .schema
+            .as_ref()
+            .map(|s| s.trim_start_matches("tenant_").to_string())
+            .or_else(|| {
+                if matches!(self.config.tenant_strategy, TenantStrategy::SchemaPerTenant) {
+                    Some("<resolver>".to_string())
+                } else {
+                    None
+                }
+            });
+        crate::metrics::record_snapshot_candidates(
+            tenant_label.as_deref(),
+            out.candidates.max(0) as u64,
+        );
+        crate::metrics::record_snapshot_max_gap(tenant_label.as_deref(), out.max_gap.max(0) as u64);
         Ok(out)
     }
 }
