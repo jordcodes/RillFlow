@@ -20,11 +20,13 @@ pub use error::{Error, Result};
 pub use events::EventEnvelope;
 pub use events::{Event, Expected};
 pub use schema::{SchemaConfig, SchemaManager, SchemaPlan, TenancyMode, TenantSchema};
-pub use store::Store;
 pub use store::SessionBuilder;
+pub use store::Store;
 
 pub use documents::DocumentSession;
 
 pub mod prelude {
+    pub use crate::events::AppendOptions;
+    pub use crate::store::SessionBuilder;
     pub use crate::{Event, Expected, Result, Store};
 }

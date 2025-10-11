@@ -35,8 +35,14 @@ impl Store {
         }
     }
 
-    pub fn document_session(&self) -> DocumentSession {
+    /// Obtain a `DocumentSession` using the store's current session defaults.
+    pub fn session(&self) -> DocumentSession {
         self.session_builder().build()
+    }
+
+    #[deprecated(note = "Use Store::session() instead")] // maintain backward compatibility
+    pub fn document_session(&self) -> DocumentSession {
+        self.session()
     }
 
     pub fn session_builder(&self) -> SessionBuilder {
@@ -47,15 +53,21 @@ impl Store {
         }
     }
 
+    /// Current session defaults (headers + advisory lock flag).
+    /// Defaults are applied to `store.session()` and `store.session_builder()`.
     pub fn session_defaults(&self) -> (&AppendOptions, bool) {
         (&self.session_defaults, self.session_advisory_locks)
     }
 
+    /// Override session defaults for new sessions created after this call.
+    /// Prefer configuring defaults through [`StoreBuilder::session_defaults`] at startup so
+    /// clones of `Store` share the same settings without requiring runtime mutation.
     pub fn set_session_defaults(&mut self, defaults: AppendOptions, advisory_locks: bool) {
         self.session_defaults = defaults;
         self.session_advisory_locks = advisory_locks;
     }
 
+    /// Consume the builder while setting session defaults before creating the store.
     pub fn with_session_defaults(mut self, defaults: AppendOptions, advisory_locks: bool) -> Self {
         self.set_session_defaults(defaults, advisory_locks);
         self
@@ -115,6 +127,8 @@ pub struct StoreBuilder {
     url: String,
     max_connections: Option<u32>,
     connect_timeout: Option<Duration>,
+    session_defaults: AppendOptions,
+    session_advisory_locks: bool,
 }
 
 /// Builder for `DocumentSession` instances with preconfigured defaults.
@@ -130,6 +144,8 @@ impl StoreBuilder {
             url: url.into(),
             max_connections: None,
             connect_timeout: None,
+            session_defaults: AppendOptions::default(),
+            session_advisory_locks: false,
         }
     }
 
@@ -140,6 +156,16 @@ impl StoreBuilder {
 
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = Some(timeout);
+        self
+    }
+
+    pub fn session_defaults(mut self, defaults: AppendOptions) -> Self {
+        self.session_defaults = defaults;
+        self
+    }
+
+    pub fn session_advisory_locks(mut self, enable: bool) -> Self {
+        self.session_advisory_locks = enable;
         self
     }
 
@@ -154,8 +180,8 @@ impl StoreBuilder {
         let pool = opts.connect(&self.url).await?;
         Ok(Store {
             pool,
-            session_defaults: AppendOptions::default(),
-            session_advisory_locks: false,
+            session_defaults: self.session_defaults,
+            session_advisory_locks: self.session_advisory_locks,
         })
     }
 }

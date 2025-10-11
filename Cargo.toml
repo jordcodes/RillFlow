@@ -54,6 +54,10 @@ name = "rillflow"
 path = "src/bin/rillflow.rs"
 required-features = ["cli"]
 
+[[example]]
+name = "session_defaults"
+path = "examples/session_defaults.rs"
+
 [dev-dependencies]
 testcontainers = "0.25.0"
 anyhow = "1"

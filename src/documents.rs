@@ -469,12 +469,13 @@ impl DocumentSession {
 
     /// Ensure an idempotency key header is present on staged event appends.
     pub fn set_event_idempotency_key(&mut self, key: impl Into<String>) -> &mut Self {
-        let mut map = match self.event_defaults.headers.take() {
-            Some(Value::Object(m)) => m,
-            _ => serde_json::Map::new(),
-        };
+        let mut map = serde_json::Map::new();
         map.insert("idempotency_key".to_string(), Value::String(key.into()));
-        self.event_defaults.headers = Some(Value::Object(map));
+        let overrides = AppendOptions {
+            headers: Some(Value::Object(map)),
+            ..AppendOptions::default()
+        };
+        self.event_defaults = Self::combine_options(&self.event_defaults, &overrides);
         self
     }
 

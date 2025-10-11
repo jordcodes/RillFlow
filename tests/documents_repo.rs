@@ -30,7 +30,15 @@ async fn put_get_update_soft_delete_restore() -> Result<()> {
     let port = container.get_host_port_ipv4(5432).await?;
     let url = format!("postgres://postgres:postgres@{host}:{port}/postgres?sslmode=disable");
 
-    let store = Store::connect(&url).await?;
+    let store = Store::builder(&url)
+        .session_defaults(AppendOptions {
+            headers: Some(json!({"source": "test"})),
+            causation_id: None,
+            correlation_id: None,
+        })
+        .session_advisory_locks(true)
+        .build()
+        .await?;
     rillflow::testing::migrate_core_schema(store.pool()).await?;
 
     let id = Uuid::new_v4();
@@ -110,7 +118,15 @@ async fn session_load_store_delete_roundtrip() -> Result<()> {
     let port = container.get_host_port_ipv4(5432).await?;
     let url = format!("postgres://postgres:postgres@{host}:{port}/postgres?sslmode=disable");
 
-    let mut store = Store::connect(&url).await?;
+    let store = Store::builder(&url)
+        .session_defaults(AppendOptions {
+            headers: Some(json!({"source": "test"})),
+            causation_id: None,
+            correlation_id: None,
+        })
+        .session_advisory_locks(true)
+        .build()
+        .await?;
     rillflow::testing::migrate_core_schema(store.pool()).await?;
 
     #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -120,15 +136,7 @@ async fn session_load_store_delete_roundtrip() -> Result<()> {
     }
 
     let id = Uuid::new_v4();
-    store.set_session_defaults(
-        AppendOptions {
-            headers: Some(json!({"source": "test"})),
-            causation_id: None,
-            correlation_id: None,
-        },
-        true,
-    );
-    let mut session = store.document_session();
+    let mut session = store.session();
 
     // create new doc via session store + save
     session.store(
@@ -161,7 +169,7 @@ async fn session_load_store_delete_roundtrip() -> Result<()> {
     session.save_changes().await?;
 
     // second session observes persisted version 2
-    let mut session2 = store.document_session();
+    let mut session2 = store.session();
     let fresh = session2.load::<Profile>(&id).await?.unwrap();
     assert_eq!(fresh.tier, "plus");
 

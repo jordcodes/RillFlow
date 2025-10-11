@@ -488,49 +488,28 @@ use uuid::Uuid;
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct Customer { id: Uuid, email: String, tier: String }
 
-async fn upgrade_customer(store: &rillflow::Store, id: Uuid) -> rillflow::Result<()> {
-    let mut session = store
-        .session_builder()
-        .merge_headers(serde_json::json!({"source": "billing"}))
-        .advisory_locks(true)
-        .build();
+let store = Store::builder(&url)
+    .session_defaults(AppendOptions {
+        headers: Some(serde_json::json!({"source": "api"})),
+        causation_id: None,
+        correlation_id: None,
+    })
+    .session_advisory_locks(true)
+    .build()
+    .await?;
 
-    if let Some(mut customer) = session.load::<Customer>(&id).await? {
-        customer.tier = "pro".into();
-        session.store(id, &customer)?;
-        session.set_event_idempotency_key("req-upgrade-42");
-        session.append_events(
-            id,
-            rillflow::Expected::Any,
-            vec![rillflow::Event::new(
-                "CustomerTierChanged",
-                &serde_json::json!({"tier": "pro"}),
-            )],
-        )?;
-    }
-    session.save_changes().await
-}
+// Store is cheap to clone and share. Configure defaults up front so every clone
+// produces sessions with consistent metadata.
 
-async fn onboarding_flow(store: &rillflow::Store, id: Uuid) -> rillflow::Result<()> {
-    let mut session = store
-        .session_builder()
-        .merge_headers(serde_json::json!({"source": "signup"}))
-        .correlation_id(Some(id))
-        .build();
-
-    if session.load::<Customer>(&id).await?.is_none() {
-        let fresh = Customer { id, email: "new@example.com".into(), tier: "starter".into() };
-        session.store(id, &fresh)?;
-        session.set_event_idempotency_key("req-onboard-1");
-        session.append_events(
-            id,
-            rillflow::Expected::Any,
-            vec![rillflow::Event::new("CustomerRegistered", &fresh)],
-        )?;
-    }
-
-    session.save_changes().await
-}
+let mut session = store.session();
+let customer = Customer { id, email: "new@example.com".into(), tier: "starter".into() };
+session.store(id, &customer)?;
+session.append_events(
+    id,
+    rillflow::Expected::Any,
+    vec![rillflow::Event::new("CustomerRegistered", &customer)],
+)?;
+session.save_changes().await?;
 ```
 
 ## License

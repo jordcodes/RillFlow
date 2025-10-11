@@ -69,7 +69,7 @@ async fn roundtrip() -> Result<()> {
         email: "a@b.com".into(),
     };
 
-    let mut session = store.document_session();
+    let mut session = store.session();
     session.store(id, &customer)?;
     session.append_events(
         id,
