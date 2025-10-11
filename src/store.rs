@@ -194,6 +194,33 @@ impl Store {
         }
     }
 
+    pub async fn drop_tenant(&self, tenant: &str) -> Result<()> {
+        match self.tenant_strategy {
+            TenantStrategy::Single => Err(crate::Error::TenantNotFound(tenant.to_string())),
+            TenantStrategy::SchemaPerTenant => {
+                let schema = tenant_schema_name(tenant);
+                let stmt = format!(
+                    "drop schema if exists {} cascade",
+                    crate::schema::quote_ident(&schema)
+                );
+                sqlx::query(&stmt).execute(&self.pool).await?;
+                self.forget_tenant_schema(&schema);
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn tenant_exists(&self, tenant: &str) -> Result<bool> {
+        let schema = tenant_schema_name(tenant);
+        let exists: bool = sqlx::query_scalar(
+            "select exists (select 1 from information_schema.schemata where schema_name = $1)",
+        )
+        .bind(&schema)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists)
+    }
+
     pub fn tenant_strategy(&self) -> TenantStrategy {
         self.tenant_strategy
     }

@@ -38,14 +38,85 @@ async fn tenant_status(store: &Store, name: &str) -> rillflow::Result<()> {
 }
 
 async fn drop_tenant(store: &Store, name: &str) -> rillflow::Result<()> {
+    store.drop_tenant(name).await
+}
+
+async fn archive_tenant(
+    store: &Store,
+    name: &str,
+    output: &str,
+    include_snapshots: bool,
+) -> rillflow::Result<()> {
+    if !store.tenant_exists(name).await? {
+        println!("tenant '{}' does not exist, nothing to archive", name);
+        return Ok(());
+    }
     let schema = rillflow::store::tenant_schema_name(name);
-    sqlx::query(&format!(
-        "drop schema if exists {} cascade",
-        rillflow::schema::quote_ident(&schema)
-    ))
-    .execute(store.pool())
+    let docs_out = format!("{}/docs.json", output);
+    export_table(store, &schema, "docs", &docs_out, include_snapshots).await?;
+    let events_out = format!("{}/events.json", output);
+    export_table(store, &schema, "events", &events_out, include_snapshots).await?;
+    if include_snapshots {
+        let snaps_out = format!("{}/snapshots.json", output);
+        export_table(store, &schema, "snapshots", &snaps_out, true).await?;
+    }
+    Ok(())
+}
+
+async fn export_table(
+    store: &Store,
+    schema: &str,
+    table: &str,
+    path: &str,
+    include_meta: bool,
+) -> rillflow::Result<()> {
+    use tokio::fs;
+    use tokio::io::AsyncWriteExt;
+
+    let qualified = format!(
+        "{}.{}",
+        rillflow::schema::quote_ident(schema),
+        rillflow::schema::quote_ident(table)
+    );
+    let rows = sqlx::query(&format!("select row_to_json(t) from {} t", qualified))
+        .fetch_all(store.pool())
+        .await?;
+    fs::create_dir_all(
+        std::path::Path::new(path)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new(".")),
+    )
     .await?;
-    store.forget_tenant_schema(&schema);
+    let mut file = fs::File::create(path).await?;
+    for row in rows {
+        let value: serde_json::Value = row.get(0);
+        let line = serde_json::to_string(&value)?;
+        file.write_all(line.as_bytes()).await?;
+        file.write_all(b"\n").await?;
+    }
+
+    if include_meta && table == "events" {
+        let checkpoints = sqlx::query(&format!(
+            "select row_to_json(t) from {}.projections t",
+            rillflow::schema::quote_ident(schema)
+        ))
+        .fetch_all(store.pool())
+        .await?;
+        if !checkpoints.is_empty() {
+            let path = format!(
+                "{}/projections.json",
+                std::path::Path::new(path).parent().unwrap().display()
+            );
+            let mut meta = fs::File::create(&path).await?;
+            for row in checkpoints {
+                let value: serde_json::Value = row.get(0);
+                let line = serde_json::to_string(&value)?;
+                meta.write_all(line.as_bytes()).await?;
+                meta.write_all(b"\n").await?;
+            }
+        }
+    }
+
     Ok(())
 }
 use clap::{ArgAction, Parser, Subcommand};
@@ -253,6 +324,14 @@ enum TenantsCmd {
     List,
     /// Show schema-level status for a tenant
     Status { name: String },
+    /// Archive a tenant schema to disk (exports docs/events JSON)
+    Archive {
+        name: String,
+        #[arg(long)]
+        output: String,
+        #[arg(long, default_value_t = false)]
+        include_snapshots: bool,
+    },
     /// Drop a tenant schema (dangerous)
     Drop {
         name: String,
@@ -772,6 +851,14 @@ async fn main() -> rillflow::Result<()> {
             TenantsCmd::Status { name } => {
                 tenant_status(&store, &name).await?;
             }
+            TenantsCmd::Archive {
+                name,
+                output,
+                include_snapshots,
+            } => {
+                archive_tenant(&store, &name, &output, include_snapshots).await?;
+                println!("tenant '{}' archived to {}", name, output);
+            }
             TenantsCmd::Drop { name, force } => {
                 if !force {
                     eprintln!(
@@ -780,7 +867,7 @@ async fn main() -> rillflow::Result<()> {
                     );
                     std::process::exit(3);
                 }
-                drop_tenant(&store, &name).await?;
+                store.drop_tenant(&name).await?;
                 println!("tenant '{}' dropped", name);
             }
         },
