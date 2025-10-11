@@ -667,7 +667,10 @@ impl DocumentSession {
         self.event_defaults = AppendOptions::default();
     }
 
-    pub(crate) fn combine_options(defaults: &AppendOptions, overrides: &AppendOptions) -> AppendOptions {
+    pub(crate) fn combine_options(
+        defaults: &AppendOptions,
+        overrides: &AppendOptions,
+    ) -> AppendOptions {
         AppendOptions {
             headers: Self::merge_headers(&defaults.headers, &overrides.headers),
             causation_id: overrides.causation_id.or(defaults.causation_id),
