@@ -129,6 +129,9 @@ enum SubscriptionsCmd {
         /// Optional consumer group name
         #[arg(long)]
         group: Option<String>,
+        /// Optional max in-flight items to bound per-batch delivery
+        #[arg(long)]
+        max_in_flight: Option<usize>,
     },
     /// Group admin: list groups for a subscription
     Groups { name: String },
@@ -453,7 +456,12 @@ async fn main() -> rillflow::Result<()> {
                     .await?;
                     println!("reset {} to {}", name, seq);
                 }
-                SubscriptionsCmd::Tail { name, limit, group } => {
+                SubscriptionsCmd::Tail {
+                    name,
+                    limit,
+                    group,
+                    max_in_flight,
+                } => {
                     // load filter
                     let rec =
                         sqlx::query("select filter, last_seq from subscriptions where name=$1")
@@ -468,6 +476,7 @@ async fn main() -> rillflow::Result<()> {
                     let opts = SubscriptionOptions {
                         start_from: last_seq,
                         group,
+                        max_in_flight: max_in_flight.unwrap_or(1024),
                         ..Default::default()
                     };
                     let (_h, mut rx) = subs.subscribe(&name, filter, opts).await?;
