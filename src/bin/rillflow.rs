@@ -52,6 +52,10 @@ enum Commands {
     /// Snapshots compaction
     #[command(subcommand)]
     Snapshots(SnapshotsCmd),
+
+    /// Tenants (schema-per-tenant) helpers
+    #[command(subcommand)]
+    Tenants(TenantsCmd),
 }
 
 #[derive(Subcommand, Debug)]
@@ -169,6 +173,16 @@ enum SnapshotsCmd {
         #[arg(long, default_value_t = 100)]
         threshold: i32,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum TenantsCmd {
+    /// Create a new tenant schema (idempotent) and sync core tables
+    Create { name: String },
+    /// Sync (plan+apply) core tables for an existing tenant schema
+    Sync { name: String },
+    /// List user schemas (excluding system schemas)
+    List,
 }
 
 #[tokio::main]
@@ -595,6 +609,45 @@ async fn main() -> rillflow::Result<()> {
                 );
             }
         },
+        Commands::Tenants(cmd) => {
+            match cmd {
+                TenantsCmd::Create { name } => {
+                    // Create schema if not exists, then sync tables for that schema
+                    sqlx::query(&format!(
+                        "create schema if not exists {}",
+                        quote_ident(&name)
+                    ))
+                    .execute(store.pool())
+                    .await?;
+                    let cfg = SchemaConfig::with_base_schema(name);
+                    let plan = mgr.sync(&cfg).await?;
+                    if plan.is_empty() {
+                        println!("No changes needed.");
+                    } else {
+                        print_plan(&plan);
+                    }
+                }
+                TenantsCmd::Sync { name } => {
+                    let cfg = SchemaConfig::with_base_schema(name);
+                    let plan = mgr.sync(&cfg).await?;
+                    if plan.is_empty() {
+                        println!("No changes needed.");
+                    } else {
+                        print_plan(&plan);
+                    }
+                }
+                TenantsCmd::List => {
+                    let rows = sqlx::query_scalar::<_, String>(
+                        "select schema_name from information_schema.schemata where schema_name not in ('pg_catalog','information_schema','public') order by schema_name",
+                    )
+                    .fetch_all(store.pool())
+                    .await?;
+                    for s in rows {
+                        println!("{}", s);
+                    }
+                }
+            }
+        }
     }
 
     Ok(())

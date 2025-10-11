@@ -25,6 +25,10 @@ cargo test --test integration_postgres
 ```bash
 cargo run --bin rillflow -- schema-plan --database-url "$DATABASE_URL" --schema public
 cargo run --bin rillflow -- schema-sync  --database-url "$DATABASE_URL" --schema public
+# Tenants (schema-per-tenant)
+cargo run --bin rillflow -- tenants create acme --database-url "$DATABASE_URL"
+cargo run --bin rillflow -- tenants sync acme   --database-url "$DATABASE_URL"
+cargo run --bin rillflow -- tenants list        --database-url "$DATABASE_URL"
 ```
 
 - Projections admin
