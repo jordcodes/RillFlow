@@ -527,11 +527,6 @@ aggregates.commit(
     rillflow::Expected::Any,
     vec![rillflow::Event::new("CustomerVisited", &serde_json::json!({}))],
 )?;
-aggregates.commit_for(
-    id,
-    &VisitCounter::default(),
-    vec![rillflow::Event::new("CustomerVisited", &serde_json::json!({}))],
-)?;
 aggregates.commit_and_snapshot(
     id,
     &VisitCounter::default(),
@@ -539,6 +534,29 @@ aggregates.commit_and_snapshot(
     2,
 )?;
 session.save_changes().await?;
+```
+
+### Multi-Tenancy (Schema Per Tenant)
+
+```rust
+use rillflow::{Store, store::TenantStrategy};
+
+let store = Store::builder(&url)
+    .tenant_strategy(TenantStrategy::SchemaPerTenant)
+    .build()
+    .await?;
+
+store.ensure_tenant("acme").await?;
+store.ensure_tenant("globex").await?;
+
+let mut acme = store.session();
+acme.context_mut().tenant = Some("acme".into());
+acme.store(customer_id, &customer_body)?;
+acme.save_changes().await?;
+
+let mut globex = store.session();
+globex.context_mut().tenant = Some("globex".into());
+assert!(globex.load::<Customer>(&customer_id).await?.is_none());
 ```
 
 ## License

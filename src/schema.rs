@@ -545,11 +545,11 @@ fn build_subscription_group_leases_table_sql(schema: &str) -> String {
     )
 }
 
-fn qualified_name(schema: &str, ident: &str) -> String {
+pub fn qualified_name(schema: &str, ident: &str) -> String {
     format!("{}.{}", quote_ident(schema), quote_ident(ident))
 }
 
-fn quote_ident(value: &str) -> String {
+pub fn quote_ident(value: &str) -> String {
     let escaped = value.replace('"', "\"\"");
     format!("\"{}\"", escaped)
 }

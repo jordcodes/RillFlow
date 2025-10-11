@@ -19,6 +19,8 @@ pub enum Error {
     DocNotFound,
     #[error("document version conflict")]
     DocVersionConflict,
+    #[error("tenant required for this operation")]
+    TenantRequired,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -37,6 +37,11 @@ impl SessionContextBuilder {
         self
     }
 
+    pub fn maybe_tenant(mut self, tenant: Option<String>) -> Self {
+        self.tenant = tenant;
+        self
+    }
+
     pub fn correlation_id(mut self, id: Uuid) -> Self {
         self.correlation_id = Some(id);
         self

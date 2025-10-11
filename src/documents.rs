@@ -4,6 +4,8 @@ use crate::{
     events::{AppendOptions, Event, Events, Expected},
     metrics,
     query::{CompiledQuery, DocumentQuery, DocumentQueryContext},
+    schema,
+    store::{TenantStrategy, tenant_schema_name},
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -331,11 +333,16 @@ pub struct DocumentSession {
     event_ops: Vec<SessionEventOp>,
     snapshot_ops: Vec<SessionSnapshotOp>,
     context: crate::context::SessionContext,
+    tenant_strategy: TenantStrategy,
 }
 
 impl DocumentSession {
     pub fn aggregates<'a>(&'a mut self, repo: &'a AggregateRepository) -> AggregateSession<'a> {
         AggregateSession::new(repo, self)
+    }
+
+    pub(crate) fn set_tenant_strategy(&mut self, strategy: TenantStrategy) {
+        self.tenant_strategy = strategy;
     }
 
     pub(crate) fn new(
@@ -351,6 +358,20 @@ impl DocumentSession {
             event_ops: Vec::new(),
             snapshot_ops: Vec::new(),
             context,
+            tenant_strategy: TenantStrategy::Single,
+        }
+    }
+
+    fn tenant_schema(&self) -> Result<Option<String>> {
+        match self.tenant_strategy {
+            TenantStrategy::Single => Ok(None),
+            TenantStrategy::SchemaPerTenant => {
+                if let Some(ref tenant) = self.context.tenant {
+                    Ok(Some(tenant_schema_name(tenant)))
+                } else {
+                    Err(Error::TenantRequired)
+                }
+            }
         }
     }
 
@@ -381,10 +402,20 @@ impl DocumentSession {
             }
         }
 
+        let schema = self.tenant_schema()?;
+        let mut conn = self.pool.acquire().await?;
+        if let Some(ref schema_name) = schema {
+            let search_path = format!("{}, public", schema::quote_ident(schema_name));
+            sqlx::query("select set_config('search_path', $1, false)")
+                .bind(search_path)
+                .execute(&mut *conn)
+                .await?;
+        }
+
         let row: Option<(Value, i32, Option<chrono::DateTime<chrono::Utc>>)> =
             sqlx::query_as("select doc, version, deleted_at from docs where id = $1")
                 .bind(id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *conn)
                 .await?;
 
         match row {
@@ -609,7 +640,16 @@ impl DocumentSession {
 
     /// Persist staged changes inside a single database transaction.
     pub async fn save_changes(&mut self) -> Result<()> {
+        let schema = self.tenant_schema()?;
         let mut tx = self.pool.begin().await?;
+
+        if let Some(ref schema_name) = schema {
+            let search_path = format!("{}, public", schema::quote_ident(schema_name));
+            sqlx::query("select set_config('search_path', $1, false)")
+                .bind(search_path)
+                .execute(&mut *tx)
+                .await?;
+        }
         let mut mutations = Vec::with_capacity(self.staged.len());
         let mut write_count = 0u64;
 

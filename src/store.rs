@@ -4,10 +4,32 @@ use crate::{
     documents::{DocumentSession, Documents},
     events::{AppendOptions, Events},
     projections::Projections,
+    schema::{SchemaConfig, TenancyMode, TenantSchema},
 };
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::time::Duration;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TenantStrategy {
+    Single,
+    SchemaPerTenant,
+}
+
+pub(crate) fn tenant_schema_name(tenant: &str) -> String {
+    let mut normalized = String::with_capacity(tenant.len());
+    for ch in tenant.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            normalized.push(ch.to_ascii_lowercase());
+        } else {
+            normalized.push('_');
+        }
+    }
+    if normalized.is_empty() {
+        normalized.push('_');
+    }
+    format!("tenant_{}", normalized)
+}
 
 #[derive(Clone)]
 pub struct Store {
@@ -15,6 +37,7 @@ pub struct Store {
     session_defaults: AppendOptions,
     session_advisory_locks: bool,
     session_context: SessionContext,
+    tenant_strategy: TenantStrategy,
 }
 
 impl Store {
@@ -25,6 +48,7 @@ impl Store {
             session_defaults: AppendOptions::default(),
             session_advisory_locks: false,
             session_context: SessionContext::default(),
+            tenant_strategy: TenantStrategy::Single,
         })
     }
 
@@ -54,6 +78,7 @@ impl Store {
             defaults: self.session_defaults.clone(),
             use_advisory_lock: self.session_advisory_locks,
             context: self.session_context.clone(),
+            tenant_strategy: self.tenant_strategy,
         }
     }
 
@@ -79,6 +104,26 @@ impl Store {
 
     pub fn session_context(&self) -> &SessionContext {
         &self.session_context
+    }
+
+    pub async fn ensure_tenant(&self, tenant: &str) -> Result<()> {
+        match self.tenant_strategy {
+            TenantStrategy::Single => Ok(()),
+            TenantStrategy::SchemaPerTenant => {
+                let schema = tenant_schema_name(tenant);
+                let config = SchemaConfig {
+                    base_schema: "public".into(),
+                    tenancy_mode: TenancyMode::SchemaPerTenant {
+                        tenants: vec![TenantSchema::new(&schema)],
+                    },
+                };
+                self.schema().sync(&config).await.map(|_| ())
+            }
+        }
+    }
+
+    pub fn tenant_strategy(&self) -> TenantStrategy {
+        self.tenant_strategy
     }
 
     pub fn events(&self) -> Events {
@@ -138,6 +183,7 @@ pub struct StoreBuilder {
     session_defaults: AppendOptions,
     session_advisory_locks: bool,
     session_context_builder: SessionContextBuilder,
+    tenant_strategy: TenantStrategy,
 }
 
 /// Builder for `DocumentSession` instances with preconfigured defaults.
@@ -146,6 +192,7 @@ pub struct SessionBuilder {
     defaults: AppendOptions,
     use_advisory_lock: bool,
     context: SessionContext,
+    tenant_strategy: TenantStrategy,
 }
 
 impl StoreBuilder {
@@ -157,6 +204,7 @@ impl StoreBuilder {
             session_defaults: AppendOptions::default(),
             session_advisory_locks: false,
             session_context_builder: SessionContext::builder(),
+            tenant_strategy: TenantStrategy::Single,
         }
     }
 
@@ -185,6 +233,11 @@ impl StoreBuilder {
         self
     }
 
+    pub fn tenant_strategy(mut self, strategy: TenantStrategy) -> Self {
+        self.tenant_strategy = strategy;
+        self
+    }
+
     pub async fn build(self) -> Result<Store> {
         let mut opts = PgPoolOptions::new();
         if let Some(max) = self.max_connections {
@@ -199,6 +252,7 @@ impl StoreBuilder {
             session_defaults: self.session_defaults,
             session_advisory_locks: self.session_advisory_locks,
             session_context: self.session_context_builder.build(),
+            tenant_strategy: self.tenant_strategy,
         })
     }
 }
@@ -255,12 +309,14 @@ impl SessionBuilder {
             defaults,
             use_advisory_lock,
             context,
+            tenant_strategy,
         } = self;
 
         let mut events = store.events();
         events.use_advisory_lock = use_advisory_lock;
 
         let mut session = DocumentSession::new(store.pool.clone(), events, context);
+        session.set_tenant_strategy(tenant_strategy);
         if let Some(headers) = defaults.headers.clone() {
             session.merge_event_headers(headers);
         }

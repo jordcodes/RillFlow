@@ -1,4 +1,7 @@
-use rillflow::{Aggregate, AggregateRepository, SessionContext, Store, events::AppendOptions};
+use rillflow::{
+    Aggregate, AggregateRepository, SessionContext, Store, events::AppendOptions,
+    store::TenantStrategy,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
@@ -47,9 +50,13 @@ async fn main() -> rillflow::Result<()> {
                 .tenant("default")
                 .headers(json!({"environment": "dev"})),
         )
+        .tenant_strategy(TenantStrategy::SchemaPerTenant)
         .session_advisory_locks(true)
         .build()
         .await?;
+
+    store.ensure_tenant("default").await?;
+    store.ensure_tenant("acme").await?;
 
     rillflow::testing::migrate_core_schema(store.pool()).await?;
 
@@ -88,7 +95,13 @@ async fn main() -> rillflow::Result<()> {
     )?;
     session.save_changes().await?;
 
+    let mut acme_session = store.session();
+    acme_session.context_mut().tenant = Some("acme".into());
+    acme_session.store(customer_id, &customer)?;
+    acme_session.save_changes().await?;
+
     let mut session = store.session();
+    session.context_mut().tenant = Some("default".into());
     let repo = AggregateRepository::new(store.events());
     let mut aggregates = session.aggregates(&repo);
     let visits_stream = customer_id;

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use rillflow::events::AppendOptions;
+use rillflow::store::TenantStrategy;
 use rillflow::{Aggregate, AggregateRepository, Error, Event, Expected, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -327,6 +328,70 @@ async fn session_aggregate_commit_and_snapshot() -> Result<()> {
     let (version, body) = snapshot.expect("snapshot row");
     assert_eq!(version, 3);
     assert_eq!(body["n"], 3);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_multi_tenant_isolation() -> Result<()> {
+    let image = GenericImage::new("postgres", "16-alpine")
+        .with_exposed_port(5432.tcp())
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres");
+    let container = image.start().await?;
+    let host = container.get_host().await?;
+    let port = container.get_host_port_ipv4(5432).await?;
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres?sslmode=disable");
+
+    let store = Store::builder(&url)
+        .tenant_strategy(rillflow::store::TenantStrategy::SchemaPerTenant)
+        .build()
+        .await?;
+
+    store.ensure_tenant("acme").await?;
+    store.ensure_tenant("globex").await?;
+
+    rillflow::testing::migrate_core_schema(store.pool()).await?;
+
+    let customer_id = Uuid::new_v4();
+
+    let mut session_acme = store.session();
+    session_acme.context_mut().tenant = Some("acme".into());
+    session_acme.store(
+        customer_id,
+        &Customer {
+            email: "acme@example.com".into(),
+            tier: "starter".into(),
+        },
+    )?;
+    session_acme.save_changes().await?;
+
+    let mut session_globex = store.session();
+    session_globex.context_mut().tenant = Some("globex".into());
+    let acme_doc = session_globex.load::<Customer>(&customer_id).await?;
+    assert!(acme_doc.is_none(), "globex session must not see acme data");
+
+    session_globex.store(
+        customer_id,
+        &Customer {
+            email: "globex@example.com".into(),
+            tier: "pro".into(),
+        },
+    )?;
+    session_globex.save_changes().await?;
+
+    let mut acme_check = store.session();
+    acme_check.context_mut().tenant = Some("acme".into());
+    let acme_doc = acme_check.load::<Customer>(&customer_id).await?.unwrap();
+    assert_eq!(acme_doc.email, "acme@example.com");
+
+    let mut globex_check = store.session();
+    globex_check.context_mut().tenant = Some("globex".into());
+    let globex_doc = globex_check.load::<Customer>(&customer_id).await?.unwrap();
+    assert_eq!(globex_doc.email, "globex@example.com");
 
     Ok(())
 }
