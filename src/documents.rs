@@ -306,6 +306,7 @@ impl Documents {
             Events {
                 pool: self.pool.clone(),
                 use_advisory_lock: false,
+                apply_inline: false,
             },
             crate::context::SessionContext::default(),
         )

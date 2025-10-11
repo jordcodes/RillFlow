@@ -259,6 +259,7 @@ impl Store {
         Events {
             pool: self.pool.clone(),
             use_advisory_lock: false,
+            apply_inline: false,
         }
     }
 

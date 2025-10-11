@@ -1,3 +1,4 @@
+use crate::projections::ProjectionHandler;
 use crate::{Error, Result, metrics};
 use serde::Serialize;
 use serde_json::Value;
@@ -39,6 +40,7 @@ pub struct AppendOptions {
 pub struct Events {
     pub(crate) pool: PgPool,
     pub(crate) use_advisory_lock: bool,
+    pub(crate) apply_inline: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -60,6 +62,11 @@ pub struct EventEnvelope {
 impl Events {
     pub fn with_advisory_locks(mut self) -> Self {
         self.use_advisory_lock = true;
+        self
+    }
+
+    pub fn enable_inline_projections(mut self) -> Self {
+        self.apply_inline = true;
         self
     }
 
@@ -304,6 +311,15 @@ impl Events {
                 }
                 return Err(e.into());
             }
+
+            // Apply inline projections inside the same transaction for immediate consistency
+            if self.apply_inline {
+                if let Ok(handlers) = INLINE_HANDLERS.get_or_init(Default::default).lock() {
+                    for h in handlers.iter() {
+                        h.apply(&event.typ, &event.body, tx).await?;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -396,6 +412,16 @@ pub fn register_upcaster(event_type: &str, from_version: i32, upcaster: Upcaster
     let map = UPCASTERS.get_or_init(Default::default);
     if let Ok(mut m) = map.lock() {
         m.insert((event_type.to_string(), from_version), upcaster);
+    }
+}
+
+static INLINE_HANDLERS: OnceLock<Mutex<Vec<Arc<dyn ProjectionHandler + Send + Sync>>>> =
+    OnceLock::new();
+
+pub fn register_inline_projection(handler: Arc<dyn ProjectionHandler + Send + Sync>) {
+    let list = INLINE_HANDLERS.get_or_init(Default::default);
+    if let Ok(mut v) = list.lock() {
+        v.push(handler);
     }
 }
 
