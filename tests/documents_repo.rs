@@ -1,4 +1,5 @@
 use anyhow::Result;
+use rillflow::events::AppendOptions;
 use rillflow::{Error, Event, Expected, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -109,7 +110,7 @@ async fn session_load_store_delete_roundtrip() -> Result<()> {
     let port = container.get_host_port_ipv4(5432).await?;
     let url = format!("postgres://postgres:postgres@{host}:{port}/postgres?sslmode=disable");
 
-    let store = Store::connect(&url).await?;
+    let mut store = Store::connect(&url).await?;
     rillflow::testing::migrate_core_schema(store.pool()).await?;
 
     #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -119,11 +120,15 @@ async fn session_load_store_delete_roundtrip() -> Result<()> {
     }
 
     let id = Uuid::new_v4();
-    let mut session = store
-        .session_builder()
-        .merge_headers(json!({"source": "test"}))
-        .advisory_locks(true)
-        .build();
+    store.set_session_defaults(
+        AppendOptions {
+            headers: Some(json!({"source": "test"})),
+            causation_id: None,
+            correlation_id: None,
+        },
+        true,
+    );
+    let mut session = store.document_session();
 
     // create new doc via session store + save
     session.store(

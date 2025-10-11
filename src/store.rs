@@ -11,12 +11,18 @@ use std::time::Duration;
 #[derive(Clone)]
 pub struct Store {
     pool: PgPool,
+    session_defaults: AppendOptions,
+    session_advisory_locks: bool,
 }
 
 impl Store {
     pub async fn connect(url: &str) -> Result<Self> {
         let pool = PgPool::connect(url).await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            session_defaults: AppendOptions::default(),
+            session_advisory_locks: false,
+        })
     }
 
     pub fn builder(url: impl Into<String>) -> StoreBuilder {
@@ -30,15 +36,29 @@ impl Store {
     }
 
     pub fn document_session(&self) -> DocumentSession {
-        self.docs().session()
+        self.session_builder().build()
     }
 
     pub fn session_builder(&self) -> SessionBuilder {
         SessionBuilder {
             store: self.clone(),
-            defaults: AppendOptions::default(),
-            use_advisory_lock: false,
+            defaults: self.session_defaults.clone(),
+            use_advisory_lock: self.session_advisory_locks,
         }
+    }
+
+    pub fn session_defaults(&self) -> (&AppendOptions, bool) {
+        (&self.session_defaults, self.session_advisory_locks)
+    }
+
+    pub fn set_session_defaults(&mut self, defaults: AppendOptions, advisory_locks: bool) {
+        self.session_defaults = defaults;
+        self.session_advisory_locks = advisory_locks;
+    }
+
+    pub fn with_session_defaults(mut self, defaults: AppendOptions, advisory_locks: bool) -> Self {
+        self.set_session_defaults(defaults, advisory_locks);
+        self
     }
 
     pub fn events(&self) -> Events {
@@ -132,7 +152,11 @@ impl StoreBuilder {
             opts = opts.acquire_timeout(t);
         }
         let pool = opts.connect(&self.url).await?;
-        Ok(Store { pool })
+        Ok(Store {
+            pool,
+            session_defaults: AppendOptions::default(),
+            session_advisory_locks: false,
+        })
     }
 }
 
@@ -194,14 +218,18 @@ impl SessionBuilder {
 
         let mut session = DocumentSession::new(store.pool.clone(), events);
         if let Some(headers) = defaults.headers.clone() {
-            let headers_clone = headers.clone();
-            session.merge_event_headers(headers_clone);
-            if let Some(key) = headers.get("idempotency_key").and_then(|v| v.as_str()) {
-                session.set_event_idempotency_key(key);
-            }
+            session.merge_event_headers(headers);
         }
         session.set_event_causation_id(defaults.causation_id);
         session.set_event_correlation_id(defaults.correlation_id);
+        if let Some(key) = defaults
+            .headers
+            .as_ref()
+            .and_then(|h| h.get("idempotency_key"))
+            .and_then(|v| v.as_str())
+        {
+            session.set_event_idempotency_key(key);
+        }
         session
     }
 }
