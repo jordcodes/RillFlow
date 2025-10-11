@@ -112,6 +112,7 @@ create table if not exists events (
     event_version int not null default 1,
     tenant_id text null,
     user_id text null,
+    is_tombstone boolean not null default false,
     created_at timestamptz not null default now(),
     unique (stream_id, stream_seq)
 );
@@ -129,6 +130,7 @@ create table if not exists events_archive (
     event_version int not null default 1,
     tenant_id text null,
     user_id text null,
+    is_tombstone boolean not null default false,
     created_at timestamptz not null
 );
 

@@ -339,6 +339,31 @@ impl Events {
         tx.commit().await?;
         Ok(moved)
     }
+
+    pub async fn append_tombstone(&self, stream_id: Uuid, reason: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let current: i32 = sqlx::query_scalar::<_, Option<i32>>(
+            "select max(stream_seq) from events where stream_id = $1",
+        )
+        .bind(stream_id)
+        .fetch_one(&mut *tx)
+        .await?
+        .unwrap_or(0);
+        let next = current + 1;
+        sqlx::query(
+            r#"insert into events (stream_id, stream_seq, event_type, body, headers, is_tombstone, event_version, user_id)
+                values ($1,$2,$3,$4,$5,true,1,current_user)"#,
+        )
+        .bind(stream_id)
+        .bind(next)
+        .bind("$tombstone")
+        .bind(serde_json::json!({"reason": reason}))
+        .bind(serde_json::json!({}))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 type UpcasterFn = Arc<dyn Fn(Value) -> Result<Value> + Send + Sync + 'static>;

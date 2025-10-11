@@ -478,6 +478,7 @@ fn build_events_table_sql(schema: &str) -> String {
             event_version int not null default 1,
             tenant_id text null,
             user_id text null,
+            is_tombstone boolean not null default false,
             created_at timestamptz not null default now(),
             unique (stream_id, stream_seq)
         )
@@ -501,6 +502,7 @@ fn build_events_archive_table_sql(schema: &str) -> String {
             event_version int not null default 1,
             tenant_id text null,
             user_id text null,
+            is_tombstone boolean not null default false,
             created_at timestamptz not null,
             primary key (global_seq)
         )
