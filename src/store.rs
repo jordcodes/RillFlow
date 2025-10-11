@@ -1,4 +1,9 @@
-use crate::{Result, documents::Documents, events::Events, projections::Projections};
+use crate::{
+    Result,
+    documents::{DocumentSession, Documents},
+    events::Events,
+    projections::Projections,
+};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::time::Duration;
 
@@ -21,6 +26,10 @@ impl Store {
         Documents {
             pool: self.pool.clone(),
         }
+    }
+
+    pub fn document_session(&self) -> DocumentSession {
+        self.docs().session()
     }
 
     pub fn events(&self) -> Events {

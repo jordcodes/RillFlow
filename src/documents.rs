@@ -1,10 +1,12 @@
 use crate::{
-    Error, Result,
+    Error, Result, metrics,
     query::{CompiledQuery, DocumentQuery, DocumentQueryContext},
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, QueryBuilder, types::Json};
+use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use uuid::Uuid;
 
 pub struct Documents {
@@ -248,5 +250,289 @@ impl Documents {
         rows.into_iter()
             .map(|(value,)| serde_json::from_value(value).map_err(Into::into))
             .collect()
+    }
+
+    pub fn session(&self) -> DocumentSession {
+        DocumentSession::new(self.pool.clone())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct IdentityEntry {
+    value: Option<Value>,
+    version: Option<i32>,
+    dirty: bool,
+}
+
+impl IdentityEntry {
+    fn new() -> Self {
+        Self {
+            value: None,
+            version: None,
+            dirty: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct StagedOperation {
+    id: Uuid,
+    action: SessionAction,
+}
+
+#[derive(Clone, Debug)]
+enum SessionAction {
+    Upsert { value: Value, expected: Option<i32> },
+    Delete { expected: Option<i32> },
+}
+
+enum IdentityMutation {
+    Upsert {
+        id: Uuid,
+        value: Value,
+        version: i32,
+    },
+    Delete {
+        id: Uuid,
+    },
+}
+
+/// State-tracking unit-of-work for coordinating document changes.
+pub struct DocumentSession {
+    pool: PgPool,
+    identity: HashMap<Uuid, IdentityEntry>,
+    staged: Vec<StagedOperation>,
+}
+
+impl DocumentSession {
+    pub(crate) fn new(pool: PgPool) -> Self {
+        Self {
+            pool,
+            identity: HashMap::new(),
+            staged: Vec::new(),
+        }
+    }
+
+    fn remove_staged(&mut self, id: &Uuid) {
+        self.staged.retain(|op| &op.id != id);
+    }
+
+    fn current_expected(&self, id: &Uuid) -> Option<i32> {
+        self.identity.get(id).and_then(|entry| entry.version)
+    }
+
+    fn mark_loaded(&mut self, id: Uuid, value: Value, version: i32) {
+        let entry = self.identity.entry(id).or_insert_with(IdentityEntry::new);
+        entry.value = Some(value);
+        entry.version = Some(version);
+        entry.dirty = false;
+    }
+
+    /// Load a document into the session identity map, returning a typed struct if present.
+    pub async fn load<T: DeserializeOwned>(&mut self, id: &Uuid) -> Result<Option<T>> {
+        if let Some(entry) = self.identity.get(id) {
+            if let Some(value) = &entry.value {
+                let doc = serde_json::from_value::<T>(value.clone())?;
+                return Ok(Some(doc));
+            }
+            if entry.dirty {
+                return Ok(None);
+            }
+        }
+
+        let row: Option<(Value, i32, Option<chrono::DateTime<chrono::Utc>>)> =
+            sqlx::query_as("select doc, version, deleted_at from docs where id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        match row {
+            Some((value, version, deleted_at)) => {
+                if deleted_at.is_some() {
+                    let entry = self.identity.entry(*id).or_insert_with(IdentityEntry::new);
+                    entry.value = None;
+                    entry.version = Some(version);
+                    entry.dirty = false;
+                    return Ok(None);
+                }
+                metrics::metrics()
+                    .doc_reads_total
+                    .fetch_add(1, Ordering::Relaxed);
+                let doc_json = value.clone();
+                self.mark_loaded(*id, value, version);
+                let doc: T = serde_json::from_value(doc_json)?;
+                Ok(Some(doc))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Stage a document for insertion or update, using the session's known version for concurrency.
+    pub fn store<T: Serialize>(&mut self, id: Uuid, doc: &T) -> Result<()> {
+        let expected = self.current_expected(&id);
+        self.store_with_expected(id, doc, expected)
+    }
+
+    /// Stage a document with an explicit expected version (None for upsert semantics).
+    pub fn store_with_expected<T: Serialize>(
+        &mut self,
+        id: Uuid,
+        doc: &T,
+        expected: Option<i32>,
+    ) -> Result<()> {
+        let value = serde_json::to_value(doc)?;
+        self.remove_staged(&id);
+        self.staged.push(StagedOperation {
+            id,
+            action: SessionAction::Upsert {
+                value: value.clone(),
+                expected,
+            },
+        });
+
+        let entry = self.identity.entry(id).or_insert_with(IdentityEntry::new);
+        entry.value = Some(value);
+        entry.version = expected;
+        entry.dirty = true;
+        Ok(())
+    }
+
+    /// Stage a delete using the session's known version if available.
+    pub fn delete(&mut self, id: Uuid) {
+        let expected = self.current_expected(&id);
+        self.delete_with_expected(id, expected);
+    }
+
+    /// Stage a delete with an explicit expected version.
+    pub fn delete_with_expected(&mut self, id: Uuid, expected: Option<i32>) {
+        self.remove_staged(&id);
+        self.staged.push(StagedOperation {
+            id,
+            action: SessionAction::Delete { expected },
+        });
+
+        let entry = self.identity.entry(id).or_insert_with(IdentityEntry::new);
+        entry.value = None;
+        entry.version = expected;
+        entry.dirty = true;
+    }
+
+    /// Persist staged changes inside a single database transaction.
+    pub async fn save_changes(&mut self) -> Result<()> {
+        if self.staged.is_empty() {
+            return Ok(());
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let mut mutations = Vec::with_capacity(self.staged.len());
+        let mut write_count = 0u64;
+
+        for op in self.staged.drain(..) {
+            match op.action {
+                SessionAction::Upsert { value, expected } => {
+                    let version = if let Some(expected) = expected {
+                        let rec: Option<(i32,)> = sqlx::query_as(
+                            r#"update docs
+                               set doc = $2,
+                                   version = version + 1,
+                                   updated_at = now()
+                               where id = $1 and version = $3 and deleted_at is null
+                               returning version"#,
+                        )
+                        .bind(op.id)
+                        .bind(&value)
+                        .bind(expected)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+
+                        match rec {
+                            Some((ver,)) => ver,
+                            None => {
+                                metrics::metrics()
+                                    .doc_conflicts_total
+                                    .fetch_add(1, Ordering::Relaxed);
+                                return Err(Error::DocVersionConflict);
+                            }
+                        }
+                    } else {
+                        sqlx::query_scalar(
+                            r#"with up as (
+                                   insert into docs (id, doc, version)
+                                   values ($1, $2, 1)
+                                   on conflict (id) do update
+                                     set doc = excluded.doc,
+                                         version = docs.version + 1,
+                                         updated_at = now()
+                                   returning version)
+                               select version from up"#,
+                        )
+                        .bind(op.id)
+                        .bind(&value)
+                        .fetch_one(&mut *tx)
+                        .await?
+                    };
+
+                    mutations.push(IdentityMutation::Upsert {
+                        id: op.id,
+                        value,
+                        version,
+                    });
+                    write_count += 1;
+                }
+                SessionAction::Delete { expected } => {
+                    if let Some(expected) = expected {
+                        let result = sqlx::query(
+                            "delete from docs where id = $1 and version = $2 and deleted_at is null",
+                        )
+                        .bind(op.id)
+                        .bind(expected)
+                        .execute(&mut *tx)
+                        .await?;
+                        if result.rows_affected() == 0 {
+                            metrics::metrics()
+                                .doc_conflicts_total
+                                .fetch_add(1, Ordering::Relaxed);
+                            return Err(Error::DocVersionConflict);
+                        }
+                    } else {
+                        sqlx::query("delete from docs where id = $1")
+                            .bind(op.id)
+                            .execute(&mut *tx)
+                            .await?;
+                    }
+                    mutations.push(IdentityMutation::Delete { id: op.id });
+                }
+            }
+        }
+
+        tx.commit().await?;
+
+        if write_count > 0 {
+            metrics::metrics()
+                .doc_writes_total
+                .fetch_add(write_count, Ordering::Relaxed);
+        }
+
+        for mutation in mutations {
+            match mutation {
+                IdentityMutation::Upsert { id, value, version } => {
+                    let entry = self.identity.entry(id).or_insert_with(IdentityEntry::new);
+                    entry.value = Some(value);
+                    entry.version = Some(version);
+                    entry.dirty = false;
+                }
+                IdentityMutation::Delete { id } => {
+                    self.identity.remove(&id);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Clear cached identity entries and staged operations without touching the database.
+    pub fn clear(&mut self) {
+        self.identity.clear();
+        self.staged.clear();
     }
 }

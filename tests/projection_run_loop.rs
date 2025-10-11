@@ -1,9 +1,15 @@
 use anyhow::Result;
-use rillflow::{Store, projection_runtime::{ProjectionDaemon, ProjectionWorkerConfig}};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use rillflow::{
+    Store,
+    projection_runtime::{ProjectionDaemon, ProjectionWorkerConfig},
+};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use testcontainers::{
-    core::{IntoContainerPort, WaitFor},
     GenericImage, ImageExt,
+    core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
 };
 
@@ -34,5 +40,3 @@ async fn run_loop_stops_on_flag() -> Result<()> {
     let res = jh.await??;
     Ok(res)
 }
-
-

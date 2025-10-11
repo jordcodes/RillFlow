@@ -88,6 +88,7 @@ cargo run --features cli --bin rillflow -- schema-plan --database-url "$DATABASE
 ## Features
 
 - JSONB document store with optimistic versioning
+- Document session unit-of-work with identity map + staged writes
 - LINQ-like document query DSL (filters, sorting, paging, projections)
 - Composable compiled queries for cached predicates and reuse
 - Event streams with expected-version checks
@@ -475,6 +476,35 @@ impl CompiledQuery<serde_json::Value> for VipCustomers {
 
 async fn load_vips(store: &Store) -> rillflow::Result<Vec<serde_json::Value>> {
     store.docs().execute_compiled(VipCustomers).await
+}
+```
+
+### Document Sessions
+
+```rust
+use rillflow::DocumentSession;
+use uuid::Uuid;
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct Customer { id: Uuid, email: String, tier: String }
+
+async fn upgrade_customer(session: &mut DocumentSession, id: Uuid) -> rillflow::Result<()> {
+    if let Some(mut customer) = session.load::<Customer>(&id).await? {
+        customer.tier = "pro".into();
+        session.store(id, &customer)?;
+    } else {
+        let fresh = Customer { id, email: "new@example.com".into(), tier: "starter".into() };
+        session.store(id, &fresh)?;
+    }
+    session.save_changes().await
+}
+
+async fn workflow(store: &Store) -> rillflow::Result<()> {
+    let id = Uuid::new_v4();
+    let mut session = store.document_session();
+    upgrade_customer(&mut session, id).await?;
+    session.delete(id);
+    session.save_changes().await
 }
 ```
 

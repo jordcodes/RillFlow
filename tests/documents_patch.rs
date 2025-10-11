@@ -1,6 +1,5 @@
 use anyhow::Result;
 use rillflow::Store;
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 use testcontainers::{
     GenericImage, ImageExt,
@@ -8,12 +7,6 @@ use testcontainers::{
     runners::AsyncRunner,
 };
 use uuid::Uuid;
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-struct Profile {
-    name: String,
-    age: u32,
-}
 
 #[tokio::test]
 async fn patch_single_and_multiple_fields() -> Result<()> {

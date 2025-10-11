@@ -93,3 +93,93 @@ async fn put_get_update_soft_delete_restore() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn session_load_store_delete_roundtrip() -> Result<()> {
+    let image = GenericImage::new("postgres", "16-alpine")
+        .with_exposed_port(5432.tcp())
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres");
+    let container = image.start().await?;
+    let host = container.get_host().await?;
+    let port = container.get_host_port_ipv4(5432).await?;
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres?sslmode=disable");
+
+    let store = Store::connect(&url).await?;
+    rillflow::testing::migrate_core_schema(store.pool()).await?;
+
+    #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+    struct Profile {
+        email: String,
+        tier: String,
+    }
+
+    let id = Uuid::new_v4();
+    let mut session = store.document_session();
+
+    // create new doc via session store + save
+    session.store(
+        id,
+        &Profile {
+            email: "beta@example.com".into(),
+            tier: "starter".into(),
+        },
+    )?;
+    session.save_changes().await?;
+
+    // identity map serves cached copy without hitting DB
+    let loaded = session.load::<Profile>(&id).await?.unwrap();
+    assert_eq!(loaded.tier, "starter");
+
+    // update tracked doc (uses version 1 underneath)
+    session.store(
+        id,
+        &Profile {
+            email: "beta@example.com".into(),
+            tier: "plus".into(),
+        },
+    )?;
+    session.save_changes().await?;
+
+    // second session observes persisted version 2
+    let mut session2 = store.document_session();
+    let fresh = session2.load::<Profile>(&id).await?.unwrap();
+    assert_eq!(fresh.tier, "plus");
+
+    // first session bumps version to 3
+    session.store(
+        id,
+        &Profile {
+            email: "beta@example.com".into(),
+            tier: "platinum".into(),
+        },
+    )?;
+    session.save_changes().await?;
+
+    // stale session attempts update -> version conflict
+    session2.store(
+        id,
+        &Profile {
+            email: "beta@example.com".into(),
+            tier: "gold".into(),
+        },
+    )?;
+    let err = session2
+        .save_changes()
+        .await
+        .expect_err("stale session must error");
+    assert!(matches!(err, Error::DocVersionConflict));
+
+    // delete should remove from DB and the session cache
+    session.delete(id);
+    session.save_changes().await?;
+
+    assert!(session.load::<Profile>(&id).await?.is_none());
+    let persisted = store.docs().get::<Profile>(&id).await?;
+    assert!(persisted.is_none());
+
+    Ok(())
+}
