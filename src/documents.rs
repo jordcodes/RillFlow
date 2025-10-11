@@ -667,7 +667,7 @@ impl DocumentSession {
         self.event_defaults = AppendOptions::default();
     }
 
-    fn combine_options(defaults: &AppendOptions, overrides: &AppendOptions) -> AppendOptions {
+    pub(crate) fn combine_options(defaults: &AppendOptions, overrides: &AppendOptions) -> AppendOptions {
         AppendOptions {
             headers: Self::merge_headers(&defaults.headers, &overrides.headers),
             causation_id: overrides.causation_id.or(defaults.causation_id),
@@ -675,7 +675,7 @@ impl DocumentSession {
         }
     }
 
-    fn merge_headers(base: &Option<Value>, overrides: &Option<Value>) -> Option<Value> {
+    pub(crate) fn merge_headers(base: &Option<Value>, overrides: &Option<Value>) -> Option<Value> {
         match (base, overrides) {
             (_, Some(Value::Object(override_map))) => {
                 if let Some(Value::Object(base_map)) = base {

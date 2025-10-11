@@ -21,6 +21,7 @@ pub use events::EventEnvelope;
 pub use events::{Event, Expected};
 pub use schema::{SchemaConfig, SchemaManager, SchemaPlan, TenancyMode, TenantSchema};
 pub use store::Store;
+pub use store::SessionBuilder;
 
 pub use documents::DocumentSession;
 

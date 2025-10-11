@@ -119,10 +119,11 @@ async fn session_load_store_delete_roundtrip() -> Result<()> {
     }
 
     let id = Uuid::new_v4();
-    let mut session = store.document_session();
-    session
-        .merge_event_headers(json!({"source": "test"}))
-        .enable_event_advisory_locks();
+    let mut session = store
+        .session_builder()
+        .merge_headers(json!({"source": "test"}))
+        .advisory_locks(true)
+        .build();
 
     // create new doc via session store + save
     session.store(

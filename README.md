@@ -488,27 +488,13 @@ use uuid::Uuid;
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct Customer { id: Uuid, email: String, tier: String }
 
-async fn onboarding_flow(session: &mut DocumentSession, id: Uuid) -> rillflow::Result<()> {
-    session
-        .merge_event_headers(serde_json::json!({"source": "signup"}))
-        .set_event_correlation_id(Some(id));
-
-    if session.load::<Customer>(&id).await?.is_none() {
-        let fresh = Customer { id, email: "new@example.com".into(), tier: "starter".into() };
-        session.store(id, &fresh)?;
-        session.set_event_idempotency_key("req-onboard-1");
-        session.append_events(
-            id,
-            rillflow::Expected::Any,
-            vec![rillflow::Event::new("CustomerRegistered", &fresh)],
-        )?;
-    }
-
-    session.save_changes().await
-}
-
 async fn upgrade_customer(store: &rillflow::Store, id: Uuid) -> rillflow::Result<()> {
-    let mut session = store.document_session();
+    let mut session = store
+        .session_builder()
+        .merge_headers(serde_json::json!({"source": "billing"}))
+        .advisory_locks(true)
+        .build();
+
     if let Some(mut customer) = session.load::<Customer>(&id).await? {
         customer.tier = "pro".into();
         session.store(id, &customer)?;
@@ -522,6 +508,27 @@ async fn upgrade_customer(store: &rillflow::Store, id: Uuid) -> rillflow::Result
             )],
         )?;
     }
+    session.save_changes().await
+}
+
+async fn onboarding_flow(store: &rillflow::Store, id: Uuid) -> rillflow::Result<()> {
+    let mut session = store
+        .session_builder()
+        .merge_headers(serde_json::json!({"source": "signup"}))
+        .correlation_id(Some(id))
+        .build();
+
+    if session.load::<Customer>(&id).await?.is_none() {
+        let fresh = Customer { id, email: "new@example.com".into(), tier: "starter".into() };
+        session.store(id, &fresh)?;
+        session.set_event_idempotency_key("req-onboard-1");
+        session.append_events(
+            id,
+            rillflow::Expected::Any,
+            vec![rillflow::Event::new("CustomerRegistered", &fresh)],
+        )?;
+    }
+
     session.save_changes().await
 }
 ```

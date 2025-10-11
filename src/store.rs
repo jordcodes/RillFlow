@@ -1,9 +1,10 @@
 use crate::{
     Result,
     documents::{DocumentSession, Documents},
-    events::Events,
+    events::{AppendOptions, Events},
     projections::Projections,
 };
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::time::Duration;
 
@@ -30,6 +31,14 @@ impl Store {
 
     pub fn document_session(&self) -> DocumentSession {
         self.docs().session()
+    }
+
+    pub fn session_builder(&self) -> SessionBuilder {
+        SessionBuilder {
+            store: self.clone(),
+            defaults: AppendOptions::default(),
+            use_advisory_lock: false,
+        }
     }
 
     pub fn events(&self) -> Events {
@@ -88,6 +97,13 @@ pub struct StoreBuilder {
     connect_timeout: Option<Duration>,
 }
 
+/// Builder for `DocumentSession` instances with preconfigured defaults.
+pub struct SessionBuilder {
+    store: Store,
+    defaults: AppendOptions,
+    use_advisory_lock: bool,
+}
+
 impl StoreBuilder {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
@@ -117,5 +133,75 @@ impl StoreBuilder {
         }
         let pool = opts.connect(&self.url).await?;
         Ok(Store { pool })
+    }
+}
+
+impl SessionBuilder {
+    /// Replace default headers applied to every staged event.
+    pub fn headers(mut self, headers: JsonValue) -> Self {
+        self.defaults.headers = Some(headers);
+        self
+    }
+
+    /// Merge additional headers into the existing defaults.
+    pub fn merge_headers(mut self, headers: JsonValue) -> Self {
+        self.defaults.headers = crate::documents::DocumentSession::merge_headers(
+            &self.defaults.headers,
+            &Some(headers),
+        );
+        self
+    }
+
+    /// Set a default causation id for staged events.
+    pub fn causation_id(mut self, id: Option<uuid::Uuid>) -> Self {
+        self.defaults.causation_id = id;
+        self
+    }
+
+    /// Set a default correlation id for staged events.
+    pub fn correlation_id(mut self, id: Option<uuid::Uuid>) -> Self {
+        self.defaults.correlation_id = id;
+        self
+    }
+
+    /// Provide an idempotency key header applied to subsequent staged events.
+    pub fn idempotency_key(mut self, key: impl Into<String>) -> Self {
+        let mut map = match self.defaults.headers.take() {
+            Some(JsonValue::Object(m)) => m,
+            _ => JsonMap::new(),
+        };
+        map.insert("idempotency_key".to_string(), JsonValue::String(key.into()));
+        self.defaults.headers = Some(JsonValue::Object(map));
+        self
+    }
+
+    /// Enable or disable advisory locks when the session flushes events.
+    pub fn advisory_locks(mut self, enable: bool) -> Self {
+        self.use_advisory_lock = enable;
+        self
+    }
+
+    /// Build a new `DocumentSession` applying the configured defaults.
+    pub fn build(self) -> DocumentSession {
+        let SessionBuilder {
+            store,
+            defaults,
+            use_advisory_lock,
+        } = self;
+
+        let mut events = store.events();
+        events.use_advisory_lock = use_advisory_lock;
+
+        let mut session = DocumentSession::new(store.pool.clone(), events);
+        if let Some(headers) = defaults.headers.clone() {
+            let headers_clone = headers.clone();
+            session.merge_event_headers(headers_clone);
+            if let Some(key) = headers.get("idempotency_key").and_then(|v| v.as_str()) {
+                session.set_event_idempotency_key(key);
+            }
+        }
+        session.set_event_causation_id(defaults.causation_id);
+        session.set_event_correlation_id(defaults.correlation_id);
+        session
     }
 }
