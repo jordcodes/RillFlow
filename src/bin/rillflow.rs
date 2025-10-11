@@ -137,6 +137,12 @@ enum SubscriptionsCmd {
     Groups { name: String },
     /// Group admin: show a group status (checkpoint and lease)
     GroupStatus { name: String, group: String },
+    /// Set or unset max in-flight per group
+    SetGroupMaxInFlight {
+        name: String,
+        group: String,
+        value: Option<i32>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -545,6 +551,29 @@ async fn main() -> rillflow::Result<()> {
                         "{}:{} last_seq={} head={} lag={} leased_by={:?} lease_until={:?}",
                         name, group, last_seq, head, lag, leased_by, lease_until
                     );
+                }
+                SubscriptionsCmd::SetGroupMaxInFlight { name, group, value } => {
+                    if let Some(v) = value {
+                        sqlx::query(
+                            "insert into subscription_groups(name, grp, max_in_flight) values($1,$2,$3)
+                             on conflict(name,grp) do update set max_in_flight = excluded.max_in_flight, updated_at = now()",
+                        )
+                        .bind(&name)
+                        .bind(&group)
+                        .bind(v)
+                        .execute(store.pool())
+                        .await?;
+                        println!("{}:{} max_in_flight set to {}", name, group, v);
+                    } else {
+                        sqlx::query(
+                            "update subscription_groups set max_in_flight = null, updated_at = now() where name=$1 and grp=$2",
+                        )
+                        .bind(&name)
+                        .bind(&group)
+                        .execute(store.pool())
+                        .await?;
+                        println!("{}:{} max_in_flight unset", name, group);
+                    }
                 }
             }
         }

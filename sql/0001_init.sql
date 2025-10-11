@@ -69,9 +69,14 @@ create table if not exists subscription_groups (
     last_seq bigint not null default 0,
     paused boolean not null default false,
     backoff_until timestamptz null,
+    max_in_flight int null,
     updated_at timestamptz not null default now(),
     primary key (name, grp)
 );
+
+-- backfill: add max_in_flight if table already existed
+alter table if exists subscription_groups
+add column if not exists max_in_flight int null;
 
 -- subscription group leases (single worker per group)
 create table if not exists subscription_group_leases (

@@ -520,6 +520,7 @@ fn build_subscription_groups_table_sql(schema: &str) -> String {
             last_seq bigint not null default 0,
             paused boolean not null default false,
             backoff_until timestamptz null,
+            max_in_flight int null,
             updated_at timestamptz not null default now(),
             primary key (name, grp)
         )

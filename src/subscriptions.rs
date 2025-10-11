@@ -339,6 +339,54 @@ impl Subscriptions {
                     );
                 }
 
+                // Backpressure: if unacknowledged (cursor - persisted) exceeds max_in_flight, throttle
+                let persisted_seq: i64 = if let Some(grp) = &opts.group {
+                    sqlx::query_scalar::<_, Option<i64>>(
+                        "select last_seq from subscription_groups where name=$1 and grp=$2",
+                    )
+                    .bind(&name_s)
+                    .bind(grp)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .unwrap_or(None)
+                    .unwrap_or(0)
+                } else {
+                    sqlx::query_scalar::<_, Option<i64>>(
+                        "select last_seq from subscriptions where name=$1",
+                    )
+                    .bind(&name_s)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .unwrap_or(None)
+                    .unwrap_or(0)
+                };
+                let pending = (cursor - persisted_seq).max(0);
+                // Allow a stored group-specific limit to override runtime option if present
+                let group_limit: Option<i32> = if let Some(grp) = &opts.group {
+                    sqlx::query_scalar::<_, Option<i32>>(
+                        "select max_in_flight from subscription_groups where name=$1 and grp=$2",
+                    )
+                    .bind(&name_s)
+                    .bind(grp)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .unwrap_or(None)
+                } else {
+                    None
+                };
+                let effective_limit = group_limit
+                    .map(|v| v as usize)
+                    .unwrap_or(opts.max_in_flight);
+                if pending as usize > effective_limit {
+                    info!(
+                        pending = pending,
+                        max_in_flight = effective_limit,
+                        "subscription throttling due to in-flight backlog"
+                    );
+                    sleep(opts.poll_interval).await;
+                    continue;
+                }
+
                 if last_lease_refresh.elapsed() >= Duration::from_secs(5) {
                     if let Some(grp) = &opts.group {
                         let ttl = chrono::Utc::now()
