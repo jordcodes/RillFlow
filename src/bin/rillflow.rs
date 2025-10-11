@@ -125,6 +125,7 @@ use rillflow::subscriptions::{SubscriptionFilter, SubscriptionOptions, Subscript
 use rillflow::{SchemaConfig, Store, TenancyMode, TenantSchema, TenantStrategy};
 use serde_json::Value as JsonValue;
 use sqlx::Row;
+use std::sync::Arc;
 use uuid::Uuid;
 
 #[derive(Parser, Debug)]
@@ -177,6 +178,10 @@ enum Commands {
     /// Tenants (schema-per-tenant) helpers
     #[command(subcommand)]
     Tenants(TenantsCmd),
+
+    /// Validate tenant schemas are current
+    #[command(subcommand)]
+    Health(HealthCmd),
 }
 
 #[derive(Subcommand, Debug)]
@@ -459,6 +464,17 @@ enum TenantsCmd {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum HealthCmd {
+    /// Check schema drift for selected tenants
+    Schema {
+        #[arg(long)]
+        tenant: Option<String>,
+        #[arg(long, default_value_t = false)]
+        all_tenants: bool,
+    },
+}
+
 #[tokio::main]
 async fn main() -> rillflow::Result<()> {
     let cli = Cli::parse();
@@ -498,10 +514,11 @@ async fn main() -> rillflow::Result<()> {
     let store = builder.build().await?;
     let mgr = store.schema();
 
-    let tenant_args = TenantArgs {
-        strategy: store.tenant_strategy(),
-        resolver: store.tenant_resolver().cloned(),
-    };
+    let tenant_helper = TenantHelper::new(
+        store.tenant_strategy(),
+        store.tenant_resolver().cloned(),
+        store.tenant_strategy() == TenantStrategy::SchemaPerTenant,
+    );
 
     match cli.command {
         Commands::SchemaPlan => {
@@ -518,13 +535,13 @@ async fn main() -> rillflow::Result<()> {
             }
         }
         Commands::Projections(cmd) => {
-            let daemon = tenant_args.projection_daemon(store.pool().clone());
+            let daemon = tenant_helper.projection_daemon(store.pool().clone());
             match cmd {
                 ProjectionsCmd::List {
                     tenant,
                     all_tenants,
                 } => {
-                    let list = tenant_args
+                    let list = tenant_helper
                         .with_selection(tenant, all_tenants, |sel| async {
                             let mut rows = Vec::new();
                             for ctx in sel {
@@ -559,7 +576,7 @@ async fn main() -> rillflow::Result<()> {
                     }
                 }
                 ProjectionsCmd::Status { name, tenant } => {
-                    let (ctx, name) = tenant_args.select_single(tenant.as_deref(), &name)?;
+                    let (ctx, name) = tenant_helper.select_single(tenant.as_deref(), &name)?;
                     let s = daemon.status(&name, ctx.tenant_label.as_deref()).await?;
                     println!(
                         "{}  last_seq={}  paused={}  leased_by={:?}  lease_until={:?}  backoff_until={:?}  dlq_count={}",
@@ -573,24 +590,24 @@ async fn main() -> rillflow::Result<()> {
                     );
                 }
                 ProjectionsCmd::Pause { name, tenant } => {
-                    let (ctx, name) = tenant_args.select_single(tenant.as_deref(), &name)?;
+                    let (ctx, name) = tenant_helper.select_single(tenant.as_deref(), &name)?;
                     daemon.pause(&name, ctx.tenant_label.as_deref()).await?;
                     println!("paused {}", { name });
                 }
                 ProjectionsCmd::Resume { name, tenant } => {
-                    let (ctx, name) = tenant_args.select_single(tenant.as_deref(), &name)?;
+                    let (ctx, name) = tenant_helper.select_single(tenant.as_deref(), &name)?;
                     daemon.resume(&name, ctx.tenant_label.as_deref()).await?;
                     println!("resumed {}", { name });
                 }
                 ProjectionsCmd::ResetCheckpoint { name, seq, tenant } => {
-                    let (ctx, name) = tenant_args.select_single(tenant.as_deref(), &name)?;
+                    let (ctx, name) = tenant_helper.select_single(tenant.as_deref(), &name)?;
                     daemon
                         .reset_checkpoint(&name, seq, ctx.tenant_label.as_deref())
                         .await?;
                     println!("reset {} to {}", name, seq);
                 }
                 ProjectionsCmd::Rebuild { name, tenant } => {
-                    let (ctx, name) = tenant_args.select_single(tenant.as_deref(), &name)?;
+                    let (ctx, name) = tenant_helper.select_single(tenant.as_deref(), &name)?;
                     daemon.rebuild(&name, ctx.tenant_label.as_deref()).await?;
                     println!("rebuild scheduled for {}", name);
                 }
@@ -599,7 +616,7 @@ async fn main() -> rillflow::Result<()> {
                     tenant,
                     all_tenants,
                 } => {
-                    tenant_args
+                    tenant_helper
                         .with_selection(tenant, all_tenants, |sel| async {
                             if let Some(name) = name.clone() {
                                 for ctx in sel {
@@ -623,7 +640,7 @@ async fn main() -> rillflow::Result<()> {
                     tenant,
                     all_tenants,
                 } => {
-                    tenant_args
+                    tenant_helper
                         .with_selection(tenant, all_tenants, |sel| async {
                             if let Some(n) = name.clone() {
                                 for ctx in sel {
@@ -655,7 +672,7 @@ async fn main() -> rillflow::Result<()> {
                     limit,
                     tenant,
                 } => {
-                    let (ctx, name) = tenant_args.select_single(tenant.as_deref(), &name)?;
+                    let (ctx, name) = tenant_helper.select_single(tenant.as_deref(), &name)?;
                     let items = daemon
                         .dlq_list(&name, limit, ctx.tenant_label.as_deref())
                         .await?;
@@ -667,21 +684,21 @@ async fn main() -> rillflow::Result<()> {
                     }
                 }
                 ProjectionsCmd::DlqRequeue { name, id, tenant } => {
-                    let (ctx, name) = tenant_args.select_single(tenant.as_deref(), &name)?;
+                    let (ctx, name) = tenant_helper.select_single(tenant.as_deref(), &name)?;
                     daemon
                         .dlq_requeue(&name, id, ctx.tenant_label.as_deref())
                         .await?;
                     println!("requeued {}:{}", name, id);
                 }
                 ProjectionsCmd::DlqDelete { name, id, tenant } => {
-                    let (ctx, name) = tenant_args.select_single(tenant.as_deref(), &name)?;
+                    let (ctx, name) = tenant_helper.select_single(tenant.as_deref(), &name)?;
                     daemon
                         .dlq_delete(&name, id, ctx.tenant_label.as_deref())
                         .await?;
                     println!("deleted {}:{}", name, id);
                 }
                 ProjectionsCmd::Metrics { name, tenant } => {
-                    let (ctx, name) = tenant_args.select_single(tenant.as_deref(), &name)?;
+                    let (ctx, name) = tenant_helper.select_single(tenant.as_deref(), &name)?;
                     let m = daemon.metrics(&name, ctx.tenant_label.as_deref()).await?;
                     println!(
                         "{} last_seq={} head_seq={} lag={} dlq_count={}",
@@ -694,7 +711,7 @@ async fn main() -> rillflow::Result<()> {
                     tenant,
                     all_tenants,
                 } => {
-                    tenant_args
+                    tenant_helper
                         .with_selection(tenant, all_tenants, |sel| async move {
                             for ctx in sel {
                                 let stop =
@@ -726,7 +743,7 @@ async fn main() -> rillflow::Result<()> {
             }
         }
         Commands::Subscriptions(cmd) => {
-            let subs = tenant_args.subscriptions(store.pool().clone());
+            let subs = tenant_helper.subscriptions(store.pool().clone());
             match cmd {
                 SubscriptionsCmd::Create {
                     name,
@@ -755,25 +772,37 @@ async fn main() -> rillflow::Result<()> {
                     tenant,
                     all_tenants,
                 } => {
-                    let rows = sqlx::query(
-                        "select name, last_seq, paused, backoff_until, filter from subscriptions order by name",
-                    )
-                    .fetch_all(store.pool())
-                    .await?;
-                    for r in rows {
-                        let name: String = r.get("name");
-                        let last_seq: i64 = r.get::<Option<i64>, _>("last_seq").unwrap_or(0);
-                        let paused: bool = r.get::<Option<bool>, _>("paused").unwrap_or(false);
-                        let backoff_until =
-                            r.get::<Option<chrono::DateTime<chrono::Utc>>, _>("backoff_until");
-                        let filter = r
-                            .get::<Option<serde_json::Value>, _>("filter")
-                            .unwrap_or(serde_json::json!({}));
-                        println!(
-                            "{} last_seq={} paused={} backoff_until={:?} filter={}",
-                            name, last_seq, paused, backoff_until, filter,
-                        );
-                    }
+                    tenant_helper
+                        .with_selection(tenant, all_tenants, |sel| async {
+                            for ctx in sel {
+                                let rows = sqlx::query(
+                                    "select name, last_seq, paused, backoff_until, filter from subscriptions order by name",
+                                )
+                                .fetch_all(store.pool())
+                                .await?;
+                                for r in rows {
+                                    let name: String = r.get("name");
+                                    let last_seq: i64 = r.get::<Option<i64>, _>("last_seq").unwrap_or(0);
+                                    let paused: bool = r.get::<Option<bool>, _>("paused").unwrap_or(false);
+                                    let backoff_until =
+                                        r.get::<Option<chrono::DateTime<chrono::Utc>>, _>("backoff_until");
+                                    let filter = r
+                                        .get::<Option<serde_json::Value>, _>("filter")
+                                        .unwrap_or(serde_json::json!({}));
+                                    println!(
+                                        "{}{} last_seq={} paused={} backoff_until={:?} filter={}",
+                                        name,
+                                        ctx.tenant_suffix(),
+                                        last_seq,
+                                        paused,
+                                        backoff_until,
+                                        filter,
+                                    );
+                                }
+                            }
+                            Ok(())
+                        })
+                        .await?;
                 }
                 SubscriptionsCmd::Status { name, tenant } => {
                     let r = sqlx::query(
@@ -1012,7 +1041,17 @@ async fn main() -> rillflow::Result<()> {
                 tenant,
                 all_tenants,
             } => {
-                let n = compact_snapshots_once(store.pool(), &cli.schema, threshold, batch).await?;
+                let n = tenant_helper
+                    .with_selection(tenant, all_tenants, |sel| async {
+                        let mut total = 0u64;
+                        for ctx in sel {
+                            let schema = ctx.schema_or(&cli.schema);
+                            total += compact_snapshots_once(store.pool(), &schema, threshold, batch)
+                                .await? as u64;
+                        }
+                        Ok(total as u32)
+                    })
+                    .await?;
                 println!("compacted {} stream(s)", n);
             }
             SnapshotsCmd::RunUntilIdle {
@@ -1021,18 +1060,30 @@ async fn main() -> rillflow::Result<()> {
                 tenant,
                 all_tenants,
             } => {
-                let mut total = 0u64;
-                loop {
-                    let n =
-                        compact_snapshots_once(store.pool(), &cli.schema, threshold, batch).await?;
-                    total += n as u64;
-                    if n == 0 {
-                        break;
-                    }
-                }
-                println!("compacted total {} stream(s)", total);
+                tenant_helper
+                    .with_selection(tenant, all_tenants, |sel| async {
+                        for ctx in sel {
+                            loop {
+                                let schema = ctx.schema_or(&cli.schema);
+                                let n =
+                                    compact_snapshots_once(store.pool(), &schema, threshold, batch)
+                                        .await?;
+                                if n == 0 {
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(())
+                    })
+                    .await?;
+                println!("compacted all streams to threshold");
             }
             SnapshotsCmd::Metrics { threshold, tenant } => {
+                let schema = tenant
+                    .as_ref()
+                    .map(|t| tenant_helper.require_schema(t))
+                    .transpose()?;
+                let schema = schema.as_deref().unwrap_or(&cli.schema);
                 let candidates: i64 = sqlx::query_scalar(
                     r#"
                      select count(1) from (
@@ -1062,7 +1113,8 @@ async fn main() -> rillflow::Result<()> {
                 .await?;
 
                 println!(
-                    "threshold={} candidates={} max_gap={}",
+                    "schema={} threshold={} candidates={} max_gap={}",
+                    schema,
                     threshold,
                     candidates,
                     max_gap.unwrap_or(0).max(0)
@@ -1109,6 +1161,30 @@ async fn main() -> rillflow::Result<()> {
                 println!("tenant '{}' dropped", name);
             }
         },
+        Commands::Health(HealthCmd::Schema {
+            tenant,
+            all_tenants,
+        }) => {
+            tenant_helper
+                .with_selection(tenant, all_tenants, |sel| async {
+                    for ctx in sel {
+                        let schema = ctx.schema_or(&cli.schema);
+                        let config = SchemaConfig {
+                            base_schema: schema.clone(),
+                            tenancy_mode,
+                        };
+                        let plan = store.schema().plan(&config).await?;
+                        if plan.is_empty() {
+                            println!("schema '{}' up to date", schema);
+                        } else {
+                            eprintln!("schema '{}' drift detected:", schema);
+                            print_plan(&plan);
+                        }
+                    }
+                    Ok(())
+                })
+                .await?;
+        }
     }
 
     Ok(())
@@ -1215,4 +1291,128 @@ async fn compact_snapshots_once(
 fn quote_ident(value: &str) -> String {
     let escaped = value.replace('"', "\"\"");
     format!("\"{}\"", escaped)
+}
+
+#[derive(Clone)]
+struct TenantHelper {
+    strategy: TenantStrategy,
+    resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
+    schema_per_tenant: bool,
+}
+
+#[derive(Clone)]
+struct TenantContext {
+    tenant_label: Option<String>,
+}
+
+impl TenantContext {
+    fn tenant_suffix(&self) -> String {
+        self.tenant_label
+            .as_ref()
+            .map(|t| format!("@{}", t))
+            .unwrap_or_default()
+    }
+
+    fn schema_or<'a>(&self, default: &'a str) -> String {
+        if let Some(label) = &self.tenant_label {
+            tenant_schema_name(label)
+        } else {
+            default.to_string()
+        }
+    }
+}
+
+impl TenantHelper {
+    fn new(
+        strategy: TenantStrategy,
+        resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
+        schema_per_tenant: bool,
+    ) -> Self {
+        Self {
+            strategy,
+            resolver,
+            schema_per_tenant,
+        }
+    }
+
+    fn projection_daemon(&self, pool: PgPool) -> ProjectionDaemon {
+        let mut config = ProjectionWorkerConfig::default();
+        config.tenant_strategy = self.strategy;
+        config.tenant_resolver = self.resolver.clone();
+        ProjectionDaemon::new(pool, config)
+    }
+
+    fn subscriptions(&self, pool: PgPool) -> Subscriptions {
+        let mut subs = Subscriptions::new(pool);
+        subs.tenant_strategy = self.strategy;
+        subs.tenant_resolver = self.resolver.clone();
+        subs
+    }
+
+    fn select_single<'a>(
+        &'a self,
+        tenant: Option<&str>,
+        name: &str,
+    ) -> rillflow::Result<(TenantContext, String)> {
+        let ctx = match (tenant, self.strategy) {
+            (Some(t), TenantStrategy::SchemaPerTenant) => TenantContext {
+                tenant_label: Some(t.to_string()),
+            },
+            (None, TenantStrategy::SchemaPerTenant) => TenantContext {
+                tenant_label: self
+                    .resolver
+                    .as_ref()
+                    .and_then(|r| (r)())
+                    .ok_or(rillflow::Error::TenantRequired)?,
+                tenant_label: None,
+            },
+            _ => TenantContext { tenant_label: None },
+        };
+        Ok((ctx, name.to_string()))
+    }
+
+    async fn with_selection<F, Fut, T>(
+        &self,
+        tenant: Option<String>,
+        all_tenants: bool,
+        mut f: F,
+    ) -> rillflow::Result<T>
+    where
+        F: FnMut(Vec<TenantContext>) -> Fut,
+        Fut: std::future::Future<Output = rillflow::Result<T>>,
+    {
+        let contexts = if all_tenants && self.schema_per_tenant {
+            let tenants = self.list_tenants().await?;
+            tenants
+                .into_iter()
+                .map(|t| TenantContext {
+                    tenant_label: Some(t),
+                })
+                .collect()
+        } else if let Some(t) = tenant {
+            vec![TenantContext {
+                tenant_label: Some(t),
+            }]
+        } else {
+            vec![TenantContext { tenant_label: None }]
+        };
+        f(contexts).await
+    }
+
+    async fn list_tenants(&self) -> rillflow::Result<Vec<String>> {
+        // For now rely on resolver; extension point for reading from DB later
+        if let Some(resolver) = &self.resolver {
+            if let Some(tenant) = resolver() {
+                return Ok(vec![tenant]);
+            }
+        }
+        Ok(vec![])
+    }
+
+    fn require_schema(&self, tenant: &str) -> rillflow::Result<String> {
+        if !self.schema_per_tenant {
+            return Ok(tenant.to_string());
+        }
+        Ok(tenant_schema_name(tenant))
+    }
 }
