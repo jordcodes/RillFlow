@@ -49,6 +49,9 @@ pub struct EventEnvelope {
     pub headers: Value,
     pub causation_id: Option<Uuid>,
     pub correlation_id: Option<Uuid>,
+    pub event_version: i32,
+    pub tenant_id: Option<String>,
+    pub user_id: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -110,9 +113,12 @@ impl Events {
             Value,
             Option<Uuid>,
             Option<Uuid>,
+            i32,
+            Option<String>,
+            Option<String>,
             chrono::DateTime<chrono::Utc>,
         )> = sqlx::query_as(
-            r#"select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, created_at
+            r#"select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, tenant_id, user_id, created_at
                 from events where stream_id = $1 order by stream_seq asc"#,
         )
         .bind(stream_id)
@@ -131,6 +137,9 @@ impl Events {
                     headers,
                     causation_id,
                     correlation_id,
+                    event_version,
+                    tenant_id,
+                    user_id,
                     created_at,
                 )| EventEnvelope {
                     global_seq,
@@ -141,6 +150,9 @@ impl Events {
                     headers,
                     causation_id,
                     correlation_id,
+                    event_version,
+                    tenant_id,
+                    user_id,
                     created_at,
                 },
             )
@@ -218,8 +230,8 @@ impl Events {
         for event in events {
             seq += 1;
             let res = sqlx::query(
-                r#"insert into events (stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id)
-                    values ($1, $2, $3, $4, $5, $6, $7)"#,
+                r#"insert into events (stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, tenant_id, user_id)
+                    values ($1, $2, $3, $4, $5, $6, $7, 1, null, current_user)"#,
             )
             .bind(stream_id)
             .bind(seq)

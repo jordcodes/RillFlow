@@ -12,6 +12,7 @@ create table if not exists docs (
 );
 
 create index if not exists docs_gin on docs using gin (doc);
+
 create index if not exists docs_fts_idx on docs using gin (docs_search);
 
 create or replace function rf_docs_search_update() returns trigger as $$
@@ -48,15 +49,36 @@ begin
   if TG_OP = 'UPDATE' then
     insert into docs_history(id, version, doc, modified_at, modified_by, op)
     values (OLD.id, OLD.version, OLD.doc, now(), current_user, 'UPDATE');
-    return NEW;
-  elsif TG_OP = 'DELETE' then
-    insert into docs_history(id, version, doc, modified_at, modified_by, op)
-    values (OLD.id, OLD.version, OLD.doc, now(), current_user, 'DELETE');
-    return OLD;
-  else
-    return NEW;
-  end if;
+
+return NEW;
+
+elsif TG_OP = 'DELETE' then
+insert into
+    docs_history (
+        id,
+        version,
+        doc,
+        modified_at,
+        modified_by,
+        op
+    )
+values (
+        OLD.id,
+        OLD.version,
+        OLD.doc,
+        now(),
+        current_user,
+        'DELETE'
+    );
+
+return OLD;
+
+else return NEW;
+
+end if;
+
 end;
+
 $$ language plpgsql;
 
 do $$
@@ -87,6 +109,9 @@ create table if not exists events (
     headers jsonb not null default '{}'::jsonb,
     causation_id uuid null,
     correlation_id uuid null,
+    event_version int not null default 1,
+    tenant_id text null,
+    user_id text null,
     created_at timestamptz not null default now(),
     unique (stream_id, stream_seq)
 );

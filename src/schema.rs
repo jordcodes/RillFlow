@@ -124,11 +124,17 @@ impl SchemaManager {
 
         // FTS function and triggers
         plan.push_action(
-            format!("create function {}.rf_docs_search_update()", quote_ident(schema)),
+            format!(
+                "create function {}.rf_docs_search_update()",
+                quote_ident(schema)
+            ),
             build_docs_fts_fn_sql(schema),
         );
         plan.push_action(
-            format!("create triggers for {}.docs full-text search", quote_ident(schema)),
+            format!(
+                "create triggers for {}.docs full-text search",
+                quote_ident(schema)
+            ),
             build_docs_fts_triggers_sql(schema),
         );
 
@@ -462,6 +468,9 @@ fn build_events_table_sql(schema: &str) -> String {
             headers jsonb not null default '{{}}'::jsonb,
             causation_id uuid null,
             correlation_id uuid null,
+            event_version int not null default 1,
+            tenant_id text null,
+            user_id text null,
             created_at timestamptz not null default now(),
             unique (stream_id, stream_seq)
         )
@@ -573,7 +582,11 @@ fn build_docs_fts_fn_sql(schema: &str) -> String {
 
 fn build_docs_fts_triggers_sql(schema: &str) -> String {
     let tbl = qualified_name(schema, "docs");
-    let fnq = format!("{}.{}", quote_ident(schema), quote_ident("rf_docs_search_update"));
+    let fnq = format!(
+        "{}.{}",
+        quote_ident(schema),
+        quote_ident("rf_docs_search_update")
+    );
     formatdoc!(
         r#"
         do $$

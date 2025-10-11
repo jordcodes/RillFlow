@@ -343,6 +343,9 @@ impl Subscriptions {
                         headers: row.get("headers"),
                         causation_id: row.get("causation_id"),
                         correlation_id: row.get("correlation_id"),
+                        event_version: row.try_get::<i32, _>("event_version").unwrap_or(1),
+                        tenant_id: row.try_get::<Option<String>, _>("tenant_id").unwrap_or(None),
+                        user_id: row.try_get::<Option<String>, _>("user_id").unwrap_or(None),
                         created_at: row.get("created_at"),
                     };
                     cursor = row.get::<i64, _>("global_seq");

@@ -106,6 +106,9 @@ impl<'a> AggregateSession<'a> {
                     headers: Value::Object(JsonMap::new()),
                     causation_id: None,
                     correlation_id: None,
+                    event_version: 1,
+                    tenant_id: None,
+                    user_id: None,
                     created_at: chrono::Utc::now(),
                 };
                 state.apply(&envelope);
