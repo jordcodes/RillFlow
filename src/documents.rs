@@ -53,7 +53,7 @@ impl Documents {
                 return Ok(None);
             }
             let doc: T = serde_json::from_value(value)?;
-            metrics::record_doc_read(None);
+            metrics::record_doc_read(Some("public"));
             Ok(Some((doc, version)))
         } else {
             Ok(None)
@@ -82,7 +82,7 @@ impl Documents {
                     metrics::record_doc_write(None, 1);
                     Ok(ver + 1)
                 } else {
-                    metrics::record_doc_conflict(None);
+                    metrics::record_doc_conflict(Some("public"));
                     Err(Error::DocVersionConflict)
                 }
             }
@@ -193,10 +193,10 @@ impl Documents {
 
         let query = qb.build_query_as::<(i32,)>();
         if let Some((new_ver,)) = query.fetch_optional(&self.pool).await? {
-            metrics::record_doc_write(None, 1);
+            metrics::record_doc_write(Some("public"), 1);
             Ok(new_ver)
         } else if expected.is_some() {
-            metrics::record_doc_conflict(None);
+            metrics::record_doc_conflict(Some("public"));
             Err(Error::DocVersionConflict)
         } else {
             Err(Error::DocNotFound)
