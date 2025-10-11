@@ -198,6 +198,17 @@ impl Store {
         self.tenant_strategy
     }
 
+    pub fn forget_tenant_schema(&self, schema: &str) {
+        if let Ok(mut cache) = self.ensured_tenants.write() {
+            cache.remove(schema);
+        }
+    }
+
+    pub fn forget_tenant(&self, tenant: &str) {
+        let schema = tenant_schema_name(tenant);
+        self.forget_tenant_schema(&schema);
+    }
+
     pub fn events(&self) -> Events {
         Events {
             pool: self.pool.clone(),

@@ -1,7 +1,57 @@
+async fn list_tenants(store: &Store) -> rillflow::Result<()> {
+    let rows = sqlx::query_scalar::<_, String>(
+        "select schema_name from information_schema.schemata where schema_name like 'tenant_%' order by schema_name",
+    )
+    .fetch_all(store.pool())
+    .await?;
+    for s in rows {
+        println!("{}", s);
+    }
+    Ok(())
+}
+
+async fn tenant_status(store: &Store, name: &str) -> rillflow::Result<()> {
+    let schema = rillflow::store::tenant_schema_name(name);
+    let exists: bool = sqlx::query_scalar(
+        "select exists (select 1 from information_schema.schemata where schema_name = $1)",
+    )
+    .bind(&schema)
+    .fetch_one(store.pool())
+    .await?;
+    if !exists {
+        println!("tenant '{}' (schema {}) does not exist", name, schema);
+        return Ok(());
+    }
+
+    println!("tenant '{}' (schema {}) exists", name, schema);
+
+    let plan = store
+        .schema()
+        .plan(&SchemaConfig::with_base_schema(schema.clone()))
+        .await?;
+    if plan.is_empty() {
+        println!("  schema is up to date");
+    } else {
+        println!("  pending DDL actions: {}", plan.actions().len());
+    }
+    Ok(())
+}
+
+async fn drop_tenant(store: &Store, name: &str) -> rillflow::Result<()> {
+    let schema = rillflow::store::tenant_schema_name(name);
+    sqlx::query(&format!(
+        "drop schema if exists {} cascade",
+        rillflow::schema::quote_ident(&schema)
+    ))
+    .execute(store.pool())
+    .await?;
+    store.forget_tenant_schema(&schema);
+    Ok(())
+}
 use clap::{ArgAction, Parser, Subcommand};
 use rillflow::projection_runtime::{ProjectionDaemon, ProjectionWorkerConfig};
 use rillflow::subscriptions::{SubscriptionFilter, SubscriptionOptions, Subscriptions};
-use rillflow::{SchemaConfig, Store, TenancyMode, TenantSchema};
+use rillflow::{SchemaConfig, Store, TenancyMode, TenantSchema, TenantStrategy};
 use serde_json::Value as JsonValue;
 use sqlx::Row;
 use uuid::Uuid;
@@ -195,12 +245,20 @@ enum SnapshotsCmd {
 
 #[derive(Subcommand, Debug)]
 enum TenantsCmd {
-    /// Create a new tenant schema (idempotent) and sync core tables
-    Create { name: String },
+    /// Ensure (create + migrate) a tenant schema using Store::ensure_tenant
+    Ensure { name: String },
     /// Sync (plan+apply) core tables for an existing tenant schema
     Sync { name: String },
-    /// List user schemas (excluding system schemas)
+    /// List known tenant schemas
     List,
+    /// Show schema-level status for a tenant
+    Status { name: String },
+    /// Drop a tenant schema (dangerous)
+    Drop {
+        name: String,
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[tokio::main]
@@ -235,7 +293,11 @@ async fn main() -> rillflow::Result<()> {
         tenancy_mode,
     };
 
-    let store = Store::connect(&url).await?;
+    let mut builder = Store::builder(&url);
+    if matches!(tenancy_mode, TenancyMode::SchemaPerTenant { .. }) {
+        builder = builder.tenant_strategy(TenantStrategy::SchemaPerTenant);
+    }
+    let store = builder.build().await?;
     let mgr = store.schema();
 
     match cli.command {
@@ -690,45 +752,38 @@ async fn main() -> rillflow::Result<()> {
                 );
             }
         },
-        Commands::Tenants(cmd) => {
-            match cmd {
-                TenantsCmd::Create { name } => {
-                    // Create schema if not exists, then sync tables for that schema
-                    sqlx::query(&format!(
-                        "create schema if not exists {}",
-                        quote_ident(&name)
-                    ))
-                    .execute(store.pool())
-                    .await?;
-                    let cfg = SchemaConfig::with_base_schema(name);
-                    let plan = mgr.sync(&cfg).await?;
-                    if plan.is_empty() {
-                        println!("No changes needed.");
-                    } else {
-                        print_plan(&plan);
-                    }
-                }
-                TenantsCmd::Sync { name } => {
-                    let cfg = SchemaConfig::with_base_schema(name);
-                    let plan = mgr.sync(&cfg).await?;
-                    if plan.is_empty() {
-                        println!("No changes needed.");
-                    } else {
-                        print_plan(&plan);
-                    }
-                }
-                TenantsCmd::List => {
-                    let rows = sqlx::query_scalar::<_, String>(
-                        "select schema_name from information_schema.schemata where schema_name not in ('pg_catalog','information_schema','public') order by schema_name",
-                    )
-                    .fetch_all(store.pool())
-                    .await?;
-                    for s in rows {
-                        println!("{}", s);
-                    }
+        Commands::Tenants(cmd) => match cmd {
+            TenantsCmd::Ensure { name } => {
+                store.ensure_tenant(&name).await?;
+                println!("tenant '{}' ensured", name);
+            }
+            TenantsCmd::Sync { name } => {
+                let cfg = SchemaConfig::with_base_schema(name.clone());
+                let plan = mgr.sync(&cfg).await?;
+                if plan.is_empty() {
+                    println!("No changes needed.");
+                } else {
+                    print_plan(&plan);
                 }
             }
-        }
+            TenantsCmd::List => {
+                list_tenants(&store).await?;
+            }
+            TenantsCmd::Status { name } => {
+                tenant_status(&store, &name).await?;
+            }
+            TenantsCmd::Drop { name, force } => {
+                if !force {
+                    eprintln!(
+                        "Refusing to drop tenant '{}'. Re-run with --force if you are absolutely sure.",
+                        name
+                    );
+                    std::process::exit(3);
+                }
+                drop_tenant(&store, &name).await?;
+                println!("tenant '{}' dropped", name);
+            }
+        },
     }
 
     Ok(())
