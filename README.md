@@ -47,6 +47,8 @@ cargo run --bin rillflow -- projections dlq-requeue my_projection --id 123 --dat
 cargo run --bin rillflow -- projections dlq-delete my_projection --id 123 --database-url "$DATABASE_URL"
 # metrics
 cargo run --bin rillflow -- projections metrics my_projection --database-url "$DATABASE_URL"
+# run loop (long-running)
+cargo run --bin rillflow -- projections run-loop --use-notify true --health-bind 0.0.0.0:8080 --database-url "$DATABASE_URL"
 ```
 
 - Streams
@@ -385,6 +387,16 @@ let daemon = ProjectionDaemon::builder(store.pool().clone())
     .build();
 
 daemon.run_until_idle().await?;
+
+// Long-running loop with graceful shutdown and optional NOTIFY wakeups
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+let stop = Arc::new(AtomicBool::new(false));
+let stop2 = stop.clone();
+tokio::spawn(async move {
+  let _ = tokio::signal::ctrl_c().await;
+  stop2.store(true, Ordering::Relaxed);
+});
+daemon.run_loop(true, stop).await?; // true = use LISTEN/NOTIFY (channel defaults to rillflow_events)
 ```
 
 Advisory locks (optional) for append:
