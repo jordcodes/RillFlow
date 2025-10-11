@@ -81,6 +81,13 @@ impl SchemaManager {
             plan,
             schema,
             &existing_tables,
+            "docs_history",
+            build_docs_history_table_sql,
+        );
+        ensure_table(
+            plan,
+            schema,
+            &existing_tables,
             "events",
             build_events_table_sql,
         );
@@ -104,6 +111,16 @@ impl SchemaManager {
             &existing_indexes,
             "docs_gin",
             build_docs_index_sql,
+        );
+
+        // History function and triggers
+        plan.push_action(
+            format!("create function {}.rf_docs_history()", quote_ident(schema)),
+            build_docs_history_fn_sql(schema),
+        );
+        plan.push_action(
+            format!("create triggers for {}.docs history", quote_ident(schema)),
+            build_docs_history_triggers_sql(schema),
         );
 
         // Projection runtime tables (control, leases, DLQ)
@@ -387,10 +404,29 @@ fn build_docs_table_sql(schema: &str) -> String {
             version int not null default 0,
             created_at timestamptz not null default now(),
             updated_at timestamptz not null default now(),
-            deleted_at timestamptz null
+            deleted_at timestamptz null,
+            created_by text null,
+            last_modified_by text null
         )
         ",
         table = qualified_name(schema, "docs"),
+    )
+}
+
+fn build_docs_history_table_sql(schema: &str) -> String {
+    formatdoc!(
+        "
+        create table if not exists {table} (
+            hist_id bigserial primary key,
+            id uuid not null,
+            version int not null,
+            doc jsonb not null,
+            modified_at timestamptz not null default now(),
+            modified_by text null,
+            op text not null
+        )
+        ",
+        table = qualified_name(schema, "docs_history"),
     )
 }
 
@@ -435,6 +471,58 @@ fn build_docs_index_sql(schema: &str) -> String {
         ",
         index = quote_ident("docs_gin"),
         table = qualified_name(schema, "docs"),
+    )
+}
+
+fn build_docs_history_fn_sql(schema: &str) -> String {
+    formatdoc!(
+        r#"
+        create or replace function {schema}.rf_docs_history() returns trigger as $$
+        begin
+          if TG_OP = 'UPDATE' then
+            insert into {schema}.docs_history(id, version, doc, modified_at, modified_by, op)
+            values (OLD.id, OLD.version, OLD.doc, now(), current_user, 'UPDATE');
+            return NEW;
+          elsif TG_OP = 'DELETE' then
+            insert into {schema}.docs_history(id, version, doc, modified_at, modified_by, op)
+            values (OLD.id, OLD.version, OLD.doc, now(), current_user, 'DELETE');
+            return OLD;
+          else
+            return NEW;
+          end if;
+        end;
+        $$ language plpgsql;
+        "#,
+        schema = quote_ident(schema),
+    )
+}
+
+fn build_docs_history_triggers_sql(schema: &str) -> String {
+    formatdoc!(
+        r#"
+        do $$
+        begin
+          if not exists (
+            select 1 from pg_trigger t
+            join pg_class c on c.oid = t.tgrelid
+            join pg_namespace n on n.oid = c.relnamespace
+            where t.tgname = 'rf_docs_history_update' and c.relname = 'docs' and n.nspname = {schema_lit}
+          ) then
+            execute 'create trigger rf_docs_history_update after update on {tbl} for each row execute function {fn}()';
+          end if;
+          if not exists (
+            select 1 from pg_trigger t
+            join pg_class c on c.oid = t.tgrelid
+            join pg_namespace n on n.oid = c.relnamespace
+            where t.tgname = 'rf_docs_history_delete' and c.relname = 'docs' and n.nspname = {schema_lit}
+          ) then
+            execute 'create trigger rf_docs_history_delete after delete on {tbl} for each row execute function {fn}()';
+          end if;
+        end$$;
+        "#,
+        schema_lit = format!("'{}'", schema),
+        tbl = qualified_name(schema, "docs"),
+        fn = format!("{}.{}", quote_ident(schema), quote_ident("rf_docs_history")),
     )
 }
 

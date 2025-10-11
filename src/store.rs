@@ -63,6 +63,7 @@ pub struct Store {
     ensured_tenants: Arc<RwLock<HashSet<String>>>,
     tenant_resolver: Option<TenantResolver>,
     enforce_tenant: bool,
+    prepared_statement_cache_size: Option<usize>,
 }
 
 impl Store {
@@ -77,6 +78,7 @@ impl Store {
             ensured_tenants: Arc::new(RwLock::new(HashSet::new())),
             tenant_resolver: None,
             enforce_tenant: false,
+            prepared_statement_cache_size: None,
         })
     }
 
@@ -280,6 +282,12 @@ impl Store {
         &self.pool
     }
 
+    /// Lightweight liveness check for the connection pool.
+    pub async fn pool_health(&self) -> crate::Result<PoolHealth> {
+        let one: i32 = sqlx::query_scalar("select 1").fetch_one(&self.pool).await?;
+        Ok(PoolHealth { ok: one == 1 })
+    }
+
     /// Resolve a human alias to a stream_id UUID, creating if missing.
     pub async fn resolve_stream_alias(&self, alias: &str) -> crate::Result<uuid::Uuid> {
         if let Some(id) = sqlx::query_scalar::<_, uuid::Uuid>(
@@ -319,6 +327,7 @@ pub struct StoreBuilder {
     tenant_strategy: TenantStrategy,
     tenant_resolver: Option<TenantResolver>,
     enforce_tenant: bool,
+    prepared_statement_cache_size: Option<usize>,
 }
 
 /// Builder for `DocumentSession` instances with preconfigured defaults.
@@ -345,6 +354,7 @@ impl StoreBuilder {
             tenant_strategy: TenantStrategy::Single,
             tenant_resolver: None,
             enforce_tenant: true,
+            prepared_statement_cache_size: None,
         }
     }
 
@@ -389,6 +399,12 @@ impl StoreBuilder {
         self
     }
 
+    /// Hint for prepared statement cache size. Actual behavior depends on driver.
+    pub fn prepared_statement_cache_size(mut self, size: usize) -> Self {
+        self.prepared_statement_cache_size = Some(size.max(1));
+        self
+    }
+
     /// Allow creating sessions without a resolver or explicit tenant (system jobs only).
     pub fn allow_missing_tenant(mut self) -> Self {
         self.enforce_tenant = false;
@@ -422,8 +438,14 @@ impl StoreBuilder {
             ensured_tenants: Arc::new(RwLock::new(HashSet::new())),
             tenant_resolver: self.tenant_resolver.clone(),
             enforce_tenant: self.enforce_tenant,
+            prepared_statement_cache_size: self.prepared_statement_cache_size,
         })
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PoolHealth {
+    pub ok: bool,
 }
 
 impl SessionBuilder {

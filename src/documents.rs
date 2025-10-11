@@ -18,6 +18,17 @@ pub struct Documents {
     pub(crate) pool: PgPool,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct DocumentMetadata {
+    pub id: Uuid,
+    pub version: i32,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub created_by: Option<String>,
+    pub last_modified_by: Option<String>,
+}
+
 impl Documents {
     pub async fn upsert<T: Serialize>(&self, id: &Uuid, doc: &T) -> Result<i32> {
         let json = serde_json::to_value(doc)?;
@@ -57,6 +68,36 @@ impl Documents {
             Ok(Some((doc, version)))
         } else {
             Ok(None)
+        }
+    }
+
+    pub async fn get_with_metadata<T: DeserializeOwned>(&self, id: &Uuid) -> Result<Option<(T, DocumentMetadata)>> {
+        let row: Option<(Value, i32, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>, Option<String>, Option<String>)> =
+            sqlx::query_as(
+                "select doc, version, created_at, updated_at, deleted_at, created_by, last_modified_by from docs where id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        match row {
+            Some((value, version, created_at, updated_at, deleted_at, created_by, last_modified_by)) => {
+                if deleted_at.is_some() {
+                    return Ok(None);
+                }
+                let doc: T = serde_json::from_value(value)?;
+                let meta = DocumentMetadata {
+                    id: *id,
+                    version,
+                    created_at,
+                    updated_at,
+                    deleted_at,
+                    created_by,
+                    last_modified_by,
+                };
+                Ok(Some((doc, meta)))
+            }
+            None => Ok(None),
         }
     }
 

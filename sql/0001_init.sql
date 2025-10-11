@@ -5,10 +5,57 @@ create table if not exists docs (
     version int not null default 0,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now(),
-    deleted_at timestamptz null
+    deleted_at timestamptz null,
+    created_by text null,
+    last_modified_by text null
 );
 
 create index if not exists docs_gin on docs using gin (doc);
+
+-- document change history
+create table if not exists docs_history (
+    hist_id bigserial primary key,
+    id uuid not null,
+    version int not null,
+    doc jsonb not null,
+    modified_at timestamptz not null default now(),
+    modified_by text null,
+    op text not null
+);
+
+create or replace function rf_docs_history() returns trigger as $$
+begin
+  if TG_OP = 'UPDATE' then
+    insert into docs_history(id, version, doc, modified_at, modified_by, op)
+    values (OLD.id, OLD.version, OLD.doc, now(), current_user, 'UPDATE');
+    return NEW;
+  elsif TG_OP = 'DELETE' then
+    insert into docs_history(id, version, doc, modified_at, modified_by, op)
+    values (OLD.id, OLD.version, OLD.doc, now(), current_user, 'DELETE');
+    return OLD;
+  else
+    return NEW;
+  end if;
+end;
+$$ language plpgsql;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_trigger t
+    join pg_class c on c.oid = t.tgrelid
+    where t.tgname = 'rf_docs_history_update' and c.relname = 'docs'
+  ) then
+    create trigger rf_docs_history_update after update on docs for each row execute function rf_docs_history();
+  end if;
+  if not exists (
+    select 1 from pg_trigger t
+    join pg_class c on c.oid = t.tgrelid
+    where t.tgname = 'rf_docs_history_delete' and c.relname = 'docs'
+  ) then
+    create trigger rf_docs_history_delete after delete on docs for each row execute function rf_docs_history();
+  end if;
+end$$;
 
 -- events
 create table if not exists events (
@@ -103,8 +150,11 @@ create table if not exists subscription_dlq (
 create or replace function rf_notify_event() returns trigger as $$
 begin
   perform pg_notify('rillflow_events', new.global_seq::text);
-  return null;
+
+return null;
+
 end;
+
 $$ language plpgsql;
 
 do $$
