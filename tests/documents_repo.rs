@@ -228,6 +228,7 @@ async fn session_load_store_delete_roundtrip() -> Result<()> {
     assert_eq!(envelopes[0].headers["source"], "test");
     assert_eq!(envelopes[1].typ, "CustomerTierChanged");
     assert_eq!(envelopes[1].headers["idempotency_key"], "req-124");
+    assert_eq!(envelopes[1].headers["source"], "test");
 
     Ok(())
 }

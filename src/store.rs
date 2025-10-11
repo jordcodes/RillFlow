@@ -1,5 +1,6 @@
 use crate::{
     Result,
+    context::{SessionContext, SessionContextBuilder},
     documents::{DocumentSession, Documents},
     events::{AppendOptions, Events},
     projections::Projections,
@@ -13,6 +14,7 @@ pub struct Store {
     pool: PgPool,
     session_defaults: AppendOptions,
     session_advisory_locks: bool,
+    session_context: SessionContext,
 }
 
 impl Store {
@@ -22,6 +24,7 @@ impl Store {
             pool,
             session_defaults: AppendOptions::default(),
             session_advisory_locks: false,
+            session_context: SessionContext::default(),
         })
     }
 
@@ -50,6 +53,7 @@ impl Store {
             store: self.clone(),
             defaults: self.session_defaults.clone(),
             use_advisory_lock: self.session_advisory_locks,
+            context: self.session_context.clone(),
         }
     }
 
@@ -71,6 +75,10 @@ impl Store {
     pub fn with_session_defaults(mut self, defaults: AppendOptions, advisory_locks: bool) -> Self {
         self.set_session_defaults(defaults, advisory_locks);
         self
+    }
+
+    pub fn session_context(&self) -> &SessionContext {
+        &self.session_context
     }
 
     pub fn events(&self) -> Events {
@@ -129,6 +137,7 @@ pub struct StoreBuilder {
     connect_timeout: Option<Duration>,
     session_defaults: AppendOptions,
     session_advisory_locks: bool,
+    session_context_builder: SessionContextBuilder,
 }
 
 /// Builder for `DocumentSession` instances with preconfigured defaults.
@@ -136,6 +145,7 @@ pub struct SessionBuilder {
     store: Store,
     defaults: AppendOptions,
     use_advisory_lock: bool,
+    context: SessionContext,
 }
 
 impl StoreBuilder {
@@ -146,6 +156,7 @@ impl StoreBuilder {
             connect_timeout: None,
             session_defaults: AppendOptions::default(),
             session_advisory_locks: false,
+            session_context_builder: SessionContext::builder(),
         }
     }
 
@@ -169,6 +180,11 @@ impl StoreBuilder {
         self
     }
 
+    pub fn session_context(mut self, builder: SessionContextBuilder) -> Self {
+        self.session_context_builder = builder;
+        self
+    }
+
     pub async fn build(self) -> Result<Store> {
         let mut opts = PgPoolOptions::new();
         if let Some(max) = self.max_connections {
@@ -182,6 +198,7 @@ impl StoreBuilder {
             pool,
             session_defaults: self.session_defaults,
             session_advisory_locks: self.session_advisory_locks,
+            session_context: self.session_context_builder.build(),
         })
     }
 }
@@ -237,12 +254,13 @@ impl SessionBuilder {
             store,
             defaults,
             use_advisory_lock,
+            context,
         } = self;
 
         let mut events = store.events();
         events.use_advisory_lock = use_advisory_lock;
 
-        let mut session = DocumentSession::new(store.pool.clone(), events);
+        let mut session = DocumentSession::new(store.pool.clone(), events, context);
         if let Some(headers) = defaults.headers.clone() {
             session.merge_event_headers(headers);
         }

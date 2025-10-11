@@ -261,6 +261,7 @@ impl Documents {
                 pool: self.pool.clone(),
                 use_advisory_lock: false,
             },
+            crate::context::SessionContext::default(),
         )
     }
 }
@@ -320,18 +321,22 @@ pub struct DocumentSession {
     staged: Vec<StagedOperation>,
     events_api: Events,
     event_ops: Vec<SessionEventOp>,
-    event_defaults: AppendOptions,
+    context: crate::context::SessionContext,
 }
 
 impl DocumentSession {
-    pub(crate) fn new(pool: PgPool, events_api: Events) -> Self {
+    pub(crate) fn new(
+        pool: PgPool,
+        events_api: Events,
+        context: crate::context::SessionContext,
+    ) -> Self {
         Self {
             pool,
             identity: HashMap::new(),
             staged: Vec::new(),
             events_api,
             event_ops: Vec::new(),
-            event_defaults: AppendOptions::default(),
+            context,
         }
     }
 
@@ -441,41 +446,44 @@ impl DocumentSession {
 
     /// Merge default headers for staged event appends.
     pub fn merge_event_headers(&mut self, headers: Value) -> &mut Self {
-        let override_opts = AppendOptions {
-            headers: Some(headers),
-            ..AppendOptions::default()
-        };
-        self.event_defaults = Self::combine_options(&self.event_defaults, &override_opts);
+        self.context.merge_headers(headers);
         self
     }
 
     /// Replace default headers for staged event appends.
     pub fn set_event_headers(&mut self, headers: Option<Value>) -> &mut Self {
-        self.event_defaults.headers = headers;
+        self.context.headers.clear();
+        if let Some(Value::Object(map)) = headers {
+            self.context.headers = map;
+        }
         self
     }
 
     /// Set default causation id used for staged event appends.
     pub fn set_event_causation_id(&mut self, id: Option<Uuid>) -> &mut Self {
-        self.event_defaults.causation_id = id;
+        self.context.causation_id = id;
         self
     }
 
     /// Set default correlation id used for staged event appends.
     pub fn set_event_correlation_id(&mut self, id: Option<Uuid>) -> &mut Self {
-        self.event_defaults.correlation_id = id;
+        self.context.correlation_id = id;
         self
+    }
+
+    pub fn context(&self) -> &crate::context::SessionContext {
+        &self.context
+    }
+
+    pub fn context_mut(&mut self) -> &mut crate::context::SessionContext {
+        &mut self.context
     }
 
     /// Ensure an idempotency key header is present on staged event appends.
     pub fn set_event_idempotency_key(&mut self, key: impl Into<String>) -> &mut Self {
-        let mut map = serde_json::Map::new();
-        map.insert("idempotency_key".to_string(), Value::String(key.into()));
-        let overrides = AppendOptions {
-            headers: Some(Value::Object(map)),
-            ..AppendOptions::default()
-        };
-        self.event_defaults = Self::combine_options(&self.event_defaults, &overrides);
+        self.context
+            .headers
+            .insert("idempotency_key".to_string(), Value::String(key.into()));
         self
     }
 
@@ -513,7 +521,12 @@ impl DocumentSession {
             return Ok(());
         }
 
-        let options = Self::combine_options(&self.event_defaults, &overrides);
+        let defaults = AppendOptions {
+            headers: Some(Value::Object(self.context.headers.clone())),
+            causation_id: self.context.causation_id,
+            correlation_id: self.context.correlation_id,
+        };
+        let options = Self::combine_options(&defaults, &overrides);
         self.event_ops.push(SessionEventOp {
             stream_id,
             expected,
@@ -665,7 +678,7 @@ impl DocumentSession {
         self.identity.clear();
         self.staged.clear();
         self.event_ops.clear();
-        self.event_defaults = AppendOptions::default();
+        self.context = crate::context::SessionContext::default();
     }
 
     pub(crate) fn combine_options(

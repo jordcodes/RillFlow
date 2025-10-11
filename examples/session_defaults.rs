@@ -1,4 +1,4 @@
-use rillflow::{Store, events::AppendOptions};
+use rillflow::{SessionContext, Store, events::AppendOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
@@ -21,6 +21,11 @@ async fn main() -> rillflow::Result<()> {
             causation_id: None,
             correlation_id: None,
         })
+        .session_context(
+            SessionContext::builder()
+                .tenant("default")
+                .headers(json!({"environment": "dev"})),
+        )
         .session_advisory_locks(true)
         .build()
         .await?;
@@ -51,6 +56,10 @@ async fn main() -> rillflow::Result<()> {
     let mut session = store.session();
     session.store(customer_id, &upgraded)?;
     session.set_event_idempotency_key("req-upgrade-1");
+    session
+        .context_mut()
+        .merge_headers(json!({"upgraded": true}));
+    session.context_mut().correlation_id = Some(Uuid::new_v4());
     session.append_events(
         customer_id,
         rillflow::Expected::Any,
