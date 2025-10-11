@@ -15,6 +15,8 @@ use std::{
 };
 use tokio::time::sleep;
 
+type TenantResolver = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TenantStrategy {
     Single,
@@ -58,6 +60,8 @@ pub struct Store {
     session_context: SessionContext,
     tenant_strategy: TenantStrategy,
     ensured_tenants: Arc<RwLock<HashSet<String>>>,
+    tenant_resolver: Option<TenantResolver>,
+    enforce_tenant: bool,
 }
 
 impl Store {
@@ -70,6 +74,8 @@ impl Store {
             session_context: SessionContext::default(),
             tenant_strategy: TenantStrategy::Single,
             ensured_tenants: Arc::new(RwLock::new(HashSet::new())),
+            tenant_resolver: None,
+            enforce_tenant: false,
         })
     }
 
@@ -101,6 +107,8 @@ impl Store {
             context: self.session_context.clone(),
             tenant_strategy: self.tenant_strategy,
             ensured_tenants: self.ensured_tenants.clone(),
+            tenant_resolver: self.tenant_resolver.clone(),
+            enforce_tenant: self.enforce_tenant,
         }
     }
 
@@ -225,6 +233,10 @@ impl Store {
         self.tenant_strategy
     }
 
+    pub fn tenant_resolver(&self) -> Option<&TenantResolver> {
+        self.tenant_resolver.as_ref()
+    }
+
     pub fn forget_tenant_schema(&self, schema: &str) {
         if let Ok(mut cache) = self.ensured_tenants.write() {
             cache.remove(schema);
@@ -294,6 +306,8 @@ pub struct StoreBuilder {
     session_advisory_locks: bool,
     session_context_builder: SessionContextBuilder,
     tenant_strategy: TenantStrategy,
+    tenant_resolver: Option<TenantResolver>,
+    enforce_tenant: bool,
 }
 
 /// Builder for `DocumentSession` instances with preconfigured defaults.
@@ -304,6 +318,8 @@ pub struct SessionBuilder {
     context: SessionContext,
     tenant_strategy: TenantStrategy,
     ensured_tenants: Arc<RwLock<HashSet<String>>>,
+    tenant_resolver: Option<TenantResolver>,
+    enforce_tenant: bool,
 }
 
 impl StoreBuilder {
@@ -316,6 +332,8 @@ impl StoreBuilder {
             session_advisory_locks: false,
             session_context_builder: SessionContext::builder(),
             tenant_strategy: TenantStrategy::Single,
+            tenant_resolver: None,
+            enforce_tenant: true,
         }
     }
 
@@ -344,12 +362,38 @@ impl StoreBuilder {
         self
     }
 
+    pub fn tenant_resolver<F>(mut self, resolver: F) -> Self
+    where
+        F: Fn() -> Option<String> + Send + Sync + 'static,
+    {
+        self.tenant_resolver = Some(Arc::new(resolver));
+        self
+    }
+
     pub fn tenant_strategy(mut self, strategy: TenantStrategy) -> Self {
         self.tenant_strategy = strategy;
+        if matches!(self.tenant_strategy, TenantStrategy::SchemaPerTenant) {
+            self.enforce_tenant = true;
+        }
+        self
+    }
+
+    /// Allow creating sessions without a resolver or explicit tenant (system jobs only).
+    pub fn allow_missing_tenant(mut self) -> Self {
+        self.enforce_tenant = false;
         self
     }
 
     pub async fn build(self) -> Result<Store> {
+        if matches!(self.tenant_strategy, TenantStrategy::SchemaPerTenant)
+            && self.tenant_resolver.is_none()
+            && self.enforce_tenant
+        {
+            panic!(
+                "StoreBuilder requires tenant_resolver or allow_missing_tenant() when TenantStrategy::SchemaPerTenant is configured."
+            );
+        }
+
         let mut opts = PgPoolOptions::new();
         if let Some(max) = self.max_connections {
             opts = opts.max_connections(max);
@@ -365,6 +409,8 @@ impl StoreBuilder {
             session_context: self.session_context_builder.build(),
             tenant_strategy: self.tenant_strategy,
             ensured_tenants: Arc::new(RwLock::new(HashSet::new())),
+            tenant_resolver: self.tenant_resolver.clone(),
+            enforce_tenant: self.enforce_tenant,
         })
     }
 }
@@ -416,27 +462,33 @@ impl SessionBuilder {
 
     /// Build a new `DocumentSession` applying the configured defaults.
     pub fn build(self) -> DocumentSession {
-        let SessionBuilder {
-            store,
-            defaults,
-            use_advisory_lock,
-            context,
-            tenant_strategy,
-            ensured_tenants,
-        } = self;
+        let resolver_present = self.tenant_resolver.is_some();
 
-        let mut events = store.events();
-        events.use_advisory_lock = use_advisory_lock;
+        let mut events = self.store.events();
+        events.use_advisory_lock = self.use_advisory_lock;
 
-        let mut session = DocumentSession::new(store.pool.clone(), events, context);
-        session.set_tenant_strategy(tenant_strategy);
-        session.set_tenant_cache(ensured_tenants);
-        if let Some(headers) = defaults.headers.clone() {
+        let mut session = DocumentSession::new(self.store.pool.clone(), events, self.context);
+        session.set_tenant_strategy(self.tenant_strategy);
+        session.set_tenant_cache(self.ensured_tenants);
+        session.set_tenant_resolver(self.tenant_resolver);
+
+        if self.enforce_tenant
+            && matches!(self.tenant_strategy, TenantStrategy::SchemaPerTenant)
+            && session.context().tenant.is_none()
+            && !resolver_present
+        {
+            panic!(
+                "DocumentSession requires tenant context or tenant_resolver (call allow_missing_tenant for system jobs) when using TenantStrategy::SchemaPerTenant."
+            );
+        }
+
+        if let Some(headers) = self.defaults.headers.clone() {
             session.merge_event_headers(headers);
         }
-        session.set_event_causation_id(defaults.causation_id);
-        session.set_event_correlation_id(defaults.correlation_id);
-        if let Some(key) = defaults
+        session.set_event_causation_id(self.defaults.causation_id);
+        session.set_event_correlation_id(self.defaults.correlation_id);
+        if let Some(key) = self
+            .defaults
             .headers
             .as_ref()
             .and_then(|h| h.get("idempotency_key"))
@@ -445,5 +497,20 @@ impl SessionBuilder {
             session.set_event_idempotency_key(key);
         }
         session
+    }
+
+    /// Provide a tenant resolver closure (e.g. per-request metadata) for schema-per-tenant sessions.
+    pub fn tenant_resolver<F>(mut self, resolver: F) -> Self
+    where
+        F: Fn() -> Option<String> + Send + Sync + 'static,
+    {
+        self.tenant_resolver = Some(Arc::new(resolver));
+        self
+    }
+
+    /// Allow creating a session without an immediate tenant (system jobs only).
+    pub fn allow_missing_tenant(mut self) -> Self {
+        self.enforce_tenant = false;
+        self
     }
 }

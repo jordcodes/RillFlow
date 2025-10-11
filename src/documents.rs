@@ -336,6 +336,7 @@ pub struct DocumentSession {
     context: crate::context::SessionContext,
     tenant_strategy: TenantStrategy,
     ensured_tenants: Option<Arc<RwLock<HashSet<String>>>>,
+    tenant_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
 }
 
 impl DocumentSession {
@@ -349,6 +350,13 @@ impl DocumentSession {
 
     pub(crate) fn set_tenant_cache(&mut self, cache: Arc<RwLock<HashSet<String>>>) {
         self.ensured_tenants = Some(cache);
+    }
+
+    pub(crate) fn set_tenant_resolver(
+        &mut self,
+        resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
+    ) {
+        self.tenant_resolver = resolver;
     }
 
     pub(crate) fn new(
@@ -366,15 +374,23 @@ impl DocumentSession {
             context,
             tenant_strategy: TenantStrategy::Single,
             ensured_tenants: None,
+            tenant_resolver: None,
         }
     }
 
-    fn tenant_schema(&self) -> Result<Option<String>> {
+    fn tenant_schema(&mut self) -> Result<Option<String>> {
         match self.tenant_strategy {
             TenantStrategy::Single => Ok(None),
             TenantStrategy::SchemaPerTenant => {
                 if let Some(ref tenant) = self.context.tenant {
                     Ok(Some(tenant_schema_name(tenant)))
+                } else if let Some(resolver) = &self.tenant_resolver {
+                    if let Some(tenant) = (resolver)() {
+                        self.context.tenant = Some(tenant.clone());
+                        Ok(Some(tenant_schema_name(&tenant)))
+                    } else {
+                        Err(Error::TenantRequired)
+                    }
                 } else {
                     Err(Error::TenantRequired)
                 }

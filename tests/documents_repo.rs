@@ -8,6 +8,7 @@ use testcontainers::{
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
 };
+use tokio::runtime::Runtime;
 use uuid::Uuid;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -347,6 +348,7 @@ async fn session_multi_tenant_isolation() -> Result<()> {
 
     let store = Store::builder(&url)
         .tenant_strategy(rillflow::store::TenantStrategy::SchemaPerTenant)
+        .tenant_resolver(|| Some("acme".into()))
         .build()
         .await?;
 
@@ -368,8 +370,10 @@ async fn session_multi_tenant_isolation() -> Result<()> {
     )?;
     session_acme.save_changes().await?;
 
-    let mut session_globex = store.session();
-    session_globex.context_mut().tenant = Some("globex".into());
+    let mut session_globex = store
+        .session_builder()
+        .tenant_resolver(|| Some("globex".to_string()))
+        .build();
     let acme_doc = session_globex.load::<Customer>(&customer_id).await?;
     assert!(acme_doc.is_none(), "globex session must not see acme data");
 
@@ -395,6 +399,77 @@ async fn session_multi_tenant_isolation() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn session_requires_tenant_when_schema_per_tenant() -> Result<()> {
+    let image = GenericImage::new("postgres", "16-alpine")
+        .with_exposed_port(5432.tcp())
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres");
+    let container = image.start().await?;
+    let host = container.get_host().await?;
+    let port = container.get_host_port_ipv4(5432).await?;
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres?sslmode=disable");
+
+    let result = std::panic::catch_unwind(|| {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let _ = Store::builder(&url)
+                .tenant_strategy(rillflow::store::TenantStrategy::SchemaPerTenant)
+                .build()
+                .await
+                .unwrap();
+        });
+    });
+
+    assert!(
+        result.is_err(),
+        "store build should panic without tenant resolver"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_allow_missing_tenant_ok() -> Result<()> {
+    let image = GenericImage::new("postgres", "16-alpine")
+        .with_exposed_port(5432.tcp())
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres");
+    let container = image.start().await?;
+    let host = container.get_host().await?;
+    let port = container.get_host_port_ipv4(5432).await?;
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres?sslmode=disable");
+
+    let store = Store::builder(&url)
+        .tenant_strategy(rillflow::store::TenantStrategy::SchemaPerTenant)
+        .allow_missing_tenant()
+        .build()
+        .await?;
+
+    store.ensure_tenant("acme").await?;
+
+    let mut session = store
+        .session_builder()
+        .tenant_resolver(|| Some("acme".to_string()))
+        .allow_missing_tenant()
+        .build();
+    session.store(
+        Uuid::new_v4(),
+        &Customer {
+            email: "missing@example.com".into(),
+            tier: "trial".into(),
+        },
+    )?;
+    session.save_changes().await?;
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn store_ensure_tenant_concurrency() -> Result<()> {
     let image = GenericImage::new("postgres", "16-alpine")
@@ -411,6 +486,7 @@ async fn store_ensure_tenant_concurrency() -> Result<()> {
 
     let store = Store::builder(&url)
         .tenant_strategy(rillflow::store::TenantStrategy::SchemaPerTenant)
+        .allow_missing_tenant()
         .build()
         .await?;
 
