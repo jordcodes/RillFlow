@@ -71,10 +71,10 @@ async fn roundtrip() -> Result<()> {
 
     let mut session = store.session();
     session.store(id, &customer)?;
-    session.append_events(
+    session.enqueue_event(
         id,
         Expected::Any,
-        vec![Event::new("CustomerRegistered", &customer)],
+        Event::new("CustomerRegistered", &customer),
     )?;
     session.save_changes().await?;
 
