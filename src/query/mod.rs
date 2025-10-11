@@ -498,6 +498,10 @@ impl DocumentQueryContext {
         }
         self
     }
+
+    pub fn build_query(self, pool: PgPool) -> (PgPool, QueryBuilder<'static, Postgres>) {
+        self.spec.build_query(pool)
+    }
 }
 
 pub trait CompiledQuery<R>
