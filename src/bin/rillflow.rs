@@ -770,9 +770,20 @@ async fn serve_health(
             Err(_) => continue,
         };
         let mut _buf = [0u8; 1024];
-        let _ = sock.read(&_buf).await;
-        let resp = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\ncontent-type: text/plain\r\n\r\nok";
-        let _ = sock.write_all(resp).await;
+        let n = sock.read(&_buf).await.unwrap_or(0);
+        let req = std::str::from_utf8(&_buf[..n]).unwrap_or("");
+        let (status, body) = if req.starts_with("GET /metrics ") {
+            ("200 OK", rillflow::metrics::render_prometheus())
+        } else {
+            ("200 OK", "ok".to_string())
+        };
+        let headers = format!(
+            "HTTP/1.1 {}\r\ncontent-length: {}\r\ncontent-type: text/plain\r\n\r\n",
+            status,
+            body.len()
+        );
+        let _ = sock.write_all(headers.as_bytes()).await;
+        let _ = sock.write_all(body.as_bytes()).await;
     }
 }
 

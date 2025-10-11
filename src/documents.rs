@@ -46,6 +46,9 @@ impl Documents {
                 return Ok(None);
             }
             let doc: T = serde_json::from_value(value)?;
+            crate::metrics::metrics()
+                .doc_reads_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(Some((doc, version)))
         } else {
             Ok(None)
@@ -71,8 +74,14 @@ impl Documents {
                 .execute(&self.pool)
                 .await?;
                 if rows.rows_affected() == 1 {
+                    crate::metrics::metrics()
+                        .doc_writes_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     Ok(ver + 1)
                 } else {
+                    crate::metrics::metrics()
+                        .doc_conflicts_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     Err(Error::DocVersionConflict)
                 }
             }
@@ -183,8 +192,14 @@ impl Documents {
 
         let query = qb.build_query_as::<(i32,)>();
         if let Some((new_ver,)) = query.fetch_optional(&self.pool).await? {
+            crate::metrics::metrics()
+                .doc_writes_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(new_ver)
         } else if expected.is_some() {
+            crate::metrics::metrics()
+                .doc_conflicts_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Err(Error::DocVersionConflict)
         } else {
             Err(Error::DocNotFound)

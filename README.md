@@ -53,11 +53,24 @@ cargo run --bin rillflow -- projections dlq-delete my_projection --id 123 --data
 cargo run --bin rillflow -- projections metrics my_projection --database-url "$DATABASE_URL"
 # run loop (long-running)
 cargo run --bin rillflow -- projections run-loop --use-notify true --health-bind 0.0.0.0:8080 --database-url "$DATABASE_URL"
+# metrics endpoint (served on the same bind as health)
+curl -s http://127.0.0.1:8080/metrics | head -50
 ```
 
 - Streams
 ```bash
 cargo run --bin rillflow -- streams resolve orders:42 --database-url "$DATABASE_URL"
+```
+
+- Documents admin
+```bash
+# read JSON
+cargo run --bin rillflow -- docs get <uuid> --database-url "$DATABASE_URL"
+# soft-delete / restore
+cargo run --bin rillflow -- docs soft-delete <uuid> --database-url "$DATABASE_URL"
+cargo run --bin rillflow -- docs restore <uuid> --database-url "$DATABASE_URL"
+# index advisor (DDL suggestions)
+cargo run --bin rillflow -- docs index-advisor --gin --field email --database-url "$DATABASE_URL"
 ```
 
 - Snapshots

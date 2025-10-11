@@ -4,6 +4,7 @@ pub mod aggregates;
 pub mod documents;
 mod error;
 pub mod events;
+pub mod metrics;
 pub mod projection_runtime;
 pub mod projections;
 pub mod query;

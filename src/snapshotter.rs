@@ -165,10 +165,17 @@ impl<F: SnapshotFolder> Snapshotter<F> {
         .fetch_one(&self.pool)
         .await?;
 
-        Ok(SnapshotterMetrics {
+        let out = SnapshotterMetrics {
             candidates,
             max_gap: max_gap.unwrap_or(0).max(0),
-        })
+        };
+        crate::metrics::metrics()
+            .snapshot_candidates_gauge
+            .store(out.candidates as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::metrics::metrics()
+            .snapshot_max_gap_gauge
+            .store(out.max_gap as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(out)
     }
 }
 
