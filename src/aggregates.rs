@@ -1,7 +1,9 @@
 use crate::{
     Result,
-    events::{Event, EventEnvelope, Events, Expected},
+    documents::DocumentSession,
+    events::{AppendOptions, Event, EventEnvelope, Events, Expected},
 };
+use serde_json::{Map as JsonMap, Value};
 use uuid::Uuid;
 
 /// Minimal aggregate trait folded from event envelopes.
@@ -18,8 +20,114 @@ pub trait Aggregate: Sized {
 
 /// Repository for loading and committing event-sourced aggregates.
 pub struct AggregateRepository {
-    events: Events,
-    validator: Option<fn(&serde_json::Value) -> crate::Result<()>>,
+    pub(crate) events: Events,
+    pub(crate) validator: Option<fn(&serde_json::Value) -> crate::Result<()>>,
+}
+
+pub struct AggregateSession<'a> {
+    repo: &'a AggregateRepository,
+    session: &'a mut DocumentSession,
+}
+
+impl<'a> AggregateSession<'a> {
+    pub(crate) fn new(repo: &'a AggregateRepository, session: &'a mut DocumentSession) -> Self {
+        Self { repo, session }
+    }
+
+    pub async fn load<A: Aggregate>(&self, stream_id: Uuid) -> Result<A> {
+        self.repo.load(stream_id).await
+    }
+
+    pub async fn load_with_snapshot<A: Aggregate>(&self, stream_id: Uuid) -> Result<A> {
+        self.repo.load_with_snapshot(stream_id).await
+    }
+
+    pub fn commit(
+        &mut self,
+        stream_id: Uuid,
+        expected: Expected,
+        events: Vec<Event>,
+    ) -> Result<()> {
+        self.session
+            .enqueue_aggregate(stream_id, expected, events, None)
+    }
+
+    pub fn commit_with_options(
+        &mut self,
+        stream_id: Uuid,
+        expected: Expected,
+        events: Vec<Event>,
+        overrides: AppendOptions,
+    ) -> Result<()> {
+        self.session
+            .enqueue_aggregate(stream_id, expected, events, Some(overrides))
+    }
+
+    pub fn commit_for<A: Aggregate>(
+        &mut self,
+        stream_id: Uuid,
+        aggregate: &A,
+        events: Vec<Event>,
+    ) -> Result<()> {
+        self.commit(stream_id, Expected::Exact(aggregate.version()), events)
+    }
+
+    pub fn commit_and_snapshot<A: Aggregate + serde::Serialize + Clone>(
+        &mut self,
+        stream_id: Uuid,
+        aggregate: &A,
+        events: Vec<Event>,
+        snapshot_every: i32,
+    ) -> Result<()> {
+        let event_count = events.len() as i32;
+        if event_count == 0 {
+            return Ok(());
+        }
+
+        let expected = Expected::Exact(aggregate.version());
+
+        let should_snapshot = snapshot_every > 0;
+        let mut new_state = if should_snapshot || self.repo.validator.is_some() {
+            Some(aggregate.clone())
+        } else {
+            None
+        };
+
+        if let Some(state) = new_state.as_mut() {
+            let mut seq = aggregate.version();
+            for event in &events {
+                seq += 1;
+                let envelope = EventEnvelope {
+                    global_seq: 0,
+                    stream_id,
+                    stream_seq: seq,
+                    typ: event.typ.clone(),
+                    body: event.body.clone(),
+                    headers: Value::Object(JsonMap::new()),
+                    causation_id: None,
+                    correlation_id: None,
+                    created_at: chrono::Utc::now(),
+                };
+                state.apply(&envelope);
+            }
+            if let Some(v) = self.repo.validator {
+                v(&serde_json::to_value(state)?)?;
+            }
+        }
+
+        let event_len = events.len() as i32;
+        let new_version = aggregate.version() + event_len;
+
+        self.session
+            .enqueue_aggregate(stream_id, expected, events, None)?;
+
+        if should_snapshot && new_version % snapshot_every == 0 {
+            let body = serde_json::to_value(new_state.expect("snapshot state"))?;
+            self.session.enqueue_snapshot(stream_id, new_version, body);
+        }
+
+        Ok(())
+    }
 }
 
 impl AggregateRepository {
@@ -28,6 +136,10 @@ impl AggregateRepository {
             events,
             validator: None,
         }
+    }
+
+    pub fn events(&self) -> &Events {
+        &self.events
     }
 
     pub fn with_validator(

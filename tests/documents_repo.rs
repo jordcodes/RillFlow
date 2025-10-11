@@ -1,6 +1,6 @@
 use anyhow::Result;
 use rillflow::events::AppendOptions;
-use rillflow::{Error, Event, Expected, Store};
+use rillflow::{Aggregate, AggregateRepository, Error, Event, Expected, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use testcontainers::{
@@ -226,6 +226,107 @@ async fn session_load_store_delete_roundtrip() -> Result<()> {
     assert_eq!(envelopes[1].typ, "CustomerTierChanged");
     assert_eq!(envelopes[1].headers["idempotency_key"], "req-124");
     assert_eq!(envelopes[1].headers["source"], "test");
+
+    Ok(())
+}
+
+#[derive(Default, Clone, serde::Serialize)]
+struct CounterAggregate {
+    n: i32,
+}
+
+impl Aggregate for CounterAggregate {
+    fn new() -> Self {
+        Self { n: 0 }
+    }
+
+    fn apply(&mut self, env: &rillflow::EventEnvelope) {
+        if env.typ == "Increment" {
+            self.n += 1;
+        }
+    }
+
+    fn version(&self) -> i32 {
+        self.n
+    }
+}
+
+#[tokio::test]
+async fn session_aggregate_commit_and_snapshot() -> Result<()> {
+    let image = GenericImage::new("postgres", "16-alpine")
+        .with_exposed_port(5432.tcp())
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres");
+    let container = image.start().await?;
+    let host = container.get_host().await?;
+    let port = container.get_host_port_ipv4(5432).await?;
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres?sslmode=disable");
+
+    let store = Store::builder(&url)
+        .session_defaults(AppendOptions {
+            headers: Some(json!({"source": "test"})),
+            causation_id: None,
+            correlation_id: None,
+        })
+        .session_advisory_locks(true)
+        .build()
+        .await?;
+    rillflow::testing::migrate_core_schema(store.pool()).await?;
+
+    let repo = AggregateRepository::new(store.events());
+
+    let stream_id = Uuid::new_v4();
+    let mut session = store.session();
+    let mut aggregates = session.aggregates(&repo);
+
+    aggregates.commit(
+        stream_id,
+        Expected::NoStream,
+        vec![Event::new("Increment", &json!({}))],
+    )?;
+    session.save_changes().await?;
+
+    let envelopes = store.events().read_stream_envelopes(stream_id).await?;
+    assert_eq!(envelopes.len(), 1);
+    assert_eq!(envelopes[0].typ, "Increment");
+
+    let mut session = store.session();
+    let mut aggregates = session.aggregates(&repo);
+    let agg_state: CounterAggregate = repo.load(stream_id).await?;
+    assert_eq!(agg_state.n, 1);
+
+    aggregates.commit_for(
+        stream_id,
+        &agg_state,
+        vec![Event::new("Increment", &json!({}))],
+    )?;
+    session.save_changes().await?;
+
+    let envelopes = store.events().read_stream_envelopes(stream_id).await?;
+    assert_eq!(envelopes.len(), 2);
+
+    let mut session = store.session();
+    let mut aggregates = session.aggregates(&repo);
+    let agg_state: CounterAggregate = repo.load(stream_id).await?;
+    aggregates.commit_and_snapshot(
+        stream_id,
+        &agg_state,
+        vec![Event::new("Increment", &json!({}))],
+        3,
+    )?;
+    session.save_changes().await?;
+
+    let snapshot: Option<(i32, serde_json::Value)> =
+        sqlx::query_as("select version, body from snapshots where stream_id = $1")
+            .bind(stream_id)
+            .fetch_optional(store.pool())
+            .await?;
+    let (version, body) = snapshot.expect("snapshot row");
+    assert_eq!(version, 3);
+    assert_eq!(body["n"], 3);
 
     Ok(())
 }

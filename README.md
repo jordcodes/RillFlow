@@ -479,14 +479,25 @@ async fn load_vips(store: &Store) -> rillflow::Result<Vec<serde_json::Value>> {
 }
 ```
 
-### Document Sessions
+### Document Sessions & Aggregates
 
 ```rust
-use rillflow::DocumentSession;
+use rillflow::{Aggregate, AggregateRepository, DocumentSession};
 use uuid::Uuid;
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct Customer { id: Uuid, email: String, tier: String }
+
+#[derive(Clone, Default, serde::Serialize)]
+struct VisitCounter { total: i32 }
+
+impl Aggregate for VisitCounter {
+    fn new() -> Self { Self { total: 0 } }
+    fn apply(&mut self, env: &rillflow::EventEnvelope) {
+        if env.typ == "CustomerVisited" { self.total += 1; }
+    }
+    fn version(&self) -> i32 { self.total }
+}
 
 let store = Store::builder(&url)
     .session_defaults(AppendOptions {
@@ -508,6 +519,24 @@ session.enqueue_event(
     id,
     rillflow::Expected::Any,
     rillflow::Event::new("CustomerRegistered", &customer),
+)?;
+let repo = AggregateRepository::new(store.events());
+let mut aggregates = session.aggregates(&repo);
+aggregates.commit(
+    id,
+    rillflow::Expected::Any,
+    vec![rillflow::Event::new("CustomerVisited", &serde_json::json!({}))],
+)?;
+aggregates.commit_for(
+    id,
+    &VisitCounter::default(),
+    vec![rillflow::Event::new("CustomerVisited", &serde_json::json!({}))],
+)?;
+aggregates.commit_and_snapshot(
+    id,
+    &VisitCounter::default(),
+    vec![rillflow::Event::new("CustomerVisited", &serde_json::json!({}))],
+    2,
 )?;
 session.save_changes().await?;
 ```

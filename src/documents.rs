@@ -1,5 +1,6 @@
 use crate::{
     Error, Result,
+    aggregates::{AggregateRepository, AggregateSession},
     events::{AppendOptions, Event, Events, Expected},
     metrics,
     query::{CompiledQuery, DocumentQuery, DocumentQueryContext},
@@ -303,6 +304,13 @@ struct SessionEventOp {
     options: AppendOptions,
 }
 
+#[derive(Clone, Debug)]
+struct SessionSnapshotOp {
+    stream_id: Uuid,
+    version: i32,
+    body: Value,
+}
+
 enum IdentityMutation {
     Upsert {
         id: Uuid,
@@ -321,10 +329,15 @@ pub struct DocumentSession {
     staged: Vec<StagedOperation>,
     events_api: Events,
     event_ops: Vec<SessionEventOp>,
+    snapshot_ops: Vec<SessionSnapshotOp>,
     context: crate::context::SessionContext,
 }
 
 impl DocumentSession {
+    pub fn aggregates<'a>(&'a mut self, repo: &'a AggregateRepository) -> AggregateSession<'a> {
+        AggregateSession::new(repo, self)
+    }
+
     pub(crate) fn new(
         pool: PgPool,
         events_api: Events,
@@ -336,6 +349,7 @@ impl DocumentSession {
             staged: Vec::new(),
             events_api,
             event_ops: Vec::new(),
+            snapshot_ops: Vec::new(),
             context,
         }
     }
@@ -558,6 +572,41 @@ impl DocumentSession {
         Ok(())
     }
 
+    pub fn enqueue_aggregate(
+        &mut self,
+        stream_id: Uuid,
+        expected: Expected,
+        events: Vec<Event>,
+        overrides: Option<AppendOptions>,
+    ) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let overrides = overrides.unwrap_or_default();
+        let defaults = AppendOptions {
+            headers: Some(Value::Object(self.context.headers.clone())),
+            causation_id: self.context.causation_id,
+            correlation_id: self.context.correlation_id,
+        };
+        let options = Self::combine_options(&defaults, &overrides);
+        self.event_ops.push(SessionEventOp {
+            stream_id,
+            expected,
+            events,
+            options,
+        });
+        Ok(())
+    }
+
+    pub fn enqueue_snapshot(&mut self, stream_id: Uuid, version: i32, body: Value) {
+        self.snapshot_ops.push(SessionSnapshotOp {
+            stream_id,
+            version,
+            body,
+        });
+    }
+
     /// Persist staged changes inside a single database transaction.
     pub async fn save_changes(&mut self) -> Result<()> {
         let mut tx = self.pool.begin().await?;
@@ -644,6 +693,7 @@ impl DocumentSession {
         }
 
         let mut event_ops = std::mem::take(&mut self.event_ops);
+        let mut snapshot_ops = std::mem::take(&mut self.snapshot_ops);
         let mut events_written = 0u64;
         if !event_ops.is_empty() {
             for op in &event_ops {
@@ -658,9 +708,30 @@ impl DocumentSession {
                             .fetch_add(1, Ordering::Relaxed);
                     }
                     self.event_ops = event_ops;
+                    self.snapshot_ops = snapshot_ops;
                     return Err(err);
                 }
                 events_written += op.events.len() as u64;
+            }
+        }
+
+        if !snapshot_ops.is_empty() {
+            for op in &snapshot_ops {
+                if let Err(err) = sqlx::query(
+                    r#"insert into snapshots(stream_id, version, body)
+                        values ($1, $2, $3)
+                        on conflict (stream_id) do update set version = excluded.version, body = excluded.body, created_at = now()"#,
+                )
+                .bind(op.stream_id)
+                .bind(op.version)
+                .bind(&op.body)
+                .execute(&mut *tx)
+                .await
+                {
+                    self.event_ops = event_ops;
+                    self.snapshot_ops = snapshot_ops;
+                    return Err(err.into());
+                }
             }
         }
 
@@ -692,6 +763,7 @@ impl DocumentSession {
         }
 
         event_ops.clear();
+        snapshot_ops.clear();
         Ok(())
     }
 
@@ -700,6 +772,7 @@ impl DocumentSession {
         self.identity.clear();
         self.staged.clear();
         self.event_ops.clear();
+        self.snapshot_ops.clear();
         self.context = crate::context::SessionContext::default();
     }
 

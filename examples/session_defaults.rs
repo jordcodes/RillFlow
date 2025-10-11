@@ -1,4 +1,4 @@
-use rillflow::{SessionContext, Store, events::AppendOptions};
+use rillflow::{Aggregate, AggregateRepository, SessionContext, Store, events::AppendOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
@@ -8,6 +8,27 @@ struct Customer {
     id: Uuid,
     email: String,
     tier: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct VisitCounter {
+    total: i32,
+}
+
+impl Aggregate for VisitCounter {
+    fn new() -> Self {
+        Self { total: 0 }
+    }
+
+    fn apply(&mut self, env: &rillflow::EventEnvelope) {
+        if env.typ == "CustomerVisited" {
+            self.total += 1;
+        }
+    }
+
+    fn version(&self) -> i32 {
+        self.total
+    }
 }
 
 #[tokio::main]
@@ -64,6 +85,24 @@ async fn main() -> rillflow::Result<()> {
         customer_id,
         rillflow::Expected::Any,
         rillflow::Event::new("CustomerTierChanged", &json!({"tier": "pro"})),
+    )?;
+    session.save_changes().await?;
+
+    let mut session = store.session();
+    let repo = AggregateRepository::new(store.events());
+    let mut aggregates = session.aggregates(&repo);
+    let visits_stream = customer_id;
+
+    aggregates.commit(
+        visits_stream,
+        rillflow::Expected::Any,
+        vec![rillflow::Event::new("CustomerVisited", &json!({}))],
+    )?;
+    aggregates.commit_and_snapshot(
+        visits_stream,
+        &VisitCounter::default(),
+        vec![rillflow::Event::new("CustomerVisited", &json!({}))],
+        2,
     )?;
     session.save_changes().await?;
 
