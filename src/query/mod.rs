@@ -38,6 +38,7 @@ pub(crate) struct SortSpec {
 pub(crate) enum Selection {
     Document,
     Fields(Vec<FieldProjection>),
+    Aggregates(Vec<AggregateSpec>),
 }
 
 #[derive(Clone, Debug)]
@@ -63,6 +64,8 @@ pub(crate) struct QuerySpec {
     limit: Option<i64>,
     offset: Option<i64>,
     include_deleted: bool,
+    group_by: Vec<JsonPath>,
+    aggregates: Vec<AggregateSpec>,
 }
 
 impl Default for QuerySpec {
@@ -74,6 +77,8 @@ impl Default for QuerySpec {
             limit: None,
             offset: None,
             include_deleted: false,
+            group_by: Vec::new(),
+            aggregates: Vec::new(),
         }
     }
 }
@@ -107,6 +112,14 @@ impl QuerySpec {
         &mut self.selection
     }
 
+    pub(crate) fn push_group_by(&mut self, path: JsonPath) {
+        self.group_by.push(path);
+    }
+
+    pub(crate) fn push_aggregate(&mut self, agg: AggregateSpec) {
+        self.aggregates.push(agg);
+    }
+
     pub(crate) fn set_limit(&mut self, limit: Option<i64>) {
         self.limit = limit;
     }
@@ -131,6 +144,8 @@ impl QuerySpec {
             limit,
             offset,
             include_deleted,
+            group_by,
+            aggregates,
         } = self;
 
         let mut builder = QueryBuilder::new("select ");
@@ -157,6 +172,26 @@ impl QuerySpec {
                     builder.push(") as doc");
                 }
             }
+            Selection::Aggregates(mut aggs_sel) => {
+                // If selection holds aggregates, prefer those; otherwise fall back to spec-level.
+                let use_aggs = if aggs_sel.is_empty() {
+                    aggregates
+                } else {
+                    aggs_sel.drain(..).collect()
+                };
+                if use_aggs.is_empty() {
+                    builder.push("count(*) as count");
+                } else {
+                    let mut first = true;
+                    for agg in use_aggs {
+                        if !first {
+                            builder.push(", ");
+                        }
+                        first = false;
+                        agg.push_sql(&mut builder);
+                    }
+                }
+            }
         }
 
         builder.push(" from docs");
@@ -177,6 +212,18 @@ impl QuerySpec {
         if !include_deleted {
             builder.push(if has_where { " and " } else { " where " });
             builder.push("deleted_at is null");
+        }
+
+        if !group_by.is_empty() {
+            builder.push(" group by ");
+            let mut first = true;
+            for g in group_by {
+                if !first {
+                    builder.push(", ");
+                }
+                first = false;
+                push_text_expr(&mut builder, &g);
+            }
         }
 
         if !sort.is_empty() {
@@ -333,8 +380,58 @@ impl DocumentQueryContext {
         match self.spec.selection_mut() {
             Selection::Document => self.spec.set_selection(Selection::Fields(vec![projection])),
             Selection::Fields(fields) => fields.push(projection),
+            Selection::Aggregates(_) => { /* no-op when aggregates selected */ }
         }
 
+        self
+    }
+
+    pub fn group_by(&mut self, path: impl Into<JsonPath>) -> &mut Self {
+        self.spec.push_group_by(path.into());
+        self
+    }
+
+    pub fn count(&mut self, alias: &str) -> &mut Self {
+        self.spec.set_selection(Selection::Aggregates(vec![]));
+        self.spec.push_aggregate(AggregateSpec::Count {
+            alias: alias.into(),
+        });
+        self
+    }
+
+    pub fn sum(&mut self, path: impl Into<JsonPath>, alias: &str) -> &mut Self {
+        self.spec.set_selection(Selection::Aggregates(vec![]));
+        self.spec.push_aggregate(AggregateSpec::Sum {
+            path: path.into(),
+            alias: alias.into(),
+        });
+        self
+    }
+
+    pub fn avg(&mut self, path: impl Into<JsonPath>, alias: &str) -> &mut Self {
+        self.spec.set_selection(Selection::Aggregates(vec![]));
+        self.spec.push_aggregate(AggregateSpec::Avg {
+            path: path.into(),
+            alias: alias.into(),
+        });
+        self
+    }
+
+    pub fn min(&mut self, path: impl Into<JsonPath>, alias: &str) -> &mut Self {
+        self.spec.set_selection(Selection::Aggregates(vec![]));
+        self.spec.push_aggregate(AggregateSpec::Min {
+            path: path.into(),
+            alias: alias.into(),
+        });
+        self
+    }
+
+    pub fn max(&mut self, path: impl Into<JsonPath>, alias: &str) -> &mut Self {
+        self.spec.set_selection(Selection::Aggregates(vec![]));
+        self.spec.push_aggregate(AggregateSpec::Max {
+            path: path.into(),
+            alias: alias.into(),
+        });
         self
     }
 
@@ -425,16 +522,53 @@ impl<'a> From<&'a [&'a str]> for JsonPath {
 /// JSONB predicate builder for document queries.
 #[derive(Clone, Debug)]
 pub enum Predicate {
-    Eq { path: JsonPath, value: Value },
-    Ne { path: JsonPath, value: Value },
-    Gt { path: JsonPath, value: f64 },
-    Ge { path: JsonPath, value: f64 },
-    Lt { path: JsonPath, value: f64 },
-    Le { path: JsonPath, value: f64 },
-    Contains { path: JsonPath, value: Value },
-    In { path: JsonPath, values: Vec<Value> },
+    Eq {
+        path: JsonPath,
+        value: Value,
+    },
+    Ne {
+        path: JsonPath,
+        value: Value,
+    },
+    Gt {
+        path: JsonPath,
+        value: f64,
+    },
+    Ge {
+        path: JsonPath,
+        value: f64,
+    },
+    Lt {
+        path: JsonPath,
+        value: f64,
+    },
+    Le {
+        path: JsonPath,
+        value: f64,
+    },
+    Contains {
+        path: JsonPath,
+        value: Value,
+    },
+    In {
+        path: JsonPath,
+        values: Vec<Value>,
+    },
     Exists(JsonPath),
-    FullTextMatches { query: String, language: Option<String> },
+    FullTextMatches {
+        query: String,
+        language: Option<String>,
+    },
+    Regex {
+        path: JsonPath,
+        pattern: String,
+        case_insensitive: bool,
+    },
+    Between {
+        path: JsonPath,
+        low: f64,
+        high: f64,
+    },
     Not(Box<Predicate>),
     And(Vec<Predicate>),
     Or(Vec<Predicate>),
@@ -510,6 +644,30 @@ impl Predicate {
 
     pub fn exists(path: impl Into<JsonPath>) -> Self {
         Self::Exists(path.into())
+    }
+
+    pub fn regex(path: impl Into<JsonPath>, pattern: impl Into<String>) -> Self {
+        Self::Regex {
+            path: path.into(),
+            pattern: pattern.into(),
+            case_insensitive: false,
+        }
+    }
+
+    pub fn iregex(path: impl Into<JsonPath>, pattern: impl Into<String>) -> Self {
+        Self::Regex {
+            path: path.into(),
+            pattern: pattern.into(),
+            case_insensitive: true,
+        }
+    }
+
+    pub fn between(path: impl Into<JsonPath>, low: f64, high: f64) -> Self {
+        Self::Between {
+            path: path.into(),
+            low,
+            high,
+        }
     }
 
     pub fn negate(predicate: Predicate) -> Self {
@@ -590,6 +748,27 @@ impl Predicate {
                 }
                 builder.push(")");
             }
+            Predicate::Regex {
+                path,
+                pattern,
+                case_insensitive,
+            } => {
+                builder.push("(");
+                push_text_expr(builder, path);
+                builder.push(if *case_insensitive { " ~* " } else { " ~ " });
+                builder.push_bind(pattern.clone());
+                builder.push(")");
+            }
+            Predicate::Between { path, low, high } => {
+                builder.push("(");
+                builder.push("(");
+                push_text_expr(builder, path);
+                builder.push(")::numeric between ");
+                builder.push_bind(*low);
+                builder.push(" and ");
+                builder.push_bind(*high);
+                builder.push(")");
+            }
             Predicate::Not(inner) => {
                 builder.push("not (");
                 inner.push_sql(builder);
@@ -626,6 +805,50 @@ impl Predicate {
                     }
                     builder.push(")");
                 }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum AggregateSpec {
+    Count { alias: String },
+    Sum { path: JsonPath, alias: String },
+    Avg { path: JsonPath, alias: String },
+    Min { path: JsonPath, alias: String },
+    Max { path: JsonPath, alias: String },
+}
+
+impl AggregateSpec {
+    fn push_sql(&self, builder: &mut QueryBuilder<'_, Postgres>) {
+        match self {
+            AggregateSpec::Count { alias } => {
+                builder.push("count(*) as ");
+                builder.push(alias.as_str());
+            }
+            AggregateSpec::Sum { path, alias } => {
+                builder.push("sum((");
+                push_text_expr(builder, path);
+                builder.push(")::numeric) as ");
+                builder.push(alias.as_str());
+            }
+            AggregateSpec::Avg { path, alias } => {
+                builder.push("avg((");
+                push_text_expr(builder, path);
+                builder.push(")::numeric) as ");
+                builder.push(alias.as_str());
+            }
+            AggregateSpec::Min { path, alias } => {
+                builder.push("min((");
+                push_text_expr(builder, path);
+                builder.push(")::numeric) as ");
+                builder.push(alias.as_str());
+            }
+            AggregateSpec::Max { path, alias } => {
+                builder.push("max((");
+                push_text_expr(builder, path);
+                builder.push(")::numeric) as ");
+                builder.push(alias.as_str());
             }
         }
     }
@@ -762,6 +985,7 @@ impl<T> DocumentQuery<T> {
         match self.spec.selection_mut() {
             Selection::Document => self.spec.set_selection(Selection::Fields(vec![projection])),
             Selection::Fields(fields) => fields.push(projection),
+            Selection::Aggregates(_) => { /* no-op when aggregates selected */ }
         }
 
         self

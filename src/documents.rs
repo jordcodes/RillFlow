@@ -310,6 +310,107 @@ impl Documents {
             crate::context::SessionContext::default(),
         )
     }
+
+    /// Bulk upsert documents. Returns number of rows inserted/updated.
+    pub async fn bulk_upsert<T: Serialize>(&self, items: &[(Uuid, T)]) -> Result<usize> {
+        if items.is_empty() {
+            return Ok(0);
+        }
+        let mut ids: Vec<Uuid> = Vec::with_capacity(items.len());
+        let mut docs: Vec<Json<Value>> = Vec::with_capacity(items.len());
+        for (id, doc) in items.iter() {
+            ids.push(*id);
+            let v = serde_json::to_value(doc)?;
+            docs.push(Json(v));
+        }
+
+        let recs: Vec<(Uuid,)> = sqlx::query_as(
+            r#"
+            with input as (
+              select unnest($1::uuid[]) as id, unnest($2::jsonb[]) as doc
+            )
+            insert into docs (id, doc, version, created_by, last_modified_by)
+            select id, doc, 1, current_user, current_user from input
+            on conflict (id) do update set
+              doc = excluded.doc,
+              version = docs.version + 1,
+              updated_at = now(),
+              last_modified_by = current_user
+            returning id
+            "#,
+        )
+        .bind(&ids)
+        .bind(&docs)
+        .fetch_all(&self.pool)
+        .await?;
+        let affected = recs.len();
+        metrics::record_doc_write(Some("public"), affected as u64);
+        Ok(affected)
+    }
+
+    /// Bulk update with optimistic concurrency. Only rows matching expected versions are updated.
+    /// Returns (updated_count, conflict_count).
+    pub async fn bulk_update_expected<T: Serialize>(
+        &self,
+        items: &[(Uuid, T, i32)],
+    ) -> Result<(usize, usize)> {
+        if items.is_empty() {
+            return Ok((0, 0));
+        }
+        let mut ids: Vec<Uuid> = Vec::with_capacity(items.len());
+        let mut docs: Vec<Json<Value>> = Vec::with_capacity(items.len());
+        let mut vers: Vec<i32> = Vec::with_capacity(items.len());
+        for (id, doc, ver) in items.iter() {
+            ids.push(*id);
+            let v = serde_json::to_value(doc)?;
+            docs.push(Json(v));
+            vers.push(*ver);
+        }
+
+        let recs: Vec<(Uuid,)> = sqlx::query_as(
+            r#"
+            with t as (
+              select unnest($1::uuid[]) as id,
+                     unnest($2::jsonb[]) as doc,
+                     unnest($3::int[])   as expected
+            )
+            update docs d
+            set doc = t.doc,
+                version = d.version + 1,
+                updated_at = now(),
+                last_modified_by = current_user
+            from t
+            where d.id = t.id and d.version = t.expected
+            returning d.id
+            "#,
+        )
+        .bind(&ids)
+        .bind(&docs)
+        .bind(&vers)
+        .fetch_all(&self.pool)
+        .await?;
+        let updated = recs.len();
+        let conflicts = items.len() - updated;
+        if updated > 0 {
+            metrics::record_doc_write(Some("public"), updated as u64);
+        }
+        if conflicts > 0 {
+            metrics::record_doc_conflict(Some("public"));
+        }
+        Ok((updated, conflicts))
+    }
+
+    /// Bulk delete by ids. Returns number of rows deleted.
+    pub async fn bulk_delete(&self, ids: &[Uuid]) -> Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let result = sqlx::query("delete from docs where id = any($1)")
+            .bind(ids)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() as u64)
+    }
 }
 
 #[derive(Clone, Debug)]
