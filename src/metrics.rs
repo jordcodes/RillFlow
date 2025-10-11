@@ -23,6 +23,11 @@ pub struct Metrics {
     // Events
     pub event_appends_total: AtomicU64,
     pub event_conflicts_total: AtomicU64,
+
+    // Pool
+    pub pool_total_gauge: AtomicU64,
+    pub pool_active_gauge: AtomicU64,
+    pub pool_idle_gauge: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -38,6 +43,9 @@ impl Default for Metrics {
             snapshot_max_gap_gauge: AtomicU64::new(0),
             event_appends_total: AtomicU64::new(0),
             event_conflicts_total: AtomicU64::new(0),
+            pool_total_gauge: AtomicU64::new(0),
+            pool_active_gauge: AtomicU64::new(0),
+            pool_idle_gauge: AtomicU64::new(0),
         }
     }
 }
@@ -57,6 +65,9 @@ struct TenantCounters {
     snapshot_max_gap_gauge: u64,
     event_appends_total: u64,
     event_conflicts_total: u64,
+    pool_total_gauge: u64,
+    pool_active_gauge: u64,
+    pool_idle_gauge: u64,
 }
 
 pub fn metrics() -> &'static Metrics {
@@ -233,6 +244,12 @@ pub fn record_event_conflict(tenant: Option<&str>) {
     }
 }
 
+pub fn record_pool_gauges(total: u64, active: u64, idle: u64) {
+    metrics().pool_total_gauge.store(total, Ordering::Relaxed);
+    metrics().pool_active_gauge.store(active, Ordering::Relaxed);
+    metrics().pool_idle_gauge.store(idle, Ordering::Relaxed);
+}
+
 pub fn render_prometheus() -> String {
     let m = metrics();
     let tenants = snapshot_tenant_metrics();
@@ -313,6 +330,27 @@ pub fn render_prometheus() -> String {
         m.event_conflicts_total.load(Ordering::Relaxed),
         &tenants,
         |c| c.event_conflicts_total,
+    );
+    write_gauge(
+        &mut s,
+        "pool_total_gauge",
+        m.pool_total_gauge.load(Ordering::Relaxed),
+        &tenants,
+        |c| c.pool_total_gauge,
+    );
+    write_gauge(
+        &mut s,
+        "pool_active_gauge",
+        m.pool_active_gauge.load(Ordering::Relaxed),
+        &tenants,
+        |c| c.pool_active_gauge,
+    );
+    write_gauge(
+        &mut s,
+        "pool_idle_gauge",
+        m.pool_idle_gauge.load(Ordering::Relaxed),
+        &tenants,
+        |c| c.pool_idle_gauge,
     );
     s
 }

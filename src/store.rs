@@ -8,7 +8,11 @@ use crate::{
     subscriptions::Subscriptions,
 };
 use serde_json::{Map as JsonMap, Value as JsonValue};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{
+    PgPool,
+    postgres::{PgConnectOptions, PgPoolOptions},
+};
+use std::str::FromStr;
 use std::{
     collections::HashSet,
     sync::{Arc, RwLock},
@@ -428,7 +432,15 @@ impl StoreBuilder {
         if let Some(t) = self.connect_timeout {
             opts = opts.acquire_timeout(t);
         }
-        let pool = opts.connect(&self.url).await?;
+        // Configure prepared statement cache if requested
+        let pool = if let Some(cap) = self.prepared_statement_cache_size {
+            let mut connect_opts = PgConnectOptions::from_str(&self.url)
+                .map_err(|e| sqlx::Error::Configuration(Box::new(e)))?;
+            connect_opts = connect_opts.statement_cache_capacity(cap);
+            opts.connect_with(connect_opts).await?
+        } else {
+            opts.connect(&self.url).await?
+        };
         Ok(Store {
             pool,
             session_defaults: self.session_defaults,
@@ -446,6 +458,42 @@ impl StoreBuilder {
 #[derive(Clone, Copy, Debug)]
 pub struct PoolHealth {
     pub ok: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PoolMetrics {
+    pub total: i64,
+    pub active: i64,
+    pub idle: i64,
+}
+
+impl Store {
+    /// Query Postgres for per-database connection counts (active/idle) and update gauges.
+    pub async fn pool_metrics(&self) -> crate::Result<PoolMetrics> {
+        let row: (i64, i64) = sqlx::query_as(
+            r#"select
+                    count(*) filter (where state = 'active') as active,
+                    count(*) filter (where state = 'idle')   as idle
+                from pg_stat_activity
+                where datname = current_database()
+                  and usename = current_user"#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let (active, idle) = row;
+        let total = active + idle;
+        crate::metrics::record_pool_gauges(total as u64, active as u64, idle as u64);
+        Ok(PoolMetrics {
+            total,
+            active,
+            idle,
+        })
+    }
+
+    /// Convenience: update gauges and return liveness.
+    pub async fn update_pool_metrics(&self) -> crate::Result<PoolMetrics> {
+        self.pool_metrics().await
+    }
 }
 
 impl SessionBuilder {

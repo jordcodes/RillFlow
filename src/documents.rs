@@ -35,12 +35,13 @@ impl Documents {
         let version: i32 = sqlx::query_scalar(
             r#"
             with up as (
-                insert into docs (id, doc, version)
-                values ($1, $2, 1)
+                insert into docs (id, doc, version, created_by, last_modified_by)
+                values ($1, $2, 1, current_user, current_user)
                 on conflict (id) do update
                   set doc = excluded.doc,
                       version = docs.version + 1,
-                      updated_at = now()
+                      updated_at = now(),
+                      last_modified_by = current_user
                 returning version
             ) select version from up
             "#,
@@ -71,7 +72,10 @@ impl Documents {
         }
     }
 
-    pub async fn get_with_metadata<T: DeserializeOwned>(&self, id: &Uuid) -> Result<Option<(T, DocumentMetadata)>> {
+    pub async fn get_with_metadata<T: DeserializeOwned>(
+        &self,
+        id: &Uuid,
+    ) -> Result<Option<(T, DocumentMetadata)>> {
         let row: Option<(Value, i32, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>, Option<String>, Option<String>)> =
             sqlx::query_as(
                 "select doc, version, created_at, updated_at, deleted_at, created_by, last_modified_by from docs where id = $1",
@@ -81,7 +85,15 @@ impl Documents {
             .await?;
 
         match row {
-            Some((value, version, created_at, updated_at, deleted_at, created_by, last_modified_by)) => {
+            Some((
+                value,
+                version,
+                created_at,
+                updated_at,
+                deleted_at,
+                created_by,
+                last_modified_by,
+            )) => {
                 if deleted_at.is_some() {
                     return Ok(None);
                 }
@@ -111,7 +123,7 @@ impl Documents {
         match expected {
             Some(ver) => {
                 let rows = sqlx::query(
-                    r#"update docs set doc=$2, version=version+1, updated_at=now()
+                    r#"update docs set doc=$2, version=version+1, updated_at=now(), last_modified_by=current_user
                         where id=$1 and version=$3 and deleted_at is null"#,
                 )
                 .bind(id)
@@ -221,7 +233,7 @@ impl Documents {
             qb.push_bind(Json(value.clone()));
             qb.push(", true)");
         }
-        qb.push(", version = version + 1, updated_at = now() where id = ");
+        qb.push(", version = version + 1, updated_at = now(), last_modified_by = current_user where id = ");
         qb.push_bind(id);
         if let Some(ver) = expected {
             qb.push(" and version = ");
