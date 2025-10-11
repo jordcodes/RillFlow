@@ -159,6 +159,15 @@ enum DocsCmd {
     SoftDelete { id: String },
     /// Restore a soft-deleted document (clears deleted_at)
     Restore { id: String },
+    /// Index advisor: prints suggested DDL for common patterns
+    IndexAdvisor {
+        /// Suggest GIN index on full doc (useful default)
+        #[arg(long, default_value_t = false)]
+        gin: bool,
+        /// Suggest expression indexes for specific fields (repeatable)
+        #[arg(long = "field", action = ArgAction::Append)]
+        fields: Vec<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -607,6 +616,24 @@ async fn main() -> rillflow::Result<()> {
                     .execute(store.pool())
                     .await?;
                 println!("restored {}", id);
+            }
+            DocsCmd::IndexAdvisor { gin, fields } => {
+                if gin {
+                    println!(
+                        "-- full-doc GIN (skip if already applied)\ncreate index if not exists docs_gin on {} using gin (doc);",
+                        quote_ident(&cli.schema)
+                    );
+                }
+                for f in fields {
+                    let idx = format!("docs_{}_expr_idx", f.replace('"', "").to_lowercase());
+                    println!(
+                        "-- expression index for text field {}\ncreate index if not exists {} on {} ((lower(doc->>'{}')));",
+                        f,
+                        quote_ident(&idx),
+                        quote_ident(&cli.schema),
+                        f
+                    );
+                }
             }
         },
         Commands::Snapshots(cmd) => match cmd {

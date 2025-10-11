@@ -373,7 +373,7 @@ impl JsonPath {
         segments
     }
 
-    fn parts(&self) -> &[String] {
+    pub fn parts(&self) -> &[String] {
         &self.0
     }
 }

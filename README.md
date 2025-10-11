@@ -341,6 +341,20 @@ sqlx::query("update docs set deleted_at = now() where id = $1").bind(id).execute
 sqlx::query("update docs set deleted_at = null where id = $1").bind(id).execute(store.pool()).await?;
 ```
 
+Partial updates (jsonb_set):
+
+```rust
+// set a single field
+store.docs().patch(&id, Some(2), "profile.name", &serde_json::json!("Alicia")).await?;
+
+// set multiple fields in one statement
+store.docs().patch_fields(
+  &id,
+  Some(3),
+  &[("profile.age", serde_json::json!(31)), ("extra.flag", serde_json::json!(true))]
+).await?;
+```
+
 See `MIGRATIONS.md` for guidance on adding workload-specific JSONB indexes for query performance.
 ### Projections Runtime (daemon primitives)
 

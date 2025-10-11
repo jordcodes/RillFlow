@@ -4,7 +4,7 @@ use crate::{
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, QueryBuilder, types::Json};
 use uuid::Uuid;
 
 pub struct Documents {
@@ -117,6 +117,90 @@ impl Documents {
         }
         tx.commit().await?;
         Ok(ver + 1)
+    }
+
+    /// Partially update fields using jsonb_set. Each path is dot/bracket notation (e.g. "profile.name").
+    /// Returns the new version. If `expected` is Some, enforces OCC with that version.
+    pub async fn patch_fields(
+        &self,
+        id: &Uuid,
+        expected: Option<i32>,
+        patches: &[(&str, Value)],
+    ) -> Result<i32> {
+        if patches.is_empty() {
+            // No-op; return current version
+            let ver: Option<i32> = sqlx::query_scalar("select version from docs where id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+            return ver.ok_or(Error::DocNotFound);
+        }
+
+        // Build nested jsonb_set(jsonb_set(...)) over doc
+        // Ensure parent objects exist before setting deep fields (for PG < 16 jsonb_set)
+        use std::collections::HashSet;
+        let mut parent_paths: HashSet<Vec<String>> = HashSet::new();
+        for (path, _) in patches.iter() {
+            let parts = crate::query::JsonPath::from(*path).parts().to_vec();
+            if parts.len() > 1 {
+                parent_paths.insert(parts[..parts.len() - 1].to_vec());
+            }
+        }
+
+        let mut qb = QueryBuilder::<Postgres>::new("update docs set doc = ");
+        let total_ops = parent_paths.len() + patches.len();
+        for _ in 0..total_ops {
+            qb.push("jsonb_set(");
+        }
+        qb.push("doc");
+        // Parent creation ops first
+        for parts in &parent_paths {
+            qb.push(", ");
+            qb.push_bind(parts);
+            qb.push(", ");
+            qb.push_bind(Json(serde_json::json!({})));
+            qb.push(", true)");
+        }
+        // Actual value patches
+        for (path, value) in patches.iter() {
+            let parts: Vec<String> = crate::query::JsonPath::from(*path).parts().to_vec();
+            qb.push(", ");
+            qb.push_bind(parts);
+            qb.push(", ");
+            qb.push_bind(Json(value.clone()));
+            qb.push(", true)");
+        }
+        qb.push(", version = version + 1, updated_at = now() where id = ");
+        qb.push_bind(id);
+        if let Some(ver) = expected {
+            qb.push(" and version = ");
+            qb.push_bind(ver);
+            qb.push(" and deleted_at is null");
+        } else {
+            qb.push(" and deleted_at is null");
+        }
+        qb.push(" returning version");
+
+        let query = qb.build_query_as::<(i32,)>();
+        if let Some((new_ver,)) = query.fetch_optional(&self.pool).await? {
+            Ok(new_ver)
+        } else if expected.is_some() {
+            Err(Error::DocVersionConflict)
+        } else {
+            Err(Error::DocNotFound)
+        }
+    }
+
+    /// Convenience: patch a single field path.
+    pub async fn patch(
+        &self,
+        id: &Uuid,
+        expected: Option<i32>,
+        path: &str,
+        value: &Value,
+    ) -> Result<i32> {
+        self.patch_fields(id, expected, &[(path, value.clone())])
+            .await
     }
 
     pub async fn get_field(&self, id: &Uuid, path: &str) -> Result<Option<Value>> {
