@@ -470,6 +470,51 @@ async fn session_allow_missing_tenant_ok() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn session_search_path_is_local() -> Result<()> {
+    let image = GenericImage::new("postgres", "16-alpine")
+        .with_exposed_port(5432.tcp())
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres");
+    let container = image.start().await?;
+    let host = container.get_host().await?;
+    let port = container.get_host_port_ipv4(5432).await?;
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres?sslmode=disable");
+
+    let store = Store::builder(&url)
+        .tenant_strategy(rillflow::store::TenantStrategy::SchemaPerTenant)
+        .allow_missing_tenant()
+        .tenant_resolver(|| Some("acme".to_string()))
+        .build()
+        .await?;
+
+    store.ensure_tenant("acme").await?;
+
+    {
+        let mut session = store.session();
+        session.context_mut().tenant = Some("acme".into());
+        session.save_changes().await?; // no-op flush
+    }
+
+    let search_path: String = sqlx::query_scalar("select current_setting('search_path')")
+        .fetch_one(store.pool())
+        .await?;
+
+    assert!(
+        search_path.contains("public"),
+        "search_path should include public after session"
+    );
+    assert!(
+        !search_path.contains("tenant_acme"),
+        "tenant schema should not leak after session"
+    );
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn store_ensure_tenant_concurrency() -> Result<()> {
     let image = GenericImage::new("postgres", "16-alpine")

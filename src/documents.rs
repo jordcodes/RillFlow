@@ -9,7 +9,7 @@ use crate::{
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use sqlx::{PgPool, Postgres, QueryBuilder, types::Json};
+use sqlx::{Acquire, PgPool, Postgres, QueryBuilder, Transaction, types::Json};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
@@ -427,19 +427,22 @@ impl DocumentSession {
 
         let schema = self.tenant_schema()?;
         let mut conn = self.pool.acquire().await?;
-        if let Some(ref schema_name) = schema {
-            let search_path = format!("{}, public", schema::quote_ident(schema_name));
-            sqlx::query("select set_config('search_path', $1, false)")
-                .bind(search_path)
-                .execute(&mut *conn)
-                .await?;
-        }
-
-        let row: Option<(Value, i32, Option<chrono::DateTime<chrono::Utc>>)> =
+        let row = if let Some(ref schema_name) = schema {
+            let mut tx = conn.begin().await?;
+            Self::set_local_search_path_tx(&mut tx, schema_name).await?;
+            let row: Option<(Value, i32, Option<chrono::DateTime<chrono::Utc>>)> =
+                sqlx::query_as("select doc, version, deleted_at from docs where id = $1")
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            tx.commit().await?;
+            row
+        } else {
             sqlx::query_as("select doc, version, deleted_at from docs where id = $1")
                 .bind(id)
                 .fetch_optional(&mut *conn)
-                .await?;
+                .await?
+        };
 
         match row {
             Some((value, version, deleted_at)) => {
@@ -676,11 +679,7 @@ impl DocumentSession {
         let mut tx = self.pool.begin().await?;
 
         if let Some(ref schema_name) = schema {
-            let search_path = format!("{}, public", schema::quote_ident(schema_name));
-            sqlx::query("select set_config('search_path', $1, false)")
-                .bind(search_path)
-                .execute(&mut *tx)
-                .await?;
+            Self::set_local_search_path_tx(&mut tx, schema_name).await?;
         }
         let mut mutations = Vec::with_capacity(self.staged.len());
         let mut write_count = 0u64;
@@ -876,5 +875,17 @@ impl DocumentSession {
             (Some(value), None) => Some(value.clone()),
             (None, None) => None,
         }
+    }
+
+    async fn set_local_search_path_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        schema_name: &str,
+    ) -> Result<()> {
+        let stmt = format!(
+            "set local search_path to {}, public",
+            schema::quote_ident(schema_name)
+        );
+        sqlx::query(&stmt).execute(&mut **tx).await?;
+        Ok(())
     }
 }
