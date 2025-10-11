@@ -1,7 +1,8 @@
-use crate::{Error, Result};
+use crate::{Error, Result, metrics};
 use serde::Serialize;
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
+use std::sync::atomic::Ordering;
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug)]
@@ -159,12 +160,43 @@ impl Events {
         }
 
         let mut tx = self.pool.begin().await?;
+        let res = self
+            .append_with_tx_internal(&mut tx, stream_id, expected, &events, opts)
+            .await;
+        match res {
+            Ok(()) => {
+                tx.commit().await?;
+                metrics::metrics()
+                    .event_appends_total
+                    .fetch_add(events.len() as u64, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(err) => {
+                metrics::metrics()
+                    .event_conflicts_total
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(err)
+            }
+        }
+    }
+
+    async fn append_with_tx_internal(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        stream_id: Uuid,
+        expected: Expected,
+        events: &[Event],
+        opts: &AppendOptions,
+    ) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
 
         if self.use_advisory_lock {
             let key = stream_id.to_string();
             sqlx::query("select pg_advisory_xact_lock(hashtext($1)::bigint)")
                 .bind(&key)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
         }
 
@@ -172,7 +204,7 @@ impl Events {
             "select max(stream_seq) from events where stream_id = $1",
         )
         .bind(stream_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?
         .unwrap_or(0);
 
@@ -201,11 +233,10 @@ impl Events {
             .bind(&headers)
             .bind(opts.causation_id)
             .bind(opts.correlation_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await;
 
             if let Err(e) = res {
-                // Detect idempotency unique index violation by looking at constraint name/type
                 if let sqlx::Error::Database(db_err) = &e {
                     let msg = db_err.message().to_lowercase();
                     if msg.contains("events_idemp_key_uq")
@@ -217,8 +248,19 @@ impl Events {
                 return Err(e.into());
             }
         }
-        tx.commit().await?;
         Ok(())
+    }
+
+    pub(crate) async fn append_with_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        stream_id: Uuid,
+        expected: Expected,
+        events: &[Event],
+        opts: &AppendOptions,
+    ) -> Result<()> {
+        self.append_with_tx_internal(tx, stream_id, expected, events, opts)
+            .await
     }
 
     pub fn builder(&self, stream_id: Uuid) -> AppendBuilder {

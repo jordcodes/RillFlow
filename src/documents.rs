@@ -1,5 +1,7 @@
 use crate::{
-    Error, Result, metrics,
+    Error, Result,
+    events::{AppendOptions, Event, Events, Expected},
+    metrics,
     query::{CompiledQuery, DocumentQuery, DocumentQueryContext},
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -253,7 +255,13 @@ impl Documents {
     }
 
     pub fn session(&self) -> DocumentSession {
-        DocumentSession::new(self.pool.clone())
+        DocumentSession::new(
+            self.pool.clone(),
+            Events {
+                pool: self.pool.clone(),
+                use_advisory_lock: false,
+            },
+        )
     }
 }
 
@@ -286,6 +294,14 @@ enum SessionAction {
     Delete { expected: Option<i32> },
 }
 
+#[derive(Clone, Debug)]
+struct SessionEventOp {
+    stream_id: Uuid,
+    expected: Expected,
+    events: Vec<Event>,
+    options: AppendOptions,
+}
+
 enum IdentityMutation {
     Upsert {
         id: Uuid,
@@ -302,14 +318,20 @@ pub struct DocumentSession {
     pool: PgPool,
     identity: HashMap<Uuid, IdentityEntry>,
     staged: Vec<StagedOperation>,
+    events_api: Events,
+    event_ops: Vec<SessionEventOp>,
+    event_defaults: AppendOptions,
 }
 
 impl DocumentSession {
-    pub(crate) fn new(pool: PgPool) -> Self {
+    pub(crate) fn new(pool: PgPool, events_api: Events) -> Self {
         Self {
             pool,
             identity: HashMap::new(),
             staged: Vec::new(),
+            events_api,
+            event_ops: Vec::new(),
+            event_defaults: AppendOptions::default(),
         }
     }
 
@@ -417,17 +439,97 @@ impl DocumentSession {
         entry.dirty = true;
     }
 
-    /// Persist staged changes inside a single database transaction.
-    pub async fn save_changes(&mut self) -> Result<()> {
-        if self.staged.is_empty() {
+    /// Merge default headers for staged event appends.
+    pub fn merge_event_headers(&mut self, headers: Value) -> &mut Self {
+        let override_opts = AppendOptions {
+            headers: Some(headers),
+            ..AppendOptions::default()
+        };
+        self.event_defaults = Self::combine_options(&self.event_defaults, &override_opts);
+        self
+    }
+
+    /// Replace default headers for staged event appends.
+    pub fn set_event_headers(&mut self, headers: Option<Value>) -> &mut Self {
+        self.event_defaults.headers = headers;
+        self
+    }
+
+    /// Set default causation id used for staged event appends.
+    pub fn set_event_causation_id(&mut self, id: Option<Uuid>) -> &mut Self {
+        self.event_defaults.causation_id = id;
+        self
+    }
+
+    /// Set default correlation id used for staged event appends.
+    pub fn set_event_correlation_id(&mut self, id: Option<Uuid>) -> &mut Self {
+        self.event_defaults.correlation_id = id;
+        self
+    }
+
+    /// Ensure an idempotency key header is present on staged event appends.
+    pub fn set_event_idempotency_key(&mut self, key: impl Into<String>) -> &mut Self {
+        let mut map = match self.event_defaults.headers.take() {
+            Some(Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        };
+        map.insert("idempotency_key".to_string(), Value::String(key.into()));
+        self.event_defaults.headers = Some(Value::Object(map));
+        self
+    }
+
+    pub fn enable_event_advisory_locks(&mut self) -> &mut Self {
+        self.events_api.use_advisory_lock = true;
+        self
+    }
+
+    pub fn disable_event_advisory_locks(&mut self) -> &mut Self {
+        self.events_api.use_advisory_lock = false;
+        self
+    }
+
+    /// Stage events to be appended when `save_changes` succeeds, using defaults.
+    pub fn append_events<I>(&mut self, stream_id: Uuid, expected: Expected, events: I) -> Result<()>
+    where
+        I: IntoIterator<Item = Event>,
+    {
+        self.append_events_with(stream_id, expected, events, AppendOptions::default())
+    }
+
+    /// Stage events with per-call override options (headers/ids).
+    pub fn append_events_with<I>(
+        &mut self,
+        stream_id: Uuid,
+        expected: Expected,
+        events: I,
+        overrides: AppendOptions,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = Event>,
+    {
+        let events_vec: Vec<Event> = events.into_iter().collect();
+        if events_vec.is_empty() {
             return Ok(());
         }
 
+        let options = Self::combine_options(&self.event_defaults, &overrides);
+        self.event_ops.push(SessionEventOp {
+            stream_id,
+            expected,
+            events: events_vec,
+            options,
+        });
+        Ok(())
+    }
+
+    /// Persist staged changes inside a single database transaction.
+    pub async fn save_changes(&mut self) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         let mut mutations = Vec::with_capacity(self.staged.len());
         let mut write_count = 0u64;
 
-        for op in self.staged.drain(..) {
+        let staged_docs: Vec<_> = self.staged.drain(..).collect();
+        for op in staged_docs {
             match op.action {
                 SessionAction::Upsert { value, expected } => {
                     let version = if let Some(expected) = expected {
@@ -505,12 +607,38 @@ impl DocumentSession {
             }
         }
 
+        let mut event_ops = std::mem::take(&mut self.event_ops);
+        let mut events_written = 0u64;
+        if !event_ops.is_empty() {
+            for op in &event_ops {
+                let result = self
+                    .events_api
+                    .append_with_tx(&mut tx, op.stream_id, op.expected, &op.events, &op.options)
+                    .await;
+                if let Err(err) = result {
+                    if matches!(err, Error::VersionConflict | Error::IdempotencyConflict) {
+                        metrics::metrics()
+                            .event_conflicts_total
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    self.event_ops = event_ops;
+                    return Err(err);
+                }
+                events_written += op.events.len() as u64;
+            }
+        }
+
         tx.commit().await?;
 
         if write_count > 0 {
             metrics::metrics()
                 .doc_writes_total
                 .fetch_add(write_count, Ordering::Relaxed);
+        }
+        if events_written > 0 {
+            metrics::metrics()
+                .event_appends_total
+                .fetch_add(events_written, Ordering::Relaxed);
         }
 
         for mutation in mutations {
@@ -527,6 +655,7 @@ impl DocumentSession {
             }
         }
 
+        event_ops.clear();
         Ok(())
     }
 
@@ -534,5 +663,34 @@ impl DocumentSession {
     pub fn clear(&mut self) {
         self.identity.clear();
         self.staged.clear();
+        self.event_ops.clear();
+        self.event_defaults = AppendOptions::default();
+    }
+
+    fn combine_options(defaults: &AppendOptions, overrides: &AppendOptions) -> AppendOptions {
+        AppendOptions {
+            headers: Self::merge_headers(&defaults.headers, &overrides.headers),
+            causation_id: overrides.causation_id.or(defaults.causation_id),
+            correlation_id: overrides.correlation_id.or(defaults.correlation_id),
+        }
+    }
+
+    fn merge_headers(base: &Option<Value>, overrides: &Option<Value>) -> Option<Value> {
+        match (base, overrides) {
+            (_, Some(Value::Object(override_map))) => {
+                if let Some(Value::Object(base_map)) = base {
+                    let mut merged = base_map.clone();
+                    for (k, v) in override_map {
+                        merged.insert(k.clone(), v.clone());
+                    }
+                    Some(Value::Object(merged))
+                } else {
+                    Some(Value::Object(override_map.clone()))
+                }
+            }
+            (_, Some(value)) => Some(value.clone()),
+            (Some(value), None) => Some(value.clone()),
+            (None, None) => None,
+        }
     }
 }

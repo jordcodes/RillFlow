@@ -69,18 +69,17 @@ async fn roundtrip() -> Result<()> {
         email: "a@b.com".into(),
     };
 
-    store.docs().upsert(&id, &customer).await?;
+    let mut session = store.document_session();
+    session.store(id, &customer)?;
+    session.append_events(
+        id,
+        Expected::Any,
+        vec![Event::new("CustomerRegistered", &customer)],
+    )?;
+    session.save_changes().await?;
+
     let fetched = store.docs().get::<Customer>(&id).await?;
     assert!(fetched.is_some());
-
-    store
-        .events()
-        .append_stream(
-            id,
-            Expected::Any,
-            vec![Event::new("CustomerRegistered", &customer)],
-        )
-        .await?;
 
     let items = store.events().read_stream(id).await?;
     assert_eq!(items.len(), 1);

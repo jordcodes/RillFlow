@@ -1,6 +1,7 @@
 use anyhow::Result;
-use rillflow::{Error, Store};
+use rillflow::{Error, Event, Expected, Store};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use testcontainers::{
     GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
@@ -119,6 +120,9 @@ async fn session_load_store_delete_roundtrip() -> Result<()> {
 
     let id = Uuid::new_v4();
     let mut session = store.document_session();
+    session
+        .merge_event_headers(json!({"source": "test"}))
+        .enable_event_advisory_locks();
 
     // create new doc via session store + save
     session.store(
@@ -142,6 +146,12 @@ async fn session_load_store_delete_roundtrip() -> Result<()> {
             tier: "plus".into(),
         },
     )?;
+    session.set_event_idempotency_key("req-123");
+    session.append_events(
+        id,
+        Expected::Any,
+        vec![Event::new("CustomerUpgraded", &json!({"tier": "plus"}))],
+    )?;
     session.save_changes().await?;
 
     // second session observes persisted version 2
@@ -157,6 +167,15 @@ async fn session_load_store_delete_roundtrip() -> Result<()> {
             tier: "platinum".into(),
         },
     )?;
+    session.set_event_idempotency_key("req-124");
+    session.append_events(
+        id,
+        Expected::Exact(1),
+        vec![Event::new(
+            "CustomerTierChanged",
+            &json!({"tier": "platinum"}),
+        )],
+    )?;
     session.save_changes().await?;
 
     // stale session attempts update -> version conflict
@@ -166,6 +185,13 @@ async fn session_load_store_delete_roundtrip() -> Result<()> {
             email: "beta@example.com".into(),
             tier: "gold".into(),
         },
+    )?;
+    session2.merge_event_headers(json!({"source": "test"}));
+    session2.set_event_idempotency_key("req-125");
+    session2.append_events(
+        id,
+        Expected::Exact(2),
+        vec![Event::new("CustomerTierChanged", &json!({"tier": "gold"}))],
     )?;
     let err = session2
         .save_changes()
@@ -180,6 +206,14 @@ async fn session_load_store_delete_roundtrip() -> Result<()> {
     assert!(session.load::<Profile>(&id).await?.is_none());
     let persisted = store.docs().get::<Profile>(&id).await?;
     assert!(persisted.is_none());
+
+    let envelopes = store.events().read_stream_envelopes(id).await?;
+    assert_eq!(envelopes.len(), 2);
+    assert_eq!(envelopes[0].typ, "CustomerUpgraded");
+    assert_eq!(envelopes[0].headers["idempotency_key"], "req-123");
+    assert_eq!(envelopes[0].headers["source"], "test");
+    assert_eq!(envelopes[1].typ, "CustomerTierChanged");
+    assert_eq!(envelopes[1].headers["idempotency_key"], "req-124");
 
     Ok(())
 }

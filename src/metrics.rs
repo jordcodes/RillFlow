@@ -18,6 +18,10 @@ pub struct Metrics {
     // Snapshotter
     pub snapshot_candidates_gauge: AtomicU64,
     pub snapshot_max_gap_gauge: AtomicU64,
+
+    // Events
+    pub event_appends_total: AtomicU64,
+    pub event_conflicts_total: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -31,6 +35,8 @@ impl Default for Metrics {
             subs_pending_gauge: AtomicU64::new(0),
             snapshot_candidates_gauge: AtomicU64::new(0),
             snapshot_max_gap_gauge: AtomicU64::new(0),
+            event_appends_total: AtomicU64::new(0),
+            event_conflicts_total: AtomicU64::new(0),
         }
     }
 }
@@ -87,6 +93,16 @@ pub fn render_prometheus() -> String {
         s,
         "# TYPE snapshot_max_gap_gauge gauge\nsnapshot_max_gap_gauge {}",
         m.snapshot_max_gap_gauge.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        s,
+        "# TYPE event_appends_total counter\nevent_appends_total {}",
+        m.event_appends_total.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        s,
+        "# TYPE event_conflicts_total counter\nevent_conflicts_total {}",
+        m.event_conflicts_total.load(Ordering::Relaxed)
     );
     s
 }
