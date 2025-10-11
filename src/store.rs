@@ -8,7 +8,12 @@ use crate::{
 };
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use sqlx::{PgPool, postgres::PgPoolOptions};
-use std::time::Duration;
+use std::{
+    collections::HashSet,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
+use tokio::time::sleep;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TenantStrategy {
@@ -31,6 +36,20 @@ pub(crate) fn tenant_schema_name(tenant: &str) -> String {
     format!("tenant_{}", normalized)
 }
 
+fn tenant_lock_key(schema: &str) -> i64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in schema.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+
+    // Clamp to positive i64 so advisory locks stay within valid range.
+    (hash & 0x7FFF_FFFF_FFFF_FFFF) as i64
+}
+
 #[derive(Clone)]
 pub struct Store {
     pool: PgPool,
@@ -38,6 +57,7 @@ pub struct Store {
     session_advisory_locks: bool,
     session_context: SessionContext,
     tenant_strategy: TenantStrategy,
+    ensured_tenants: Arc<RwLock<HashSet<String>>>,
 }
 
 impl Store {
@@ -49,6 +69,7 @@ impl Store {
             session_advisory_locks: false,
             session_context: SessionContext::default(),
             tenant_strategy: TenantStrategy::Single,
+            ensured_tenants: Arc::new(RwLock::new(HashSet::new())),
         })
     }
 
@@ -79,6 +100,7 @@ impl Store {
             use_advisory_lock: self.session_advisory_locks,
             context: self.session_context.clone(),
             tenant_strategy: self.tenant_strategy,
+            ensured_tenants: self.ensured_tenants.clone(),
         }
     }
 
@@ -111,13 +133,63 @@ impl Store {
             TenantStrategy::Single => Ok(()),
             TenantStrategy::SchemaPerTenant => {
                 let schema = tenant_schema_name(tenant);
-                let config = SchemaConfig {
-                    base_schema: "public".into(),
-                    tenancy_mode: TenancyMode::SchemaPerTenant {
-                        tenants: vec![TenantSchema::new(&schema)],
-                    },
-                };
-                self.schema().sync(&config).await.map(|_| ())
+
+                if self
+                    .ensured_tenants
+                    .read()
+                    .expect("tenant cache poisoned")
+                    .contains(&schema)
+                {
+                    return Ok(());
+                }
+
+                let lock_key = tenant_lock_key(&schema);
+                let mut conn = self.pool.acquire().await?;
+                let mut backoff = Duration::from_millis(50);
+
+                loop {
+                    let acquired: bool = sqlx::query_scalar("select pg_try_advisory_lock($1)")
+                        .bind(lock_key)
+                        .fetch_one(&mut *conn)
+                        .await?;
+
+                    if acquired {
+                        break;
+                    }
+
+                    drop(conn);
+                    sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(2));
+                    conn = self.pool.acquire().await?;
+                }
+
+                let sync_result = async {
+                    let config = SchemaConfig {
+                        base_schema: "public".into(),
+                        tenancy_mode: TenancyMode::SchemaPerTenant {
+                            tenants: vec![TenantSchema::new(&schema)],
+                        },
+                    };
+                    self.schema().sync(&config).await
+                }
+                .await;
+
+                let unlock_result = sqlx::query("select pg_advisory_unlock($1)")
+                    .bind(lock_key)
+                    .execute(&mut *conn)
+                    .await;
+
+                drop(conn);
+
+                sync_result?;
+                unlock_result?;
+
+                self.ensured_tenants
+                    .write()
+                    .expect("tenant cache poisoned")
+                    .insert(schema);
+
+                Ok(())
             }
         }
     }
@@ -193,6 +265,7 @@ pub struct SessionBuilder {
     use_advisory_lock: bool,
     context: SessionContext,
     tenant_strategy: TenantStrategy,
+    ensured_tenants: Arc<RwLock<HashSet<String>>>,
 }
 
 impl StoreBuilder {
@@ -253,6 +326,7 @@ impl StoreBuilder {
             session_advisory_locks: self.session_advisory_locks,
             session_context: self.session_context_builder.build(),
             tenant_strategy: self.tenant_strategy,
+            ensured_tenants: Arc::new(RwLock::new(HashSet::new())),
         })
     }
 }
@@ -310,6 +384,7 @@ impl SessionBuilder {
             use_advisory_lock,
             context,
             tenant_strategy,
+            ensured_tenants,
         } = self;
 
         let mut events = store.events();
@@ -317,6 +392,7 @@ impl SessionBuilder {
 
         let mut session = DocumentSession::new(store.pool.clone(), events, context);
         session.set_tenant_strategy(tenant_strategy);
+        session.set_tenant_cache(ensured_tenants);
         if let Some(headers) = defaults.headers.clone() {
             session.merge_event_headers(headers);
         }

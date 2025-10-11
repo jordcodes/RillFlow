@@ -21,6 +21,8 @@ pub enum Error {
     DocVersionConflict,
     #[error("tenant required for this operation")]
     TenantRequired,
+    #[error("tenant {0} is not provisioned")]
+    TenantNotFound(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -1,6 +1,5 @@
 use anyhow::Result;
 use rillflow::events::AppendOptions;
-use rillflow::store::TenantStrategy;
 use rillflow::{Aggregate, AggregateRepository, Error, Event, Expected, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::json;

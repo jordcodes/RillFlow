@@ -10,7 +10,8 @@ use crate::{
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, QueryBuilder, types::Json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock};
 use std::sync::atomic::Ordering;
 use uuid::Uuid;
 
@@ -334,6 +335,7 @@ pub struct DocumentSession {
     snapshot_ops: Vec<SessionSnapshotOp>,
     context: crate::context::SessionContext,
     tenant_strategy: TenantStrategy,
+    ensured_tenants: Option<Arc<RwLock<HashSet<String>>>>,
 }
 
 impl DocumentSession {
@@ -343,6 +345,10 @@ impl DocumentSession {
 
     pub(crate) fn set_tenant_strategy(&mut self, strategy: TenantStrategy) {
         self.tenant_strategy = strategy;
+    }
+
+    pub(crate) fn set_tenant_cache(&mut self, cache: Arc<RwLock<HashSet<String>>>) {
+        self.ensured_tenants = Some(cache);
     }
 
     pub(crate) fn new(
@@ -359,6 +365,7 @@ impl DocumentSession {
             snapshot_ops: Vec::new(),
             context,
             tenant_strategy: TenantStrategy::Single,
+            ensured_tenants: None,
         }
     }
 
@@ -641,6 +648,15 @@ impl DocumentSession {
     /// Persist staged changes inside a single database transaction.
     pub async fn save_changes(&mut self) -> Result<()> {
         let schema = self.tenant_schema()?;
+        if let (Some(schema_name), Some(cache)) = (&schema, &self.ensured_tenants) {
+            if !cache
+                .read()
+                .expect("tenant cache poisoned")
+                .contains(schema_name)
+            {
+                return Err(Error::TenantNotFound(schema_name.clone()));
+            }
+        }
         let mut tx = self.pool.begin().await?;
 
         if let Some(ref schema_name) = schema {
