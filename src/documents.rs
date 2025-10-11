@@ -11,8 +11,8 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, QueryBuilder, types::Json};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
 pub struct Documents {
