@@ -227,6 +227,26 @@ impl DocumentQueryContext {
         Self::default()
     }
 
+    pub fn full_text_search(&mut self, query: impl Into<String>) -> &mut Self {
+        self.spec.push_filter(Predicate::FullTextMatches {
+            query: query.into(),
+            language: None,
+        });
+        self
+    }
+
+    pub fn full_text_search_lang(
+        &mut self,
+        query: impl Into<String>,
+        language: impl Into<String>,
+    ) -> &mut Self {
+        self.spec.push_filter(Predicate::FullTextMatches {
+            query: query.into(),
+            language: Some(language.into()),
+        });
+        self
+    }
+
     pub fn filter(&mut self, predicate: Predicate) -> &mut Self {
         self.spec.push_filter(predicate);
         self
@@ -414,6 +434,7 @@ pub enum Predicate {
     Contains { path: JsonPath, value: Value },
     In { path: JsonPath, values: Vec<Value> },
     Exists(JsonPath),
+    FullTextMatches { query: String, language: Option<String> },
     Not(Box<Predicate>),
     And(Vec<Predicate>),
     Or(Vec<Predicate>),
@@ -549,6 +570,25 @@ impl Predicate {
                 builder.push("(");
                 push_json_expr(builder, path);
                 builder.push(" is not null)");
+            }
+            Predicate::FullTextMatches { query, language } => {
+                builder.push("(");
+                if let Some(lang) = language {
+                    builder.push("to_tsvector(");
+                    builder.push_bind(lang.clone());
+                    builder.push(", ");
+                    builder.push("doc #>> ARRAY[]::text[]");
+                    builder.push(") @@ plainto_tsquery(");
+                    builder.push_bind(lang.clone());
+                    builder.push(", ");
+                    builder.push_bind(query.clone());
+                    builder.push(")");
+                } else {
+                    builder.push("docs_search @@ plainto_tsquery('english', ");
+                    builder.push_bind(query.clone());
+                    builder.push(")");
+                }
+                builder.push(")");
             }
             Predicate::Not(inner) => {
                 builder.push("not (");

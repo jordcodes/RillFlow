@@ -113,6 +113,25 @@ impl SchemaManager {
             build_docs_index_sql,
         );
 
+        // Full-text search index
+        ensure_index(
+            plan,
+            schema,
+            &existing_indexes,
+            "docs_fts_idx",
+            build_docs_fts_index_sql,
+        );
+
+        // FTS function and triggers
+        plan.push_action(
+            format!("create function {}.rf_docs_search_update()", quote_ident(schema)),
+            build_docs_fts_fn_sql(schema),
+        );
+        plan.push_action(
+            format!("create triggers for {}.docs full-text search", quote_ident(schema)),
+            build_docs_fts_triggers_sql(schema),
+        );
+
         // History function and triggers
         plan.push_action(
             format!("create function {}.rf_docs_history()", quote_ident(schema)),
@@ -406,7 +425,8 @@ fn build_docs_table_sql(schema: &str) -> String {
             updated_at timestamptz not null default now(),
             deleted_at timestamptz null,
             created_by text null,
-            last_modified_by text null
+            last_modified_by text null,
+            docs_search tsvector null
         )
         ",
         table = qualified_name(schema, "docs"),
@@ -474,6 +494,17 @@ fn build_docs_index_sql(schema: &str) -> String {
     )
 }
 
+fn build_docs_fts_index_sql(schema: &str) -> String {
+    formatdoc!(
+        "
+        create index if not exists {index} on {table}
+            using gin (docs_search)
+        ",
+        index = quote_ident("docs_fts_idx"),
+        table = qualified_name(schema, "docs"),
+    )
+}
+
 fn build_docs_history_fn_sql(schema: &str) -> String {
     formatdoc!(
         r#"
@@ -523,6 +554,43 @@ fn build_docs_history_triggers_sql(schema: &str) -> String {
         schema_lit = format!("'{}'", schema),
         tbl = qualified_name(schema, "docs"),
         fn = format!("{}.{}", quote_ident(schema), quote_ident("rf_docs_history")),
+    )
+}
+
+fn build_docs_fts_fn_sql(schema: &str) -> String {
+    formatdoc!(
+        r#"
+        create or replace function {schema}.rf_docs_search_update() returns trigger as $$
+        begin
+          new.docs_search := jsonb_to_tsvector('english', new.doc, '["all"]');
+          return new;
+        end;
+        $$ language plpgsql;
+        "#,
+        schema = quote_ident(schema),
+    )
+}
+
+fn build_docs_fts_triggers_sql(schema: &str) -> String {
+    let tbl = qualified_name(schema, "docs");
+    let fnq = format!("{}.{}", quote_ident(schema), quote_ident("rf_docs_search_update"));
+    formatdoc!(
+        r#"
+        do $$
+        begin
+          if not exists (
+            select 1 from pg_trigger t
+            join pg_class c on c.oid = t.tgrelid
+            join pg_namespace n on n.oid = c.relnamespace
+            where t.tgname = 'rf_docs_fts_biu' and c.relname = 'docs' and n.nspname = {schema_lit}
+          ) then
+            execute 'create trigger rf_docs_fts_biu before insert or update of doc on {tbl} for each row execute function {fnq}()';
+          end if;
+        end$$;
+        "#,
+        schema_lit = format!("'{}'", schema),
+        tbl = tbl,
+        fnq = fnq,
     )
 }
 

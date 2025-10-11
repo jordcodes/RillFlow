@@ -7,10 +7,30 @@ create table if not exists docs (
     updated_at timestamptz not null default now(),
     deleted_at timestamptz null,
     created_by text null,
-    last_modified_by text null
+    last_modified_by text null,
+    docs_search tsvector null
 );
 
 create index if not exists docs_gin on docs using gin (doc);
+create index if not exists docs_fts_idx on docs using gin (docs_search);
+
+create or replace function rf_docs_search_update() returns trigger as $$
+begin
+  new.docs_search := jsonb_to_tsvector('english', new.doc, '["all"]');
+  return new;
+end;
+$$ language plpgsql;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_trigger t
+    join pg_class c on c.oid = t.tgrelid
+    where t.tgname = 'rf_docs_fts_biu' and c.relname = 'docs'
+  ) then
+    create trigger rf_docs_fts_biu before insert or update of doc on docs for each row execute function rf_docs_search_update();
+  end if;
+end$$;
 
 -- document change history
 create table if not exists docs_history (
