@@ -2,6 +2,8 @@ use crate::{Error, Result, metrics};
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, Transaction};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug)]
@@ -133,27 +135,45 @@ impl Events {
                     stream_id,
                     stream_seq,
                     typ,
-                    body,
+                    mut body,
                     headers,
                     causation_id,
                     correlation_id,
-                    event_version,
+                    mut event_version,
                     tenant_id,
                     user_id,
                     created_at,
-                )| EventEnvelope {
-                    global_seq,
-                    stream_id,
-                    stream_seq,
-                    typ,
-                    body,
-                    headers,
-                    causation_id,
-                    correlation_id,
-                    event_version,
-                    tenant_id,
-                    user_id,
-                    created_at,
+                )| {
+                    // Apply upcasters if registered, chaining from current version.
+                    let mut next = event_version;
+                    while let Some(up) = UPCASTERS
+                        .get_or_init(Default::default)
+                        .lock()
+                        .ok()
+                        .and_then(|m| m.get(&(typ.clone(), next)).cloned())
+                    {
+                        match (up)(body.clone()) {
+                            Ok(new_body) => {
+                                body = new_body;
+                                next += 1;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    EventEnvelope {
+                        global_seq,
+                        stream_id,
+                        stream_seq,
+                        typ,
+                        body,
+                        headers,
+                        causation_id,
+                        correlation_id,
+                        event_version: next,
+                        tenant_id,
+                        user_id,
+                        created_at,
+                    }
                 },
             )
             .collect())
@@ -278,6 +298,17 @@ impl Events {
             stream_id,
             inner: self.clone(),
         }
+    }
+}
+
+type UpcasterFn = Arc<dyn Fn(Value) -> Result<Value> + Send + Sync + 'static>;
+static UPCASTERS: OnceLock<Mutex<HashMap<(String, i32), UpcasterFn>>> = OnceLock::new();
+
+/// Register an event upcaster that transforms a given event type from a specific version to the next version.
+pub fn register_upcaster(event_type: &str, from_version: i32, upcaster: UpcasterFn) {
+    let map = UPCASTERS.get_or_init(Default::default);
+    if let Ok(mut m) = map.lock() {
+        m.insert((event_type.to_string(), from_version), upcaster);
     }
 }
 
