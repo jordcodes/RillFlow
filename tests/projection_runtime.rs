@@ -81,7 +81,7 @@ async fn projection_tick_and_pause_resume() -> Result<()> {
     assert_eq!(count, Some(2));
 
     // pause then tick — should be Paused, count unchanged
-    daemon.pause("counter").await?;
+    daemon.pause("counter", None).await?;
     let res = daemon.tick_once("counter").await?;
     assert!(matches!(
         res,
@@ -89,7 +89,7 @@ async fn projection_tick_and_pause_resume() -> Result<()> {
     ));
 
     // resume and append one more event; tick processes it
-    daemon.resume("counter").await?;
+    daemon.resume("counter", None).await?;
     store
         .events()
         .append_stream(stream, Expected::Any, vec![Event::new("Ping", &body)])

@@ -1,12 +1,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::{Error, Result, projections::ProjectionHandler};
+use crate::{
+    Error, Result, SessionContext,
+    projections::ProjectionHandler,
+    store::{TenantStrategy, tenant_schema_name},
+};
 use serde_json::Value;
 use sqlx::{PgPool, types::Json};
 use tracing::{info, instrument, warn};
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ProjectionWorkerConfig {
     pub batch_size: i64,
     pub max_retries: u32,
@@ -15,6 +19,8 @@ pub struct ProjectionWorkerConfig {
     pub lease_ttl: Duration,
     pub schema: String,
     pub notify_channel: Option<String>,
+    pub tenant_strategy: TenantStrategy,
+    pub tenant_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
 }
 
 impl Default for ProjectionWorkerConfig {
@@ -27,6 +33,8 @@ impl Default for ProjectionWorkerConfig {
             lease_ttl: Duration::from_secs(30),
             schema: "public".to_string(),
             notify_channel: Some("rillflow_events".to_string()),
+            tenant_strategy: TenantStrategy::Single,
+            tenant_resolver: None,
         }
     }
 }
@@ -65,6 +73,24 @@ impl ProjectionDaemon {
             name: name.into(),
             handler,
         });
+    }
+
+    fn resolve_schema(&self, context: &SessionContext) -> Result<Option<String>> {
+        match self.config.tenant_strategy {
+            TenantStrategy::Single => Ok(Some(self.config.schema.clone())),
+            TenantStrategy::SchemaPerTenant => {
+                if let Some(ref tenant) = context.tenant {
+                    Ok(Some(tenant_schema_name(tenant)))
+                } else if let Some(resolver) = &self.config.tenant_resolver {
+                    match resolver() {
+                        Some(tenant) => Ok(Some(tenant_schema_name(&tenant))),
+                        None => Err(crate::Error::TenantRequired),
+                    }
+                } else {
+                    Err(crate::Error::TenantRequired)
+                }
+            }
+        }
     }
 
     /// Long-running loop: ticks all projections, optionally LISTENs for event notifications to wake up.
@@ -136,12 +162,11 @@ impl ProjectionDaemon {
         }
 
         let mut tx = self.pool.begin().await?;
-        // Scope all table references to configured schema (search_path is local to this tx)
-        let set_search_path = format!(
-            "set local search_path to {}",
-            quote_ident(&self.config.schema)
-        );
-        sqlx::query(&set_search_path).execute(&mut *tx).await?;
+        let context = SessionContext::default();
+        if let Some(schema) = self.resolve_schema(&context)? {
+            let set_search_path = format!("set local search_path to {}", quote_ident(&schema));
+            sqlx::query(&set_search_path).execute(&mut *tx).await?;
+        }
         let last_seq: i64 = sqlx::query_scalar("select last_seq from projections where name = $1")
             .bind(name)
             .fetch_optional(&mut *tx)
@@ -179,7 +204,7 @@ impl ProjectionDaemon {
 
             new_last = seq;
             processed += 1;
-            crate::metrics::record_proj_events_processed(None, 1);
+            crate::metrics::record_proj_events_processed(context.tenant.as_deref(), 1);
         }
 
         self.persist_checkpoint(&mut tx, name, new_last).await?;
@@ -227,7 +252,7 @@ impl ProjectionDaemon {
 
     // --- Admin APIs ---
 
-    pub async fn list(&self) -> Result<Vec<ProjectionStatus>> {
+    pub async fn list(&self, tenant: Option<&str>) -> Result<Vec<ProjectionStatus>> {
         // Prefer registered names; if none, fall back to names found in DB.
         let mut names: Vec<String> = if self.registrations.is_empty() {
             self.discover_names().await?
@@ -239,13 +264,29 @@ impl ProjectionDaemon {
 
         let mut out = Vec::new();
         for name in names {
-            out.push(self.status(&name).await?);
+            out.push(self.status(&name, tenant).await?);
         }
         Ok(out)
     }
 
     /// List DLQ items for a projection (most recent first)
-    pub async fn dlq_list(&self, name: &str, limit: i64) -> Result<Vec<ProjectionDlqItem>> {
+    pub async fn dlq_list(
+        &self,
+        name: &str,
+        limit: i64,
+        tenant: Option<&str>,
+    ) -> Result<Vec<ProjectionDlqItem>> {
+        let mut tx = self.pool.begin().await?;
+        if let Some(schema) = tenant.map(tenant_schema_name) {
+            let stmt = format!("set local search_path to {}", quote_ident(&schema));
+            sqlx::query(&stmt).execute(&mut *tx).await?;
+        } else {
+            let stmt = format!(
+                "set local search_path to {}",
+                quote_ident(&self.config.schema)
+            );
+            sqlx::query(&stmt).execute(&mut *tx).await?;
+        }
         let rows: Vec<(i64, i64, String, chrono::DateTime<chrono::Utc>, String)> = sqlx::query_as(
             r#"select id, global_seq, event_type, failed_at, error
                 from projection_dlq where name = $1
@@ -253,8 +294,9 @@ impl ProjectionDaemon {
         )
         .bind(name)
         .bind(limit.max(1))
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(rows
             .into_iter()
@@ -269,72 +311,108 @@ impl ProjectionDaemon {
     }
 
     /// Delete a single DLQ item
-    pub async fn dlq_delete(&self, name: &str, id: i64) -> Result<()> {
+    pub async fn dlq_delete(&self, name: &str, id: i64, tenant: Option<&str>) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        if let Some(schema) = tenant.map(tenant_schema_name) {
+            let stmt = format!("set local search_path to {}", quote_ident(&schema));
+            sqlx::query(&stmt).execute(&mut *tx).await?;
+        } else {
+            let stmt = format!(
+                "set local search_path to {}",
+                quote_ident(&self.config.schema)
+            );
+            sqlx::query(&stmt).execute(&mut *tx).await?;
+        }
         sqlx::query("delete from projection_dlq where name = $1 and id = $2")
             .bind(name)
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
     /// Requeue a DLQ item by setting checkpoint to seq-1 and deleting the DLQ row
-    pub async fn dlq_requeue(&self, name: &str, id: i64) -> Result<()> {
+    pub async fn dlq_requeue(&self, name: &str, id: i64, tenant: Option<&str>) -> Result<()> {
+        let schema_stmt = if let Some(schema) = tenant.map(tenant_schema_name) {
+            format!("set local search_path to {}", quote_ident(&schema))
+        } else {
+            format!(
+                "set local search_path to {}",
+                quote_ident(&self.config.schema)
+            )
+        };
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(&schema_stmt).execute(&mut *tx).await?;
         let rec: Option<i64> =
             sqlx::query_scalar("select global_seq from projection_dlq where name = $1 and id = $2")
                 .bind(name)
                 .bind(id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *tx)
                 .await?;
         if let Some(seq) = rec {
             let reset_to = seq.saturating_sub(1);
-            self.reset_checkpoint(name, reset_to).await?;
-            self.dlq_delete(name, id).await?;
+            self.reset_checkpoint(name, reset_to, tenant).await?;
+            sqlx::query("delete from projection_dlq where name = $1 and id = $2")
+                .bind(name)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 
-    pub async fn status(&self, name: &str) -> Result<ProjectionStatus> {
-        let last_seq: Option<i64> =
-            sqlx::query_scalar("select last_seq from projections where name = $1")
-                .bind(name)
-                .fetch_optional(&self.pool)
-                .await?;
+    pub async fn status(&self, name: &str, tenant: Option<&str>) -> Result<ProjectionStatus> {
+        let schema = tenant
+            .map(tenant_schema_name)
+            .unwrap_or_else(|| self.config.schema.clone());
+        let stmt = format!("set local search_path to {}", quote_ident(&schema));
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(&stmt).execute(&mut *tx).await?;
+
+        let last_seq: i64 = sqlx::query_scalar("select last_seq from projections where name = $1")
+            .bind(name)
+            .fetch_optional(&mut *tx)
+            .await?
+            .unwrap_or(0);
 
         let paused: bool =
             sqlx::query_scalar("select paused from projection_control where name = $1")
                 .bind(name)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *tx)
                 .await?
                 .unwrap_or(false);
 
         let backoff_until: Option<chrono::DateTime<chrono::Utc>> =
             sqlx::query_scalar("select backoff_until from projection_control where name = $1")
                 .bind(name)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *tx)
                 .await?;
 
         let leased_by: Option<String> =
             sqlx::query_scalar("select leased_by from projection_leases where name = $1")
                 .bind(name)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *tx)
                 .await?;
 
         let lease_until: Option<chrono::DateTime<chrono::Utc>> =
             sqlx::query_scalar("select lease_until from projection_leases where name = $1")
                 .bind(name)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *tx)
                 .await?;
 
         let dlq_count: i64 =
             sqlx::query_scalar("select count(1) from projection_dlq where name = $1")
                 .bind(name)
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *tx)
                 .await?;
+
+        tx.commit().await?;
 
         Ok(ProjectionStatus {
             name: name.to_string(),
-            last_seq: last_seq.unwrap_or(0),
+            last_seq,
             paused,
             backoff_until,
             leased_by,
@@ -344,22 +422,31 @@ impl ProjectionDaemon {
     }
 
     /// Compute simple metrics: last checkpoint, head of events, lag and DLQ size.
-    pub async fn metrics(&self, name: &str) -> Result<ProjectionMetrics> {
+    pub async fn metrics(&self, name: &str, tenant: Option<&str>) -> Result<ProjectionMetrics> {
+        let schema = tenant
+            .map(tenant_schema_name)
+            .unwrap_or_else(|| self.config.schema.clone());
+        let stmt = format!("set local search_path to {}", quote_ident(&schema));
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(&stmt).execute(&mut *tx).await?;
+
         let last_seq: i64 = sqlx::query_scalar("select last_seq from projections where name = $1")
             .bind(name)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?
             .unwrap_or(0);
 
         let head_seq: i64 = sqlx::query_scalar("select coalesce(max(global_seq), 0) from events")
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await?;
 
         let dlq_count: i64 =
             sqlx::query_scalar("select count(1) from projection_dlq where name = $1")
                 .bind(name)
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *tx)
                 .await?;
+
+        tx.commit().await?;
 
         Ok(ProjectionMetrics {
             name: name.to_string(),
@@ -371,38 +458,74 @@ impl ProjectionDaemon {
     }
 
     #[instrument(skip_all, fields(projection = %name))]
-    pub async fn pause(&self, name: &str) -> Result<()> {
+    pub async fn pause(&self, name: &str, tenant: Option<&str>) -> Result<()> {
+        let schema = tenant
+            .map(tenant_schema_name)
+            .unwrap_or_else(|| self.config.schema.clone());
+        let stmt = format!("set local search_path to {}", quote_ident(&schema));
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(&stmt).execute(&mut *tx).await?;
         sqlx::query(
             r#"insert into projection_control(name, paused) values($1, true)
                 on conflict (name) do update set paused = true, updated_at = now()"#,
         )
         .bind(name)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
     #[instrument(skip_all, fields(projection = %name))]
-    pub async fn resume(&self, name: &str) -> Result<()> {
+    pub async fn resume(&self, name: &str, tenant: Option<&str>) -> Result<()> {
+        let schema = tenant
+            .map(tenant_schema_name)
+            .unwrap_or_else(|| self.config.schema.clone());
+        let stmt = format!("set local search_path to {}", quote_ident(&schema));
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(&stmt).execute(&mut *tx).await?;
         sqlx::query(
             r#"insert into projection_control(name, paused, backoff_until) values($1, false, null)
                 on conflict (name) do update set paused = false, backoff_until = null, updated_at = now()"#,
         )
         .bind(name)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
     #[instrument(skip_all, fields(projection = %name, seq = seq))]
-    pub async fn reset_checkpoint(&self, name: &str, seq: i64) -> Result<()> {
-        self.persist_checkpoint(&mut self.pool.begin().await?, name, seq)
-            .await
+    pub async fn reset_checkpoint(&self, name: &str, seq: i64, tenant: Option<&str>) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        if let Some(schema) = tenant.map(tenant_schema_name) {
+            let stmt = format!("set local search_path to {}", quote_ident(&schema));
+            sqlx::query(&stmt).execute(&mut *tx).await?;
+        } else {
+            let stmt = format!(
+                "set local search_path to {}",
+                quote_ident(&self.config.schema)
+            );
+            sqlx::query(&stmt).execute(&mut *tx).await?;
+        }
+        self.persist_checkpoint(&mut tx, name, seq).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     #[instrument(skip_all, fields(projection = %name))]
-    pub async fn rebuild(&self, name: &str) -> Result<()> {
+    pub async fn rebuild(&self, name: &str, tenant: Option<&str>) -> Result<()> {
         let mut tx = self.pool.begin().await?;
+        if let Some(schema) = tenant.map(tenant_schema_name) {
+            let stmt = format!("set local search_path to {}", quote_ident(&schema));
+            sqlx::query(&stmt).execute(&mut *tx).await?;
+        } else {
+            let stmt = format!(
+                "set local search_path to {}",
+                quote_ident(&self.config.schema)
+            );
+            sqlx::query(&stmt).execute(&mut *tx).await?;
+        }
         self.persist_checkpoint(&mut tx, name, 0).await?;
         sqlx::query("delete from projection_dlq where name = $1")
             .bind(name)
@@ -586,6 +709,17 @@ pub struct ProjectionDaemonBuilder {
 impl ProjectionDaemonBuilder {
     pub fn schema(mut self, schema: impl Into<String>) -> Self {
         self.config.schema = schema.into();
+        self
+    }
+    pub fn tenant_strategy(mut self, strategy: TenantStrategy) -> Self {
+        self.config.tenant_strategy = strategy;
+        self
+    }
+    pub fn tenant_resolver<F>(mut self, resolver: F) -> Self
+    where
+        F: Fn() -> Option<String> + Send + Sync + 'static,
+    {
+        self.config.tenant_resolver = Some(Arc::new(resolver));
         self
     }
     pub fn batch_size(mut self, size: i64) -> Self {

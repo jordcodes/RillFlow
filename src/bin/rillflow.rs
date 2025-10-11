@@ -182,33 +182,87 @@ enum Commands {
 #[derive(Subcommand, Debug)]
 enum ProjectionsCmd {
     /// List projections and their status
-    List,
+    List {
+        #[arg(long)]
+        tenant: Option<String>,
+        #[arg(long, default_value_t = false)]
+        all_tenants: bool,
+    },
     /// Show status of a single projection
-    Status { name: String },
+    Status {
+        name: String,
+        #[arg(long)]
+        tenant: Option<String>,
+    },
     /// Pause a projection
-    Pause { name: String },
+    Pause {
+        name: String,
+        #[arg(long)]
+        tenant: Option<String>,
+    },
     /// Resume a projection
-    Resume { name: String },
+    Resume {
+        name: String,
+        #[arg(long)]
+        tenant: Option<String>,
+    },
     /// Reset checkpoint to a specific sequence
-    ResetCheckpoint { name: String, seq: i64 },
+    ResetCheckpoint {
+        name: String,
+        seq: i64,
+        #[arg(long)]
+        tenant: Option<String>,
+    },
     /// Rebuild (reset to 0 and clear DLQ)
-    Rebuild { name: String },
+    Rebuild {
+        name: String,
+        #[arg(long)]
+        tenant: Option<String>,
+    },
     /// Run a single processing tick for one projection (by name) or all registered if omitted
-    RunOnce { name: Option<String> },
+    RunOnce {
+        name: Option<String>,
+        #[arg(long)]
+        tenant: Option<String>,
+        #[arg(long, default_value_t = false)]
+        all_tenants: bool,
+    },
     /// Run until idle (no projection has work)
-    RunUntilIdle { name: Option<String> },
+    RunUntilIdle {
+        name: Option<String>,
+        #[arg(long)]
+        tenant: Option<String>,
+        #[arg(long, default_value_t = false)]
+        all_tenants: bool,
+    },
     /// Dead Letter Queue: list recent failures
     DlqList {
         name: String,
         #[arg(long, default_value_t = 50)]
         limit: i64,
+        #[arg(long)]
+        tenant: Option<String>,
     },
     /// Dead Letter Queue: requeue one item by id (sets checkpoint to id's seq - 1)
-    DlqRequeue { name: String, id: i64 },
+    DlqRequeue {
+        name: String,
+        id: i64,
+        #[arg(long)]
+        tenant: Option<String>,
+    },
     /// Dead Letter Queue: delete one item by id
-    DlqDelete { name: String, id: i64 },
+    DlqDelete {
+        name: String,
+        id: i64,
+        #[arg(long)]
+        tenant: Option<String>,
+    },
     /// Show basic metrics (lag, last_seq, dlq)
-    Metrics { name: String },
+    Metrics {
+        name: String,
+        #[arg(long)]
+        tenant: Option<String>,
+    },
     /// Run long-lived projection loop
     RunLoop {
         /// Use LISTEN/NOTIFY to wake immediately on new events
@@ -217,6 +271,10 @@ enum ProjectionsCmd {
         /// Optional health HTTP bind, e.g. 0.0.0.0:8080
         #[arg(long)]
         health_bind: Option<String>,
+        #[arg(long)]
+        tenant: Option<String>,
+        #[arg(long, default_value_t = false)]
+        all_tenants: bool,
     },
 }
 
@@ -231,17 +289,41 @@ enum SubscriptionsCmd {
         stream_id: Vec<String>,
         #[arg(long, default_value_t = 0)]
         start_from: i64,
+        #[arg(long)]
+        tenant: Option<String>,
     },
     /// List subscriptions and checkpoints
-    List,
+    List {
+        #[arg(long)]
+        tenant: Option<String>,
+        #[arg(long, default_value_t = false)]
+        all_tenants: bool,
+    },
     /// Show a subscription status
-    Status { name: String },
+    Status {
+        name: String,
+        #[arg(long)]
+        tenant: Option<String>,
+    },
     /// Pause a subscription
-    Pause { name: String },
+    Pause {
+        name: String,
+        #[arg(long)]
+        tenant: Option<String>,
+    },
     /// Resume a subscription
-    Resume { name: String },
+    Resume {
+        name: String,
+        #[arg(long)]
+        tenant: Option<String>,
+    },
     /// Reset checkpoint to a specific sequence
-    Reset { name: String, seq: i64 },
+    Reset {
+        name: String,
+        seq: i64,
+        #[arg(long)]
+        tenant: Option<String>,
+    },
     /// Tail a subscription (prints incoming events)
     Tail {
         name: String,
@@ -253,16 +335,29 @@ enum SubscriptionsCmd {
         /// Optional max in-flight items to bound per-batch delivery
         #[arg(long)]
         max_in_flight: Option<usize>,
+        #[arg(long)]
+        tenant: Option<String>,
     },
     /// Group admin: list groups for a subscription
-    Groups { name: String },
+    Groups {
+        name: String,
+        #[arg(long)]
+        tenant: Option<String>,
+    },
     /// Group admin: show a group status (checkpoint and lease)
-    GroupStatus { name: String, group: String },
+    GroupStatus {
+        name: String,
+        group: String,
+        #[arg(long)]
+        tenant: Option<String>,
+    },
     /// Set or unset max in-flight per group
     SetGroupMaxInFlight {
         name: String,
         group: String,
         value: Option<i32>,
+        #[arg(long)]
+        tenant: Option<String>,
     },
 }
 
@@ -275,11 +370,23 @@ enum StreamsCmd {
 #[derive(Subcommand, Debug)]
 enum DocsCmd {
     /// Get a document by id
-    Get { id: String },
+    Get {
+        id: String,
+        #[arg(long)]
+        tenant: Option<String>,
+    },
     /// Soft-delete a document (sets deleted_at)
-    SoftDelete { id: String },
+    SoftDelete {
+        id: String,
+        #[arg(long)]
+        tenant: Option<String>,
+    },
     /// Restore a soft-deleted document (clears deleted_at)
-    Restore { id: String },
+    Restore {
+        id: String,
+        #[arg(long)]
+        tenant: Option<String>,
+    },
     /// Index advisor: prints suggested DDL for common patterns
     IndexAdvisor {
         /// Suggest GIN index on full doc (useful default)
@@ -288,6 +395,8 @@ enum DocsCmd {
         /// Suggest expression indexes for specific fields (repeatable)
         #[arg(long = "field", action = ArgAction::Append)]
         fields: Vec<String>,
+        #[arg(long)]
+        tenant: Option<String>,
     },
 }
 
@@ -299,6 +408,10 @@ enum SnapshotsCmd {
         threshold: i32,
         #[arg(long, default_value_t = 100)]
         batch: i64,
+        #[arg(long)]
+        tenant: Option<String>,
+        #[arg(long, default_value_t = false)]
+        all_tenants: bool,
     },
     /// Repeatedly compact until no more streams exceed the threshold
     RunUntilIdle {
@@ -306,11 +419,17 @@ enum SnapshotsCmd {
         threshold: i32,
         #[arg(long, default_value_t = 100)]
         batch: i64,
+        #[arg(long)]
+        tenant: Option<String>,
+        #[arg(long, default_value_t = false)]
+        all_tenants: bool,
     },
     /// Show snapshotter metrics (candidate streams and max gap)
     Metrics {
         #[arg(long, default_value_t = 100)]
         threshold: i32,
+        #[arg(long)]
+        tenant: Option<String>,
     },
 }
 
@@ -379,6 +498,11 @@ async fn main() -> rillflow::Result<()> {
     let store = builder.build().await?;
     let mgr = store.schema();
 
+    let tenant_args = TenantArgs {
+        strategy: store.tenant_strategy(),
+        resolver: store.tenant_resolver().cloned(),
+    };
+
     match cli.command {
         Commands::SchemaPlan => {
             let plan = mgr.plan(&config).await?;
@@ -394,11 +518,33 @@ async fn main() -> rillflow::Result<()> {
             }
         }
         Commands::Projections(cmd) => {
-            let daemon =
-                ProjectionDaemon::new(store.pool().clone(), ProjectionWorkerConfig::default());
+            let daemon = tenant_args.projection_daemon(store.pool().clone());
             match cmd {
-                ProjectionsCmd::List => {
-                    let list = daemon.list().await?;
+                ProjectionsCmd::List {
+                    tenant,
+                    all_tenants,
+                } => {
+                    let list = tenant_args
+                        .with_selection(tenant, all_tenants, |sel| async {
+                            let mut rows = Vec::new();
+                            for ctx in sel {
+                                rows.extend(
+                                    daemon
+                                        .list(ctx.tenant_label.as_deref())
+                                        .await?
+                                        .into_iter()
+                                        .map(move |mut s| {
+                                            if let Some(label) = &ctx.tenant_label {
+                                                s.name = format!("{}@{}", s.name, label);
+                                            }
+                                            Ok(s)
+                                        })
+                                        .collect::<Result<Vec<_>>>()?,
+                                );
+                            }
+                            Ok(rows)
+                        })
+                        .await?;
                     for s in list {
                         println!(
                             "{}  last_seq={}  paused={}  leased_by={:?}  lease_until={:?}  backoff_until={:?}  dlq_count={}",
@@ -412,8 +558,9 @@ async fn main() -> rillflow::Result<()> {
                         );
                     }
                 }
-                ProjectionsCmd::Status { name } => {
-                    let s = daemon.status(&name).await?;
+                ProjectionsCmd::Status { name, tenant } => {
+                    let (ctx, name) = tenant_args.select_single(tenant.as_deref(), &name)?;
+                    let s = daemon.status(&name, ctx.tenant_label.as_deref()).await?;
                     println!(
                         "{}  last_seq={}  paused={}  leased_by={:?}  lease_until={:?}  backoff_until={:?}  dlq_count={}",
                         s.name,
@@ -425,50 +572,93 @@ async fn main() -> rillflow::Result<()> {
                         s.dlq_count
                     );
                 }
-                ProjectionsCmd::Pause { name } => {
-                    daemon.pause(&name).await?;
+                ProjectionsCmd::Pause { name, tenant } => {
+                    let (ctx, name) = tenant_args.select_single(tenant.as_deref(), &name)?;
+                    daemon.pause(&name, ctx.tenant_label.as_deref()).await?;
                     println!("paused {}", { name });
                 }
-                ProjectionsCmd::Resume { name } => {
-                    daemon.resume(&name).await?;
+                ProjectionsCmd::Resume { name, tenant } => {
+                    let (ctx, name) = tenant_args.select_single(tenant.as_deref(), &name)?;
+                    daemon.resume(&name, ctx.tenant_label.as_deref()).await?;
                     println!("resumed {}", { name });
                 }
-                ProjectionsCmd::ResetCheckpoint { name, seq } => {
-                    daemon.reset_checkpoint(&name, seq).await?;
+                ProjectionsCmd::ResetCheckpoint { name, seq, tenant } => {
+                    let (ctx, name) = tenant_args.select_single(tenant.as_deref(), &name)?;
+                    daemon
+                        .reset_checkpoint(&name, seq, ctx.tenant_label.as_deref())
+                        .await?;
                     println!("reset {} to {}", name, seq);
                 }
-                ProjectionsCmd::Rebuild { name } => {
-                    daemon.rebuild(&name).await?;
+                ProjectionsCmd::Rebuild { name, tenant } => {
+                    let (ctx, name) = tenant_args.select_single(tenant.as_deref(), &name)?;
+                    daemon.rebuild(&name, ctx.tenant_label.as_deref()).await?;
                     println!("rebuild scheduled for {}", name);
                 }
-                ProjectionsCmd::RunOnce { name } => {
-                    if let Some(n) = name {
-                        let res = daemon.tick_once(&n).await?;
-                        println!("{}: {:?}", n, res);
-                    } else {
-                        daemon.tick_all_once().await?;
-                        println!("tick-all executed");
-                    }
-                }
-                ProjectionsCmd::RunUntilIdle { name } => {
-                    if let Some(n) = name {
-                        // run only this projection until idle
-                        loop {
-                            let res = daemon.tick_once(&n).await?;
-                            match res {
-                                rillflow::projection_runtime::TickResult::Processed { count }
-                                    if count > 0 => {}
-                                _ => break,
+                ProjectionsCmd::RunOnce {
+                    name,
+                    tenant,
+                    all_tenants,
+                } => {
+                    tenant_args
+                        .with_selection(tenant, all_tenants, |sel| async {
+                            if let Some(name) = name.clone() {
+                                for ctx in sel {
+                                    let res = daemon
+                                        .tick_once(&name, ctx.tenant_label.as_deref())
+                                        .await?;
+                                    println!("{}{}: {:?}", name, ctx.tenant_suffix(), res);
+                                }
+                            } else {
+                                for ctx in sel {
+                                    daemon.tick_all_once(ctx.tenant_label.as_deref()).await?;
+                                }
+                                println!("tick-all executed");
                             }
-                        }
-                        println!("{}: idle", n);
-                    } else {
-                        daemon.run_until_idle().await?;
-                        println!("all projections idle");
-                    }
+                            Ok(())
+                        })
+                        .await?;
                 }
-                ProjectionsCmd::DlqList { name, limit } => {
-                    let items = daemon.dlq_list(&name, limit).await?;
+                ProjectionsCmd::RunUntilIdle {
+                    name,
+                    tenant,
+                    all_tenants,
+                } => {
+                    tenant_args
+                        .with_selection(tenant, all_tenants, |sel| async {
+                            if let Some(n) = name.clone() {
+                                for ctx in sel {
+                                    loop {
+                                        let res = daemon
+                                            .tick_once(&n, ctx.tenant_label.as_deref())
+                                            .await?;
+                                        match res {
+                                            rillflow::projection_runtime::TickResult::Processed {
+                                                count,
+                                            } if count > 0 => {}
+                                            _ => break,
+                                        }
+                                    }
+                                    println!("{}{}: idle", n, ctx.tenant_suffix());
+                                }
+                            } else {
+                                for ctx in sel {
+                                    daemon.run_until_idle(ctx.tenant_label.as_deref()).await?;
+                                }
+                                println!("all projections idle");
+                            }
+                            Ok(())
+                        })
+                        .await?;
+                }
+                ProjectionsCmd::DlqList {
+                    name,
+                    limit,
+                    tenant,
+                } => {
+                    let (ctx, name) = tenant_args.select_single(tenant.as_deref(), &name)?;
+                    let items = daemon
+                        .dlq_list(&name, limit, ctx.tenant_label.as_deref())
+                        .await?;
                     for i in items {
                         println!(
                             "id={} seq={} type={} failed_at={} error={}",
@@ -476,16 +666,23 @@ async fn main() -> rillflow::Result<()> {
                         );
                     }
                 }
-                ProjectionsCmd::DlqRequeue { name, id } => {
-                    daemon.dlq_requeue(&name, id).await?;
+                ProjectionsCmd::DlqRequeue { name, id, tenant } => {
+                    let (ctx, name) = tenant_args.select_single(tenant.as_deref(), &name)?;
+                    daemon
+                        .dlq_requeue(&name, id, ctx.tenant_label.as_deref())
+                        .await?;
                     println!("requeued {}:{}", name, id);
                 }
-                ProjectionsCmd::DlqDelete { name, id } => {
-                    daemon.dlq_delete(&name, id).await?;
+                ProjectionsCmd::DlqDelete { name, id, tenant } => {
+                    let (ctx, name) = tenant_args.select_single(tenant.as_deref(), &name)?;
+                    daemon
+                        .dlq_delete(&name, id, ctx.tenant_label.as_deref())
+                        .await?;
                     println!("deleted {}:{}", name, id);
                 }
-                ProjectionsCmd::Metrics { name } => {
-                    let m = daemon.metrics(&name).await?;
+                ProjectionsCmd::Metrics { name, tenant } => {
+                    let (ctx, name) = tenant_args.select_single(tenant.as_deref(), &name)?;
+                    let m = daemon.metrics(&name, ctx.tenant_label.as_deref()).await?;
                     println!(
                         "{} last_seq={} head_seq={} lag={} dlq_count={}",
                         m.name, m.last_seq, m.head_seq, m.lag, m.dlq_count
@@ -494,35 +691,49 @@ async fn main() -> rillflow::Result<()> {
                 ProjectionsCmd::RunLoop {
                     use_notify,
                     health_bind,
+                    tenant,
+                    all_tenants,
                 } => {
-                    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let stop2 = stop.clone();
-                    tokio::spawn(async move {
-                        let _ = tokio::signal::ctrl_c().await;
-                        stop2.store(true, std::sync::atomic::Ordering::Relaxed);
-                    });
+                    tenant_args
+                        .with_selection(tenant, all_tenants, |sel| async move {
+                            for ctx in sel {
+                                let stop =
+                                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                let stop2 = stop.clone();
+                                tokio::spawn(async move {
+                                    let _ = tokio::signal::ctrl_c().await;
+                                    stop2.store(true, std::sync::atomic::Ordering::Relaxed);
+                                });
 
-                    if let Some(addr) = health_bind {
-                        let stop_health = stop.clone();
-                        tokio::spawn(async move {
-                            if let Err(err) = serve_health(addr, stop_health).await {
-                                eprintln!("health server error: {err}");
+                                if let Some(addr) = &health_bind {
+                                    let stop_health = stop.clone();
+                                    let addr = addr.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(err) = serve_health(addr, stop_health).await {
+                                            eprintln!("health server error: {err}");
+                                        }
+                                    });
+                                }
+
+                                daemon
+                                    .run_loop(use_notify, stop, ctx.tenant_label.as_deref())
+                                    .await?;
                             }
-                        });
-                    }
-
-                    daemon.run_loop(use_notify, stop).await?;
+                            Ok(())
+                        })
+                        .await?;
                 }
             }
         }
         Commands::Subscriptions(cmd) => {
-            let subs = Subscriptions::new(store.pool().clone());
+            let subs = tenant_args.subscriptions(store.pool().clone());
             match cmd {
                 SubscriptionsCmd::Create {
                     name,
                     event_type,
                     stream_id,
                     start_from,
+                    tenant,
                 } => {
                     let ids: Vec<Uuid> = stream_id
                         .into_iter()
@@ -540,7 +751,10 @@ async fn main() -> rillflow::Result<()> {
                     subs.create_or_update(&name, &filter, start_from).await?;
                     println!("subscription '{}' upserted (from={})", name, start_from);
                 }
-                SubscriptionsCmd::List => {
+                SubscriptionsCmd::List {
+                    tenant,
+                    all_tenants,
+                } => {
                     let rows = sqlx::query(
                         "select name, last_seq, paused, backoff_until, filter from subscriptions order by name",
                     )
@@ -561,7 +775,7 @@ async fn main() -> rillflow::Result<()> {
                         );
                     }
                 }
-                SubscriptionsCmd::Status { name } => {
+                SubscriptionsCmd::Status { name, tenant } => {
                     let r = sqlx::query(
                         "select name, last_seq, paused, backoff_until, filter from subscriptions where name = $1",
                     )
@@ -584,7 +798,7 @@ async fn main() -> rillflow::Result<()> {
                         println!("subscription '{}' not found", name);
                     }
                 }
-                SubscriptionsCmd::Pause { name } => {
+                SubscriptionsCmd::Pause { name, tenant } => {
                     sqlx::query(
                         "insert into subscriptions(name, paused) values($1,true) on conflict (name) do update set paused=true, updated_at=now()",
                     )
@@ -593,7 +807,7 @@ async fn main() -> rillflow::Result<()> {
                     .await?;
                     println!("paused {}", name);
                 }
-                SubscriptionsCmd::Resume { name } => {
+                SubscriptionsCmd::Resume { name, tenant } => {
                     sqlx::query(
                         "update subscriptions set paused=false, backoff_until=null, updated_at=now() where name=$1",
                     )
@@ -602,7 +816,7 @@ async fn main() -> rillflow::Result<()> {
                     .await?;
                     println!("resumed {}", name);
                 }
-                SubscriptionsCmd::Reset { name, seq } => {
+                SubscriptionsCmd::Reset { name, seq, tenant } => {
                     sqlx::query(
                         "update subscriptions set last_seq=$2, updated_at=now() where name=$1",
                     )
@@ -617,6 +831,7 @@ async fn main() -> rillflow::Result<()> {
                     limit,
                     group,
                     max_in_flight,
+                    tenant,
                 } => {
                     // load filter
                     let rec =
@@ -645,7 +860,7 @@ async fn main() -> rillflow::Result<()> {
                         }
                     }
                 }
-                SubscriptionsCmd::Groups { name } => {
+                SubscriptionsCmd::Groups { name, tenant } => {
                     let rows = sqlx::query(
                         "select g.grp, g.last_seq, coalesce(h.head, 0) as head
                            from subscription_groups g
@@ -669,7 +884,11 @@ async fn main() -> rillflow::Result<()> {
                         );
                     }
                 }
-                SubscriptionsCmd::GroupStatus { name, group } => {
+                SubscriptionsCmd::GroupStatus {
+                    name,
+                    group,
+                    tenant,
+                } => {
                     let last_seq: i64 = sqlx::query_scalar(
                         "select last_seq from subscription_groups where name=$1 and grp=$2",
                     )
@@ -702,7 +921,12 @@ async fn main() -> rillflow::Result<()> {
                         name, group, last_seq, head, lag, leased_by, lease_until
                     );
                 }
-                SubscriptionsCmd::SetGroupMaxInFlight { name, group, value } => {
+                SubscriptionsCmd::SetGroupMaxInFlight {
+                    name,
+                    group,
+                    value,
+                    tenant,
+                } => {
                     if let Some(v) = value {
                         sqlx::query(
                             "insert into subscription_groups(name, grp, max_in_flight) values($1,$2,$3)
@@ -734,7 +958,7 @@ async fn main() -> rillflow::Result<()> {
             }
         },
         Commands::Docs(cmd) => match cmd {
-            DocsCmd::Get { id } => {
+            DocsCmd::Get { id, tenant } => {
                 let id = Uuid::parse_str(&id)?;
                 let doc = store.docs().get::<JsonValue>(&id).await?;
                 match doc {
@@ -742,7 +966,7 @@ async fn main() -> rillflow::Result<()> {
                     None => println!("not found"),
                 }
             }
-            DocsCmd::SoftDelete { id } => {
+            DocsCmd::SoftDelete { id, tenant } => {
                 let id = Uuid::parse_str(&id)?;
                 sqlx::query("update docs set deleted_at = now() where id = $1")
                     .bind(id)
@@ -750,7 +974,7 @@ async fn main() -> rillflow::Result<()> {
                     .await?;
                 println!("soft-deleted {}", id);
             }
-            DocsCmd::Restore { id } => {
+            DocsCmd::Restore { id, tenant } => {
                 let id = Uuid::parse_str(&id)?;
                 sqlx::query("update docs set deleted_at = null where id = $1")
                     .bind(id)
@@ -758,7 +982,11 @@ async fn main() -> rillflow::Result<()> {
                     .await?;
                 println!("restored {}", id);
             }
-            DocsCmd::IndexAdvisor { gin, fields } => {
+            DocsCmd::IndexAdvisor {
+                gin,
+                fields,
+                tenant,
+            } => {
                 if gin {
                     println!(
                         "-- full-doc GIN (skip if already applied)\ncreate index if not exists docs_gin on {} using gin (doc);",
@@ -778,11 +1006,21 @@ async fn main() -> rillflow::Result<()> {
             }
         },
         Commands::Snapshots(cmd) => match cmd {
-            SnapshotsCmd::CompactOnce { threshold, batch } => {
+            SnapshotsCmd::CompactOnce {
+                threshold,
+                batch,
+                tenant,
+                all_tenants,
+            } => {
                 let n = compact_snapshots_once(store.pool(), &cli.schema, threshold, batch).await?;
                 println!("compacted {} stream(s)", n);
             }
-            SnapshotsCmd::RunUntilIdle { threshold, batch } => {
+            SnapshotsCmd::RunUntilIdle {
+                threshold,
+                batch,
+                tenant,
+                all_tenants,
+            } => {
                 let mut total = 0u64;
                 loop {
                     let n =
@@ -794,7 +1032,7 @@ async fn main() -> rillflow::Result<()> {
                 }
                 println!("compacted total {} stream(s)", total);
             }
-            SnapshotsCmd::Metrics { threshold } => {
+            SnapshotsCmd::Metrics { threshold, tenant } => {
                 let candidates: i64 = sqlx::query_scalar(
                     r#"
                      select count(1) from (
