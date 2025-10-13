@@ -162,6 +162,13 @@ enum Commands {
     /// Apply DDL changes (create schemas/tables/indexes as needed)
     SchemaSync,
 
+    /// Roll back core schema (apply sql/0001_init.down.sql) for the selected schema
+    SchemaDown {
+        /// Required to execute destructive rollback
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Projection admin commands
     #[command(subcommand)]
     Projections(ProjectionsCmd),
@@ -559,6 +566,34 @@ async fn main() -> rillflow::Result<()> {
                 println!("Applied changes:");
                 print_plan(&plan);
             }
+        }
+        Commands::SchemaDown { force } => {
+            if !force {
+                eprintln!(
+                    "This will DROP objects in schema '{}'. Re-run with --force to proceed.",
+                    &config.base_schema
+                );
+                std::process::exit(3);
+            }
+            let path = "sql/0001_init.down.sql";
+            let ddl = std::fs::read_to_string(path).map_err(|e| rillflow::Error::Context {
+                context: format!("failed to read {}", path),
+                source: Box::new(e.into()),
+            })?;
+            let mut tx = store.pool().begin().await?;
+            let set_search_path = format!(
+                "set local search_path to {}",
+                quote_ident(&config.base_schema)
+            );
+            sqlx::query(&set_search_path).execute(&mut *tx).await?;
+            for stmt in split_sql_dollar_safe(&ddl) {
+                sqlx::query(stmt).execute(&mut *tx).await?;
+            }
+            tx.commit().await?;
+            println!(
+                "Rolled back core schema objects in schema '{}'.",
+                &config.base_schema
+            );
         }
         Commands::Projections(cmd) => {
             let daemon = tenant_helper.projection_daemon(store.pool().clone());
@@ -1404,6 +1439,36 @@ async fn compact_snapshots_once(
 fn quote_ident(value: &str) -> String {
     let escaped = value.replace('"', "\"\"");
     format!("\"{}\"", escaped)
+}
+
+fn split_sql_dollar_safe(input: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let bytes = input.as_bytes();
+    let mut in_dollar = false;
+    while i < bytes.len() {
+        if !in_dollar && bytes[i] == b';' {
+            let stmt = input[start..i].trim();
+            if !stmt.is_empty() {
+                parts.push(stmt);
+            }
+            i += 1;
+            start = i;
+            continue;
+        }
+        if i + 1 < bytes.len() && bytes[i] == b'$' && bytes[i + 1] == b'$' {
+            in_dollar = !in_dollar;
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    let tail = input[start..].trim();
+    if !tail.is_empty() {
+        parts.push(tail);
+    }
+    parts
 }
 
 #[derive(Clone)]
