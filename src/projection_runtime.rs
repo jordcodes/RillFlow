@@ -192,6 +192,7 @@ impl ProjectionDaemon {
 
         let mut new_last = last_seq;
         let mut processed: usize = 0;
+        let batch_apply_start = std::time::Instant::now();
         for (seq, typ, body) in rows {
             // apply within the same transaction to keep read model + checkpoint atomic
             if let Err(err) = reg.handler.apply(&typ, &body, &mut tx).await {
@@ -215,11 +216,14 @@ impl ProjectionDaemon {
         tx.commit().await?;
         self.refresh_lease(name).await?;
 
+        let batch_elapsed = batch_apply_start.elapsed();
         info!(
             processed = processed,
             last_seq = new_last,
+            elapsed_ms = batch_elapsed.as_millis() as u64,
             "tick processed batch"
         );
+        crate::metrics::record_projection_batch(name, processed as u64, batch_elapsed);
         Ok(TickResult::Processed {
             count: processed as u32,
         })

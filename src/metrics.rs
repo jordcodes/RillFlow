@@ -55,6 +55,7 @@ static METRICS: OnceLock<Metrics> = OnceLock::new();
 static TENANT_METRICS: OnceLock<Mutex<HashMap<String, TenantCounters>>> = OnceLock::new();
 static QUERY_DURATIONS: OnceLock<Mutex<HashMap<String, (u64, u64)>>> = OnceLock::new();
 static SLOW_QUERY_THRESHOLD_MS: OnceLock<std::sync::atomic::AtomicU64> = OnceLock::new();
+static PROJECTION_STATS: OnceLock<Mutex<HashMap<String, (u64, u64, u64)>>> = OnceLock::new();
 
 #[derive(Default, Clone)]
 struct TenantCounters {
@@ -367,6 +368,23 @@ pub fn render_prometheus() -> String {
             );
         }
     }
+
+    // projection stats: total events and batch durations
+    if let Ok(map) = PROJECTION_STATS.get_or_init(Default::default).lock() {
+        for (name, (events_total, batch_count, batch_sum_ms)) in map.iter() {
+            let escaped = escape_label(name);
+            let _ = writeln!(
+                s,
+                "# TYPE projection_events_total counter\nprojection_events_total{{name=\"{}\"}} {}",
+                escaped, events_total
+            );
+            let _ = writeln!(
+                s,
+                "# TYPE projection_batch_duration_ms summary\nprojection_batch_duration_ms_count{{name=\"{}\"}} {}\nprojection_batch_duration_ms_sum{{name=\"{}\"}} {}",
+                escaped, batch_count, escaped, batch_sum_ms
+            );
+        }
+    }
     s
 }
 
@@ -389,4 +407,13 @@ pub fn set_slow_query_threshold(threshold: Duration) {
 pub fn slow_query_threshold() -> Duration {
     let atom = SLOW_QUERY_THRESHOLD_MS.get_or_init(|| std::sync::atomic::AtomicU64::new(500));
     Duration::from_millis(atom.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+pub fn record_projection_batch(name: &str, events_processed: u64, dur: Duration) {
+    if let Ok(mut map) = PROJECTION_STATS.get_or_init(Default::default).lock() {
+        let entry = map.entry(name.to_string()).or_insert((0, 0, 0));
+        entry.0 = entry.0.saturating_add(events_processed);
+        entry.1 = entry.1.saturating_add(1);
+        entry.2 = entry.2.saturating_add(dur.as_millis() as u64);
+    }
 }

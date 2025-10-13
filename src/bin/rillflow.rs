@@ -384,6 +384,16 @@ enum DocsCmd {
         #[arg(long)]
         tenant: Option<String>,
     },
+    /// EXPLAIN/ANALYZE an ad-hoc SQL (against docs table) for troubleshooting
+    ExplainSql {
+        /// Raw SQL to EXPLAIN (must be a SELECT)
+        sql: String,
+        /// Use EXPLAIN ANALYZE (executes query)
+        #[arg(long, default_value_t = false)]
+        analyze: bool,
+        #[arg(long)]
+        tenant: Option<String>,
+    },
     /// Soft-delete a document (sets deleted_at)
     SoftDelete {
         id: String,
@@ -516,7 +526,9 @@ async fn main() -> rillflow::Result<()> {
         builder = builder.tenant_strategy(TenantStrategy::SchemaPerTenant);
     }
     let store = builder.build().await?;
-    rillflow::metrics::set_slow_query_threshold(std::time::Duration::from_millis(cli.slow_query_ms));
+    rillflow::metrics::set_slow_query_threshold(std::time::Duration::from_millis(
+        cli.slow_query_ms,
+    ));
     let mgr = store.schema();
 
     let tenant_helper = TenantHelper::new(
@@ -1036,6 +1048,30 @@ async fn main() -> rillflow::Result<()> {
                         quote_ident(&cli.schema),
                         f
                     );
+                }
+            }
+            DocsCmd::ExplainSql {
+                sql,
+                analyze,
+                tenant,
+            } => {
+                let mut conn = store.pool().acquire().await?;
+                if let Some(t) = tenant.as_deref() {
+                    let stmt = format!(
+                        "set search_path to {}, public",
+                        rillflow::schema::quote_ident(&rillflow::store::tenant_schema_name(t))
+                    );
+                    sqlx::query(&stmt).execute(&mut *conn).await?;
+                }
+                let explained = if analyze {
+                    format!("EXPLAIN (ANALYZE, BUFFERS, VERBOSE, FORMAT TEXT) {}", sql)
+                } else {
+                    format!("EXPLAIN (VERBOSE, FORMAT TEXT) {}", sql)
+                };
+                let rows: Vec<String> =
+                    sqlx::query_scalar(&explained).fetch_all(&mut *conn).await?;
+                for line in rows {
+                    println!("{}", line);
                 }
             }
         },
