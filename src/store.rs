@@ -275,6 +275,10 @@ impl Store {
         )
     }
 
+    pub fn batch(&self) -> crate::batch::BatchWriter {
+        crate::batch::BatchWriter::new(self.pool.clone())
+    }
+
     pub fn subscriptions(&self) -> Subscriptions {
         Subscriptions::new_with_strategy(
             self.pool.clone(),
