@@ -5,6 +5,7 @@ pub mod context;
 pub mod documents;
 mod error;
 pub mod events;
+pub mod live;
 pub mod metrics;
 pub mod projection_runtime;
 pub mod projections;

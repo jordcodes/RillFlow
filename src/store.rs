@@ -263,6 +263,10 @@ impl Store {
         }
     }
 
+    pub fn live(&self) -> crate::live::Live {
+        crate::live::Live::new(self.pool.clone())
+    }
+
     pub fn projections(&self) -> Projections {
         Projections::new(
             self.pool.clone(),
