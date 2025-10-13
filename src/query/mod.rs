@@ -1100,6 +1100,18 @@ where
         // slow query logging
         if start.elapsed() > crate::metrics::slow_query_threshold() {
             tracing::warn!(target: "rillflow::slow_query", elapsed_ms = start.elapsed().as_millis() as u64, sql = %sql_captured, "slow document query");
+            if crate::metrics::slow_query_explain_enabled() {
+                // Best-effort EXPLAIN (without executing)
+                let explain = format!("EXPLAIN (VERBOSE, FORMAT TEXT) {}", sql_captured);
+                let rows = sqlx::query_scalar::<_, String>(&explain)
+                    .fetch_all(&pool)
+                    .await;
+                if let Ok(lines) = rows {
+                    for line in lines {
+                        tracing::warn!(target: "rillflow::slow_query", plan = %line);
+                    }
+                }
+            }
         }
         rows.into_iter()
             .map(|(value,)| serde_json::from_value(value).map_err(Into::into))
@@ -1115,6 +1127,17 @@ where
         crate::metrics::record_query_duration("docs_fetch_optional", start.elapsed());
         if start.elapsed() > crate::metrics::slow_query_threshold() {
             tracing::warn!(target: "rillflow::slow_query", elapsed_ms = start.elapsed().as_millis() as u64, sql = %sql_captured, "slow document query");
+            if crate::metrics::slow_query_explain_enabled() {
+                let explain = format!("EXPLAIN (VERBOSE, FORMAT TEXT) {}", sql_captured);
+                let rows = sqlx::query_scalar::<_, String>(&explain)
+                    .fetch_all(&pool)
+                    .await;
+                if let Ok(lines) = rows {
+                    for line in lines {
+                        tracing::warn!(target: "rillflow::slow_query", plan = %line);
+                    }
+                }
+            }
         }
         match row {
             Some((value,)) => Ok(Some(serde_json::from_value(value)?)),
@@ -1131,6 +1154,17 @@ where
         crate::metrics::record_query_duration("docs_fetch_one", start.elapsed());
         if start.elapsed() > crate::metrics::slow_query_threshold() {
             tracing::warn!(target: "rillflow::slow_query", elapsed_ms = start.elapsed().as_millis() as u64, sql = %sql_captured, "slow document query");
+            if crate::metrics::slow_query_explain_enabled() {
+                let explain = format!("EXPLAIN (VERBOSE, FORMAT TEXT) {}", sql_captured);
+                let rows = sqlx::query_scalar::<_, String>(&explain)
+                    .fetch_all(&pool)
+                    .await;
+                if let Ok(lines) = rows {
+                    for line in lines {
+                        tracing::warn!(target: "rillflow::slow_query", plan = %line);
+                    }
+                }
+            }
         }
         Ok(serde_json::from_value(value)?)
     }

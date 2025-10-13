@@ -146,6 +146,9 @@ struct Cli {
     /// Slow query logging threshold in milliseconds (default 500)
     #[arg(long, default_value_t = 500)]
     slow_query_ms: u64,
+    /// Also capture EXPLAIN (FORMAT TEXT) for slow queries
+    #[arg(long, default_value_t = false)]
+    slow_query_explain: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -534,6 +537,7 @@ async fn main() -> rillflow::Result<()> {
     rillflow::metrics::set_slow_query_threshold(std::time::Duration::from_millis(
         cli.slow_query_ms,
     ));
+    rillflow::metrics::set_slow_query_explain(cli.slow_query_explain);
     let mgr = store.schema();
 
     let tenant_helper = TenantHelper::new(

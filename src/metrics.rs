@@ -55,6 +55,7 @@ static METRICS: OnceLock<Metrics> = OnceLock::new();
 static TENANT_METRICS: OnceLock<Mutex<HashMap<String, TenantCounters>>> = OnceLock::new();
 static QUERY_DURATIONS: OnceLock<Mutex<HashMap<String, (u64, u64)>>> = OnceLock::new();
 static SLOW_QUERY_THRESHOLD_MS: OnceLock<std::sync::atomic::AtomicU64> = OnceLock::new();
+static SLOW_QUERY_EXPLAIN: OnceLock<std::sync::atomic::AtomicBool> = OnceLock::new();
 static PROJECTION_STATS: OnceLock<Mutex<HashMap<String, (u64, u64, u64)>>> = OnceLock::new();
 
 #[derive(Default, Clone)]
@@ -407,6 +408,16 @@ pub fn set_slow_query_threshold(threshold: Duration) {
 pub fn slow_query_threshold() -> Duration {
     let atom = SLOW_QUERY_THRESHOLD_MS.get_or_init(|| std::sync::atomic::AtomicU64::new(500));
     Duration::from_millis(atom.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+pub fn set_slow_query_explain(enabled: bool) {
+    let atom = SLOW_QUERY_EXPLAIN.get_or_init(|| std::sync::atomic::AtomicBool::new(false));
+    atom.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn slow_query_explain_enabled() -> bool {
+    let atom = SLOW_QUERY_EXPLAIN.get_or_init(|| std::sync::atomic::AtomicBool::new(false));
+    atom.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn record_projection_batch(name: &str, events_processed: u64, dur: Duration) {
