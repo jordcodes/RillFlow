@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 pub struct Metrics {
     // Documents
@@ -52,6 +53,7 @@ impl Default for Metrics {
 
 static METRICS: OnceLock<Metrics> = OnceLock::new();
 static TENANT_METRICS: OnceLock<Mutex<HashMap<String, TenantCounters>>> = OnceLock::new();
+static QUERY_DURATIONS: OnceLock<Mutex<HashMap<String, (u64, u64)>>> = OnceLock::new();
 
 #[derive(Default, Clone)]
 struct TenantCounters {
@@ -352,5 +354,25 @@ pub fn render_prometheus() -> String {
         &tenants,
         |c| c.pool_idle_gauge,
     );
+
+    // query durations as summary: per operation name
+    if let Ok(map) = QUERY_DURATIONS.get_or_init(Default::default).lock() {
+        for (op, (count, sum_ms)) in map.iter() {
+            let escaped = escape_label(op);
+            let _ = writeln!(
+                s,
+                "# TYPE query_duration_ms summary\nquery_duration_ms_count{{op=\"{}\"}} {}\nquery_duration_ms_sum{{op=\"{}\"}} {}",
+                escaped, count, escaped, sum_ms
+            );
+        }
+    }
     s
+}
+
+pub fn record_query_duration(op: &str, dur: Duration) {
+    if let Ok(mut map) = QUERY_DURATIONS.get_or_init(Default::default).lock() {
+        let entry = map.entry(op.to_string()).or_insert((0, 0));
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = entry.1.saturating_add(dur.as_millis() as u64);
+    }
 }

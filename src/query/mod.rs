@@ -1092,8 +1092,15 @@ where
 {
     pub async fn fetch_all(self) -> Result<Vec<T>> {
         let (pool, mut builder) = self.build_query();
+        let sql_captured = builder.sql().to_string();
         let query = builder.build_query_as::<(Value,)>();
+        let start = std::time::Instant::now();
         let rows = query.fetch_all(&pool).await?;
+        crate::metrics::record_query_duration("docs_fetch_all", start.elapsed());
+        // slow query logging
+        if start.elapsed() > std::time::Duration::from_millis(500) {
+            tracing::warn!(target: "rillflow::slow_query", elapsed_ms = start.elapsed().as_millis() as u64, sql = %sql_captured, "slow document query");
+        }
         rows.into_iter()
             .map(|(value,)| serde_json::from_value(value).map_err(Into::into))
             .collect()
@@ -1101,8 +1108,14 @@ where
 
     pub async fn fetch_optional(self) -> Result<Option<T>> {
         let (pool, mut builder) = self.build_query();
+        let sql_captured = builder.sql().to_string();
         let query = builder.build_query_as::<(Value,)>();
+        let start = std::time::Instant::now();
         let row = query.fetch_optional(&pool).await?;
+        crate::metrics::record_query_duration("docs_fetch_optional", start.elapsed());
+        if start.elapsed() > std::time::Duration::from_millis(500) {
+            tracing::warn!(target: "rillflow::slow_query", elapsed_ms = start.elapsed().as_millis() as u64, sql = %sql_captured, "slow document query");
+        }
         match row {
             Some((value,)) => Ok(Some(serde_json::from_value(value)?)),
             None => Ok(None),
@@ -1111,8 +1124,14 @@ where
 
     pub async fn fetch_one(self) -> Result<T> {
         let (pool, mut builder) = self.build_query();
+        let sql_captured = builder.sql().to_string();
         let query = builder.build_query_as::<(Value,)>();
+        let start = std::time::Instant::now();
         let (value,) = query.fetch_one(&pool).await?;
+        crate::metrics::record_query_duration("docs_fetch_one", start.elapsed());
+        if start.elapsed() > std::time::Duration::from_millis(500) {
+            tracing::warn!(target: "rillflow::slow_query", elapsed_ms = start.elapsed().as_millis() as u64, sql = %sql_captured, "slow document query");
+        }
         Ok(serde_json::from_value(value)?)
     }
 

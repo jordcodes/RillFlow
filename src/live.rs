@@ -1,4 +1,4 @@
-use crate::{Error, Result};
+use crate::Result;
 use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::HashMap;
