@@ -43,6 +43,12 @@ pub(crate) enum Selection {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct GroupBySpec {
+    path: JsonPath,
+    source: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct FieldProjection {
     source: Option<String>,
     alias: String,
@@ -78,7 +84,7 @@ pub(crate) struct QuerySpec {
     limit: Option<i64>,
     offset: Option<i64>,
     include_deleted: bool,
-    group_by: Vec<JsonPath>,
+    group_by: Vec<GroupBySpec>,
     aggregates: Vec<AggregateSpec>,
     includes: Vec<IncludeSpec>,
 }
@@ -129,7 +135,14 @@ impl QuerySpec {
     }
 
     pub(crate) fn push_group_by(&mut self, path: JsonPath) {
-        self.group_by.push(path);
+        self.group_by.push(GroupBySpec { path, source: None });
+    }
+
+    pub(crate) fn push_group_by_from(&mut self, source: String, path: JsonPath) {
+        self.group_by.push(GroupBySpec {
+            path,
+            source: Some(source),
+        });
     }
 
     pub(crate) fn push_aggregate(&mut self, agg: AggregateSpec) {
@@ -199,14 +212,16 @@ impl QuerySpec {
                 }
             }
             Selection::Aggregates(mut aggs_sel) => {
-                // If selection holds aggregates, prefer those; otherwise fall back to spec-level.
-                let use_aggs = if aggs_sel.is_empty() {
+                // Prefer selection-held aggregates; otherwise use spec-level.
+                let use_aggs: Vec<AggregateSpec> = if aggs_sel.is_empty() {
                     aggregates
                 } else {
                     aggs_sel.drain(..).collect()
                 };
+                builder.push("jsonb_build_object(");
                 if use_aggs.is_empty() {
-                    builder.push("count(*) as count");
+                    // default to count
+                    builder.push("'count', count(*)");
                 } else {
                     let mut first = true;
                     for agg in use_aggs {
@@ -214,9 +229,51 @@ impl QuerySpec {
                             builder.push(", ");
                         }
                         first = false;
-                        agg.push_sql(&mut builder);
+                        match agg {
+                            AggregateSpec::Count { ref alias } => {
+                                builder.push_bind(alias.clone());
+                                builder.push(", count(*)");
+                            }
+                            AggregateSpec::Sum {
+                                ref path,
+                                ref alias,
+                            } => {
+                                builder.push_bind(alias.clone());
+                                builder.push(", sum((");
+                                push_text_expr(&mut builder, path);
+                                builder.push(")::numeric)");
+                            }
+                            AggregateSpec::Avg {
+                                ref path,
+                                ref alias,
+                            } => {
+                                builder.push_bind(alias.clone());
+                                builder.push(", avg((");
+                                push_text_expr(&mut builder, path);
+                                builder.push(")::numeric)");
+                            }
+                            AggregateSpec::Min {
+                                ref path,
+                                ref alias,
+                            } => {
+                                builder.push_bind(alias.clone());
+                                builder.push(", min((");
+                                push_text_expr(&mut builder, path);
+                                builder.push(")::numeric)");
+                            }
+                            AggregateSpec::Max {
+                                ref path,
+                                ref alias,
+                            } => {
+                                builder.push_bind(alias.clone());
+                                builder.push(", max((");
+                                push_text_expr(&mut builder, path);
+                                builder.push(")::numeric)");
+                            }
+                        }
                     }
                 }
+                builder.push(") as doc");
             }
         }
 
@@ -252,7 +309,11 @@ impl QuerySpec {
                     builder.push(", ");
                 }
                 first = false;
-                push_text_expr(&mut builder, &g);
+                if let Some(src) = &g.source {
+                    push_text_expr_from_source(&mut builder, src, &g.path);
+                } else {
+                    push_text_expr(&mut builder, &g.path);
+                }
             }
         }
 
@@ -456,6 +517,12 @@ impl DocumentQueryContext {
 
     pub fn group_by(&mut self, path: impl Into<JsonPath>) -> &mut Self {
         self.spec.push_group_by(path.into());
+        self
+    }
+
+    pub fn group_by_from(&mut self, source_alias: &str, path: impl Into<JsonPath>) -> &mut Self {
+        self.spec
+            .push_group_by_from(source_alias.to_string(), path.into());
         self
     }
 
