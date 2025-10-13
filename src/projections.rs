@@ -223,12 +223,18 @@ impl ViewProjection {
                 ViewAgg::Count { alias } => {
                     insert_cols.push(format!("\"{}\"", alias));
                     insert_vals.push("1".to_string());
-                    updates.push(format!("\"{alias}\" = {table}.\"{alias}\" + EXCLUDED.\"{alias}\"", table = self.table));
+                    updates.push(format!(
+                        "\"{alias}\" = {table}.\"{alias}\" + EXCLUDED.\"{alias}\"",
+                        table = self.table
+                    ));
                 }
                 ViewAgg::Sum { alias, .. } => {
                     insert_cols.push(format!("\"{}\"", alias));
                     insert_vals.push(format!("${}", idx));
-                    updates.push(format!("\"{alias}\" = {table}.\"{alias}\" + EXCLUDED.\"{alias}\"", table = self.table));
+                    updates.push(format!(
+                        "\"{alias}\" = {table}.\"{alias}\" + EXCLUDED.\"{alias}\"",
+                        table = self.table
+                    ));
                     idx += 1;
                 }
             }
@@ -319,6 +325,66 @@ pub trait MultiStreamProjection: Send + Sync {
         body: &Value,
         tx: &mut Transaction<'_, Postgres>,
     ) -> Result<()>;
+}
+
+// ---------------------
+// CustomProjection (arbitrary SQL per event type)
+
+#[derive(Clone, Debug)]
+pub struct CustomStep {
+    pub event_types: Vec<String>,
+    pub sql: String,
+    pub arg_paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CustomProjection {
+    steps: Vec<CustomStep>,
+}
+
+impl CustomProjection {
+    pub fn new() -> Self {
+        Self { steps: Vec::new() }
+    }
+
+    pub fn on(mut self, event_types: &[&str], sql: impl Into<String>) -> Self {
+        self.steps.push(CustomStep {
+            event_types: event_types.iter().map(|s| s.to_string()).collect(),
+            sql: sql.into(),
+            arg_paths: Vec::new(),
+        });
+        self
+    }
+
+    pub fn args(mut self, paths: &[&str]) -> Self {
+        if let Some(last) = self.steps.last_mut() {
+            last.arg_paths = paths.iter().map(|s| s.to_string()).collect();
+        }
+        self
+    }
+}
+
+#[async_trait]
+impl ProjectionHandler for CustomProjection {
+    async fn apply(
+        &self,
+        event_type: &str,
+        body: &Value,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> Result<()> {
+        for step in &self.steps {
+            if step.event_types.iter().any(|t| t == event_type) {
+                let mut q = sqlx::query(&step.sql);
+                for p in &step.arg_paths {
+                    // Bind as text for broad compatibility; use casts in SQL if needed
+                    let v = json_path_get_text(body, p).unwrap_or_default();
+                    q = q.bind(v);
+                }
+                q.execute(&mut **tx).await?;
+            }
+        }
+        Ok(())
+    }
 }
 
 pub struct MultiStreamAdapter<T: MultiStreamProjection>(pub Arc<T>);
