@@ -384,6 +384,11 @@ enum DocsCmd {
         #[arg(long)]
         tenant: Option<String>,
     },
+    /// Verify required indexes exist and print missing index warnings
+    Verify {
+        #[arg(long)]
+        tenant: Option<String>,
+    },
     /// EXPLAIN/ANALYZE an ad-hoc SQL (against docs table) for troubleshooting
     ExplainSql {
         /// Raw SQL to EXPLAIN (must be a SELECT)
@@ -1072,6 +1077,69 @@ async fn main() -> rillflow::Result<()> {
                     sqlx::query_scalar(&explained).fetch_all(&mut *conn).await?;
                 for line in rows {
                     println!("{}", line);
+                }
+            }
+            DocsCmd::Verify { tenant } => {
+                let mut conn = store.pool().acquire().await?;
+                if let Some(t) = tenant.as_deref() {
+                    let stmt = format!(
+                        "set search_path to {}, public",
+                        rillflow::schema::quote_ident(&rillflow::store::tenant_schema_name(t))
+                    );
+                    sqlx::query(&stmt).execute(&mut *conn).await?;
+                }
+                // Check docs table exists
+                let exists: bool = sqlx::query_scalar(
+                    "select exists (select 1 from information_schema.tables where table_name = 'docs')",
+                )
+                .fetch_one(&mut *conn)
+                .await?;
+                if !exists {
+                    println!("docs table not found in current schema");
+                    return Ok(());
+                }
+                // Check GIN on doc
+                let has_gin_doc: bool = sqlx::query_scalar(
+                    "select exists (
+                        select 1 from pg_indexes
+                        where tablename = 'docs'
+                          and indexdef ilike '% using gin %doc%'
+                    )",
+                )
+                .fetch_one(&mut *conn)
+                .await?;
+                if !has_gin_doc {
+                    println!(
+                        "missing index: create index if not exists docs_gin on docs using gin (doc);"
+                    );
+                } else {
+                    println!("ok: GIN index on docs.doc present");
+                }
+                // Check docs_fulltext column and index
+                let has_fulltext_col: bool = sqlx::query_scalar(
+                    "select exists (
+                        select 1 from information_schema.columns
+                         where table_name = 'docs' and column_name = 'docs_fulltext'
+                    )",
+                )
+                .fetch_one(&mut *conn)
+                .await?;
+                if has_fulltext_col {
+                    let has_fulltext_idx: bool = sqlx::query_scalar(
+                        "select exists (
+                            select 1 from pg_indexes
+                             where tablename = 'docs' and indexdef ilike '% using gin %docs_fulltext%'
+                        )",
+                    )
+                    .fetch_one(&mut *conn)
+                    .await?;
+                    if !has_fulltext_idx {
+                        println!(
+                            "missing index: create index if not exists docs_fulltext_idx on docs using gin (docs_fulltext);"
+                        );
+                    } else {
+                        println!("ok: GIN index on docs.docs_fulltext present");
+                    }
                 }
             }
         },
