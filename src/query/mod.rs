@@ -32,6 +32,7 @@ pub(crate) enum SortKind {
 pub(crate) struct SortSpec {
     path: JsonPath,
     kind: SortKind,
+    source: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -171,11 +172,11 @@ impl QuerySpec {
 
         match selection {
             Selection::Document => {
-                builder.push("doc");
+                builder.push("docs.doc");
             }
             Selection::Fields(fields) => {
                 if fields.is_empty() {
-                    builder.push("doc");
+                    builder.push("docs.doc");
                 } else {
                     builder.push("jsonb_build_object(");
                     let mut first = true;
@@ -188,7 +189,7 @@ impl QuerySpec {
                         builder.push(", ");
                         if let Some(src) = field.source {
                             builder.push(&src);
-                            builder.push(" #> ");
+                            builder.push(".doc #> ");
                             builder.push_bind(field.path.parts().to_vec());
                         } else {
                             push_json_expr(&mut builder, &field.path);
@@ -265,13 +266,21 @@ impl QuerySpec {
                 first = false;
                 match spec.kind {
                     SortKind::Text(direction) => {
-                        push_text_expr(&mut builder, &spec.path);
+                        if let Some(src) = &spec.source {
+                            push_text_expr_from_source(&mut builder, src, &spec.path);
+                        } else {
+                            push_text_expr(&mut builder, &spec.path);
+                        }
                         builder.push(" ");
                         builder.push(direction.as_str());
                     }
                     SortKind::Numeric(direction) => {
                         builder.push("((");
-                        push_text_expr(&mut builder, &spec.path);
+                        if let Some(src) = &spec.source {
+                            push_text_expr_from_source(&mut builder, src, &spec.path);
+                        } else {
+                            push_text_expr(&mut builder, &spec.path);
+                        }
                         builder.push(")::numeric) ");
                         builder.push(direction.as_str());
                     }
@@ -343,6 +352,7 @@ impl DocumentQueryContext {
         self.spec.push_sort(SortSpec {
             path: path.into(),
             kind: SortKind::Text(direction),
+            source: None,
         });
         self
     }
@@ -355,6 +365,35 @@ impl DocumentQueryContext {
         self.spec.push_sort(SortSpec {
             path: path.into(),
             kind: SortKind::Numeric(direction),
+            source: None,
+        });
+        self
+    }
+
+    pub fn order_by_from(
+        &mut self,
+        source_alias: &str,
+        path: impl Into<JsonPath>,
+        direction: SortDirection,
+    ) -> &mut Self {
+        self.spec.push_sort(SortSpec {
+            path: path.into(),
+            kind: SortKind::Text(direction),
+            source: Some(source_alias.to_string()),
+        });
+        self
+    }
+
+    pub fn order_by_number_from(
+        &mut self,
+        source_alias: &str,
+        path: impl Into<JsonPath>,
+        direction: SortDirection,
+    ) -> &mut Self {
+        self.spec.push_sort(SortSpec {
+            path: path.into(),
+            kind: SortKind::Numeric(direction),
+            source: Some(source_alias.to_string()),
         });
         self
     }
@@ -799,14 +838,14 @@ impl Predicate {
                     builder.push("to_tsvector(");
                     builder.push_bind(lang.clone());
                     builder.push(", ");
-                    builder.push("doc #>> ARRAY[]::text[]");
+                    builder.push("docs.doc #>> ARRAY[]::text[]");
                     builder.push(") @@ plainto_tsquery(");
                     builder.push_bind(lang.clone());
                     builder.push(", ");
                     builder.push_bind(query.clone());
                     builder.push(")");
                 } else {
-                    builder.push("docs_search @@ plainto_tsquery('english', ");
+                    builder.push("docs.docs_search @@ plainto_tsquery('english', ");
                     builder.push_bind(query.clone());
                     builder.push(")");
                 }
@@ -944,12 +983,22 @@ impl IncludeSpec {
 }
 
 fn push_json_expr(builder: &mut QueryBuilder<'_, Postgres>, path: &JsonPath) {
-    builder.push("doc #> ");
+    builder.push("docs.doc #> ");
     builder.push_bind(path.parts().to_vec());
 }
 
 fn push_text_expr(builder: &mut QueryBuilder<'_, Postgres>, path: &JsonPath) {
-    builder.push("doc #>> ");
+    builder.push("docs.doc #>> ");
+    builder.push_bind(path.parts().to_vec());
+}
+
+fn push_text_expr_from_source(
+    builder: &mut QueryBuilder<'_, Postgres>,
+    source_alias: &str,
+    path: &JsonPath,
+) {
+    builder.push(source_alias);
+    builder.push(".doc #>> ");
     builder.push_bind(path.parts().to_vec());
 }
 
@@ -1012,6 +1061,7 @@ impl<T> DocumentQuery<T> {
         self.spec.push_sort(SortSpec {
             path: path.into(),
             kind: SortKind::Text(direction),
+            source: None,
         });
         self
     }
@@ -1020,6 +1070,7 @@ impl<T> DocumentQuery<T> {
         self.spec.push_sort(SortSpec {
             path: path.into(),
             kind: SortKind::Numeric(direction),
+            source: None,
         });
         self
     }
