@@ -173,6 +173,7 @@ impl ProjectionDaemon {
             .await?
             .unwrap_or(0);
 
+        let q_start = std::time::Instant::now();
         let rows: Vec<(i64, String, Value)> = sqlx::query_as(
             "select global_seq, event_type, body from events where global_seq > $1 order by global_seq asc limit $2",
         )
@@ -180,6 +181,7 @@ impl ProjectionDaemon {
         .bind(self.config.batch_size)
         .fetch_all(&mut *tx)
         .await?;
+        crate::metrics::record_query_duration("projection_fetch_batch", q_start.elapsed());
 
         if rows.is_empty() {
             // refresh lease (touch) and exit
@@ -207,7 +209,9 @@ impl ProjectionDaemon {
             crate::metrics::record_proj_events_processed(context.tenant.as_deref(), 1);
         }
 
+        let cp_start = std::time::Instant::now();
         self.persist_checkpoint(&mut tx, name, new_last).await?;
+        crate::metrics::record_query_duration("projection_persist_checkpoint", cp_start.elapsed());
         tx.commit().await?;
         self.refresh_lease(name).await?;
 

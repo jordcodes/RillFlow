@@ -1098,7 +1098,7 @@ where
         let rows = query.fetch_all(&pool).await?;
         crate::metrics::record_query_duration("docs_fetch_all", start.elapsed());
         // slow query logging
-        if start.elapsed() > std::time::Duration::from_millis(500) {
+        if start.elapsed() > crate::metrics::slow_query_threshold() {
             tracing::warn!(target: "rillflow::slow_query", elapsed_ms = start.elapsed().as_millis() as u64, sql = %sql_captured, "slow document query");
         }
         rows.into_iter()
@@ -1113,7 +1113,7 @@ where
         let start = std::time::Instant::now();
         let row = query.fetch_optional(&pool).await?;
         crate::metrics::record_query_duration("docs_fetch_optional", start.elapsed());
-        if start.elapsed() > std::time::Duration::from_millis(500) {
+        if start.elapsed() > crate::metrics::slow_query_threshold() {
             tracing::warn!(target: "rillflow::slow_query", elapsed_ms = start.elapsed().as_millis() as u64, sql = %sql_captured, "slow document query");
         }
         match row {
@@ -1129,7 +1129,7 @@ where
         let start = std::time::Instant::now();
         let (value,) = query.fetch_one(&pool).await?;
         crate::metrics::record_query_duration("docs_fetch_one", start.elapsed());
-        if start.elapsed() > std::time::Duration::from_millis(500) {
+        if start.elapsed() > crate::metrics::slow_query_threshold() {
             tracing::warn!(target: "rillflow::slow_query", elapsed_ms = start.elapsed().as_millis() as u64, sql = %sql_captured, "slow document query");
         }
         Ok(serde_json::from_value(value)?)

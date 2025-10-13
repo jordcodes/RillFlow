@@ -294,6 +294,7 @@ impl Subscriptions {
                 // Build dynamic filter via CASE checks; pass arrays or nulls and rely on ANY/LIKE.
 
                 let limit = std::cmp::min(opts.batch_size, opts.max_in_flight as i64);
+                let q_start = Instant::now();
                 let rows: Vec<PgRow> = sqlx::query(
                     r#"
                     with f as (
@@ -319,6 +320,7 @@ impl Subscriptions {
                 .fetch_all(&mut *conn)
                 .await
                 .unwrap_or_default();
+                crate::metrics::record_query_duration("subscription_fetch_batch", q_start.elapsed());
 
                 if rows.is_empty() {
                     if let Some(l) = &mut listener {

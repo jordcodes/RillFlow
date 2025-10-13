@@ -54,6 +54,7 @@ impl Default for Metrics {
 static METRICS: OnceLock<Metrics> = OnceLock::new();
 static TENANT_METRICS: OnceLock<Mutex<HashMap<String, TenantCounters>>> = OnceLock::new();
 static QUERY_DURATIONS: OnceLock<Mutex<HashMap<String, (u64, u64)>>> = OnceLock::new();
+static SLOW_QUERY_THRESHOLD_MS: OnceLock<std::sync::atomic::AtomicU64> = OnceLock::new();
 
 #[derive(Default, Clone)]
 struct TenantCounters {
@@ -375,4 +376,17 @@ pub fn record_query_duration(op: &str, dur: Duration) {
         entry.0 = entry.0.saturating_add(1);
         entry.1 = entry.1.saturating_add(dur.as_millis() as u64);
     }
+}
+
+pub fn set_slow_query_threshold(threshold: Duration) {
+    let atom = SLOW_QUERY_THRESHOLD_MS.get_or_init(|| std::sync::atomic::AtomicU64::new(500));
+    atom.store(
+        threshold.as_millis() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+pub fn slow_query_threshold() -> Duration {
+    let atom = SLOW_QUERY_THRESHOLD_MS.get_or_init(|| std::sync::atomic::AtomicU64::new(500));
+    Duration::from_millis(atom.load(std::sync::atomic::Ordering::Relaxed))
 }

@@ -143,6 +143,10 @@ struct Cli {
     #[arg(long = "tenant-schema", action = ArgAction::Append)]
     tenant_schemas: Vec<String>,
 
+    /// Slow query logging threshold in milliseconds (default 500)
+    #[arg(long, default_value_t = 500)]
+    slow_query_ms: u64,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -512,6 +516,7 @@ async fn main() -> rillflow::Result<()> {
         builder = builder.tenant_strategy(TenantStrategy::SchemaPerTenant);
     }
     let store = builder.build().await?;
+    rillflow::metrics::set_slow_query_threshold(std::time::Duration::from_millis(cli.slow_query_ms));
     let mgr = store.schema();
 
     let tenant_helper = TenantHelper::new(
