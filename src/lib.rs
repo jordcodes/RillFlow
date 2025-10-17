@@ -33,7 +33,7 @@ pub use store::SessionBuilder;
 pub use store::Store;
 pub use upcasting::{
     AsyncUpcaster, AsyncUpcasterBuilder, ClosureAsyncUpcaster, ClosureUpcaster, Upcaster,
-    UpcasterBuilder, UpcasterRegistry,
+    UpcasterBuilder, UpcasterDescriptor, UpcasterKind, UpcasterRegistry,
 };
 pub use upcasting_derive::Upcaster;
 
@@ -42,6 +42,6 @@ pub mod prelude {
     pub use crate::store::SessionBuilder;
     pub use crate::{
         Event, Expected, Result, Store,
-        upcasting::{AsyncUpcaster, Upcaster, UpcasterRegistry},
+        upcasting::{AsyncUpcaster, Upcaster, UpcasterDescriptor, UpcasterKind, UpcasterRegistry},
     };
 }

@@ -9,7 +9,6 @@ async fn list_tenants(store: &Store) -> rillflow::Result<()> {
     }
     Ok(())
 }
-
 async fn tenant_status(store: &Store, name: &str) -> rillflow::Result<()> {
     let schema = rillflow::store::tenant_schema_name(name);
     let exists: bool = sqlx::query_scalar(
@@ -119,6 +118,56 @@ async fn export_table(
 
     Ok(())
 }
+
+async fn list_upcasters(registry: Option<Arc<UpcasterRegistry>>) -> Result<()> {
+    if let Some(registry) = registry {
+        let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for entry in registry.describe() {
+            grouped
+                .entry(entry.from_type.clone())
+                .or_default()
+                .push(format!(
+                    "v{} -> {} v{} ({})",
+                    entry.from_version, entry.to_type, entry.to_version, entry.kind
+                ));
+        }
+
+        if grouped.is_empty() {
+            println!("No upcasters registered");
+        } else {
+            for (typ, transitions) in grouped {
+                println!("{}", typ);
+                for line in transitions {
+                    println!("  {}", line);
+                }
+            }
+        }
+    } else {
+        println!("No upcaster registry configured for this store");
+    }
+    Ok(())
+}
+
+async fn print_upcaster_path(
+    registry: Option<Arc<UpcasterRegistry>>,
+    from: (&str, i32),
+    to: (&str, i32),
+) -> Result<()> {
+    if let Some(registry) = registry {
+        match registry.find_path(from, to) {
+            Some(path) => {
+                println!("Transformation path:");
+                for (typ, version) in path {
+                    println!("  {} v{}", typ, version);
+                }
+            }
+            None => println!("No transformation path found"),
+        }
+    } else {
+        println!("No upcaster registry configured for this store");
+    }
+    Ok(())
+}
 use clap::{ArgAction, Parser, Subcommand};
 use rillflow::projection_runtime::{ProjectionDaemon, ProjectionWorkerConfig};
 use rillflow::subscriptions::{SubscriptionFilter, SubscriptionOptions, Subscriptions};
@@ -127,7 +176,7 @@ use rillflow::{
 };
 use serde_json::Value as JsonValue;
 use sqlx::Row;
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 use uuid::Uuid;
 
 #[derive(Parser, Debug)]
@@ -174,6 +223,10 @@ enum Commands {
     /// Projection admin commands
     #[command(subcommand)]
     Projections(ProjectionsCmd),
+
+    /// Upcasting helpers
+    #[command(subcommand)]
+    Upcasters(UpcastersCmd),
 
     /// Subscriptions admin commands
     #[command(subcommand)]
@@ -296,6 +349,23 @@ enum ProjectionsCmd {
         tenant: Option<String>,
         #[arg(long, default_value_t = false)]
         all_tenants: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum UpcastersCmd {
+    /// List all registered upcasters grouped by source type
+    List,
+    /// Print the transformation path from one type/version to another
+    Path {
+        #[arg(long)]
+        from_type: String,
+        #[arg(long)]
+        from_version: i32,
+        #[arg(long)]
+        to_type: String,
+        #[arg(long)]
+        to_version: i32,
     },
 }
 
@@ -860,6 +930,22 @@ async fn main() -> rillflow::Result<()> {
                 }
             }
         }
+        Commands::Upcasters(cmd) => match cmd {
+            UpcastersCmd::List => upcasters::list(store.upcaster_registry()).await?,
+            UpcastersCmd::Path {
+                from_type,
+                from_version,
+                to_type,
+                to_version,
+            } => {
+                upcasters::path(
+                    store.upcaster_registry(),
+                    (&from_type, from_version),
+                    (&to_type, to_version),
+                )
+                .await?;
+            }
+        },
         Commands::Subscriptions(cmd) => {
             let subs = tenant_helper.subscriptions(store.pool().clone());
             match cmd {

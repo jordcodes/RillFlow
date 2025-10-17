@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -40,6 +41,30 @@ pub struct UpcasterRegistry {
     sync_upcasters: HashMap<EventKey, Arc<dyn Upcaster>>,
     async_upcasters: HashMap<EventKey, Arc<dyn AsyncUpcaster>>,
     transformation_graph: TransformationGraph,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UpcasterKind {
+    Sync,
+    Async,
+}
+
+impl fmt::Display for UpcasterKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            UpcasterKind::Sync => write!(f, "sync"),
+            UpcasterKind::Async => write!(f, "async"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct UpcasterDescriptor {
+    pub from_type: String,
+    pub from_version: i32,
+    pub to_type: String,
+    pub to_version: i32,
+    pub kind: UpcasterKind,
 }
 
 impl UpcasterRegistry {
@@ -87,6 +112,42 @@ impl UpcasterRegistry {
                 && self
                     .async_upcasters
                     .contains_key(&(event_type.to_string(), 0)))
+    }
+
+    pub fn describe(&self) -> Vec<UpcasterDescriptor> {
+        let mut entries: Vec<UpcasterDescriptor> = self
+            .sync_upcasters
+            .values()
+            .map(|upcaster| UpcasterDescriptor {
+                from_type: upcaster.from_type().to_string(),
+                from_version: upcaster.from_version(),
+                to_type: upcaster.to_type().to_string(),
+                to_version: upcaster.to_version(),
+                kind: UpcasterKind::Sync,
+            })
+            .collect();
+
+        entries.extend(
+            self.async_upcasters
+                .values()
+                .map(|upcaster| UpcasterDescriptor {
+                    from_type: upcaster.from_type().to_string(),
+                    from_version: upcaster.from_version(),
+                    to_type: upcaster.to_type().to_string(),
+                    to_version: upcaster.to_version(),
+                    kind: UpcasterKind::Async,
+                }),
+        );
+
+        entries.sort_by(|a, b| {
+            a.from_type
+                .cmp(&b.from_type)
+                .then(a.from_version.cmp(&b.from_version))
+                .then(a.kind.cmp(&b.kind))
+                .then(a.to_version.cmp(&b.to_version))
+        });
+
+        entries
     }
 
     /// Attempt to find a transformation path between two versions/types.
@@ -740,5 +801,17 @@ mod tests {
 
         assert_eq!(AsyncUpcaster::from_version(&async_upcaster), 2);
         assert_eq!(AsyncUpcaster::to_version(&async_upcaster), 3);
+    }
+
+    #[test]
+    fn describe_returns_registered_entries() {
+        let mut registry = UpcasterRegistry::new();
+        registry.register(V1ToV2);
+        registry.register_async(AsyncV2ToV3);
+
+        let descriptors = registry.describe();
+        assert_eq!(descriptors.len(), 2);
+        assert!(descriptors.iter().any(|d| d.kind == UpcasterKind::Sync));
+        assert!(descriptors.iter().any(|d| d.kind == UpcasterKind::Async));
     }
 }

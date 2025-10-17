@@ -172,8 +172,14 @@ Upcasting happens only on read paths. For high-throughput workloads, consider:
 
 ## CLI Support
 
-Several upcoming tasks track the CLI ergonomics: listing registered upcasters and validating
-transformation paths. Until those land, rely on logging or unit tests.
+The CLI provides helpers for inspecting registries:
+
+```bash
+cargo run --bin rillflow -- upcasters list
+cargo run --bin rillflow -- upcasters path \
+  --from-type OrderPlaced --from-version 1 \
+  --to-type OrderPlaced --to-version 4
+```
 
 ## Further Reading
 
