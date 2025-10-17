@@ -2,9 +2,9 @@ use anyhow::Result;
 use rillflow::Store;
 use std::time::Duration;
 use testcontainers::{
+    GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage, ImageExt,
 };
 
 #[tokio::test]
@@ -22,8 +22,12 @@ async fn live_cache_ttl_and_invalidate() -> Result<()> {
     let url = format!("postgres://postgres:postgres@{host}:{port}/postgres?sslmode=disable");
 
     let store = Store::connect(&url).await?;
-    sqlx::query("create table if not exists counters(n int not null)").execute(store.pool()).await?;
-    sqlx::query("insert into counters(n) values(0)").execute(store.pool()).await?;
+    sqlx::query("create table if not exists counters(n int not null)")
+        .execute(store.pool())
+        .await?;
+    sqlx::query("insert into counters(n) values(0)")
+        .execute(store.pool())
+        .await?;
 
     let live = store.live().with_ttl(Duration::from_millis(300));
 
@@ -34,7 +38,9 @@ async fn live_cache_ttl_and_invalidate() -> Result<()> {
     assert_eq!(a, 0);
 
     // bump the value in DB, cached result should still be 0 until TTL expires
-    sqlx::query("update counters set n = n + 1").execute(store.pool()).await?;
+    sqlx::query("update counters set n = n + 1")
+        .execute(store.pool())
+        .await?;
     let b = live.query_scalar_i64_cached(key, sql).await?;
     assert_eq!(b, 0);
 
@@ -45,7 +51,9 @@ async fn live_cache_ttl_and_invalidate() -> Result<()> {
 
     // invalidate and bump again; next read should see new value immediately
     live.invalidate(key);
-    sqlx::query("update counters set n = n + 1").execute(store.pool()).await?;
+    sqlx::query("update counters set n = n + 1")
+        .execute(store.pool())
+        .await?;
     let d = live.query_scalar_i64_cached(key, sql).await?;
     assert_eq!(d, 2);
     Ok(())

@@ -375,7 +375,11 @@ pub fn render_prometheus() -> String {
     if let Ok(map) = SLOW_QUERY_COUNT.get_or_init(Default::default).lock() {
         for (op, count) in map.iter() {
             let escaped = escape_label(op);
-            let _ = writeln!(s, "# TYPE slow_queries_total counter\nslow_queries_total{{op=\"{}\"}} {}", escaped, count);
+            let _ = writeln!(
+                s,
+                "# TYPE slow_queries_total counter\nslow_queries_total{{op=\"{}\"}} {}",
+                escaped, count
+            );
         }
     }
 

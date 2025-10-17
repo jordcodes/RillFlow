@@ -23,7 +23,10 @@ pub use context::{SessionContext, SessionContextBuilder};
 pub use error::{Error, Result};
 pub use events::EventEnvelope;
 pub use events::{Event, Expected};
-pub use schema::{SchemaConfig, SchemaManager, SchemaPlan, TenancyMode, TenantSchema};
+pub use schema::{
+    SchemaConfig, SchemaManager, SchemaPlan, TenancyMode, TenantColumn, TenantColumnType,
+    TenantSchema,
+};
 pub use store::SessionBuilder;
 pub use store::Store;
 

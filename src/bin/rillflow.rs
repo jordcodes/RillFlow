@@ -549,10 +549,14 @@ async fn main() -> rillflow::Result<()> {
     rillflow::metrics::set_slow_query_explain(cli.slow_query_explain);
     let mgr = store.schema();
 
+    let store_tenant_strategy = store.tenant_strategy();
     let tenant_helper = TenantHelper::new(
-        store.tenant_strategy(),
+        store_tenant_strategy.clone(),
         store.tenant_resolver().cloned(),
-        store.tenant_strategy() == TenantStrategy::SchemaPerTenant,
+        matches!(
+            store_tenant_strategy,
+            TenantStrategy::SchemaPerTenant | TenantStrategy::Conjoined { .. }
+        ),
     );
 
     match cli.command {
@@ -1477,7 +1481,7 @@ fn split_sql_dollar_safe(input: &str) -> Vec<&str> {
 struct TenantHelper {
     strategy: TenantStrategy,
     resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
-    schema_per_tenant: bool,
+    tenant_aware: bool,
 }
 
 #[derive(Clone)]
@@ -1506,25 +1510,25 @@ impl TenantHelper {
     fn new(
         strategy: TenantStrategy,
         resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
-        schema_per_tenant: bool,
+        tenant_aware: bool,
     ) -> Self {
         Self {
             strategy,
             resolver,
-            schema_per_tenant,
+            tenant_aware,
         }
     }
 
     fn projection_daemon(&self, pool: PgPool) -> ProjectionDaemon {
         let mut config = ProjectionWorkerConfig::default();
-        config.tenant_strategy = self.strategy;
+        config.tenant_strategy = self.strategy.clone();
         config.tenant_resolver = self.resolver.clone();
         ProjectionDaemon::new(pool, config)
     }
 
     fn subscriptions(&self, pool: PgPool) -> Subscriptions {
         let mut subs = Subscriptions::new(pool);
-        subs.tenant_strategy = self.strategy;
+        subs.tenant_strategy = self.strategy.clone();
         subs.tenant_resolver = self.resolver.clone();
         subs
     }
@@ -1534,7 +1538,7 @@ impl TenantHelper {
         tenant: Option<&str>,
         name: &str,
     ) -> rillflow::Result<(TenantContext, String)> {
-        let ctx = match (tenant, self.strategy) {
+        let ctx = match (tenant, &self.strategy) {
             (Some(t), TenantStrategy::SchemaPerTenant) => TenantContext {
                 tenant_label: Some(t.to_string()),
             },
@@ -1544,7 +1548,16 @@ impl TenantHelper {
                     .as_ref()
                     .and_then(|r| (r)())
                     .ok_or(rillflow::Error::TenantRequired)?,
-                tenant_label: None,
+            },
+            (Some(t), TenantStrategy::Conjoined { .. }) => TenantContext {
+                tenant_label: Some(t.to_string()),
+            },
+            (None, TenantStrategy::Conjoined { .. }) => TenantContext {
+                tenant_label: self
+                    .resolver
+                    .as_ref()
+                    .and_then(|r| (r)())
+                    .ok_or(rillflow::Error::TenantRequired)?,
             },
             _ => TenantContext { tenant_label: None },
         };
@@ -1561,7 +1574,7 @@ impl TenantHelper {
         F: FnMut(Vec<TenantContext>) -> Fut,
         Fut: std::future::Future<Output = rillflow::Result<T>>,
     {
-        let contexts = if all_tenants && self.schema_per_tenant {
+        let contexts = if all_tenants && self.tenant_aware {
             let tenants = self.list_tenants().await?;
             tenants
                 .into_iter()
@@ -1573,6 +1586,14 @@ impl TenantHelper {
             vec![TenantContext {
                 tenant_label: Some(t),
             }]
+        } else if self.tenant_aware {
+            vec![TenantContext {
+                tenant_label: self
+                    .resolver
+                    .as_ref()
+                    .and_then(|r| (r)())
+                    .ok_or(rillflow::Error::TenantRequired)?,
+            }]
         } else {
             vec![TenantContext { tenant_label: None }]
         };
@@ -1582,7 +1603,7 @@ impl TenantHelper {
     async fn list_tenants(&self) -> rillflow::Result<Vec<String>> {
         // For now rely on resolver; extension point for reading from DB later
         if let Some(resolver) = &self.resolver {
-            if let Some(tenant) = resolver() {
+            if let Some(tenant) = (resolver)() {
                 return Ok(vec![tenant]);
             }
         }
@@ -1590,9 +1611,10 @@ impl TenantHelper {
     }
 
     fn require_schema(&self, tenant: &str) -> rillflow::Result<String> {
-        if !self.schema_per_tenant {
-            return Ok(tenant.to_string());
+        if matches!(self.strategy, TenantStrategy::SchemaPerTenant) {
+            Ok(tenant_schema_name(tenant))
+        } else {
+            Ok(tenant.to_string())
         }
-        Ok(tenant_schema_name(tenant))
     }
 }

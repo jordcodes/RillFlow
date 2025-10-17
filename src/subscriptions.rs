@@ -93,6 +93,14 @@ impl Subscriptions {
     fn resolve_schema(&self) -> Result<Option<String>> {
         match self.tenant_strategy {
             TenantStrategy::Single => Ok(None),
+            TenantStrategy::Conjoined { .. } => {
+                if let Some(resolver) = &self.tenant_resolver {
+                    if (resolver)().is_some() {
+                        return Ok(None);
+                    }
+                }
+                Err(Error::TenantRequired)
+            }
             TenantStrategy::SchemaPerTenant => {
                 if let Some(resolver) = &self.tenant_resolver {
                     if let Some(tenant) = (resolver)() {
@@ -141,7 +149,7 @@ impl Subscriptions {
         let schema_ident = schema_name.as_ref().map(|s| schema::quote_ident(s));
         let name_s = name.to_string();
         let handle_group = opts.group.clone();
-        let tenant_strategy = self.tenant_strategy;
+        let tenant_strategy = self.tenant_strategy.clone();
         let tenant_resolver = self.tenant_resolver.clone();
         tokio::spawn(async move {
             let mut cursor = opts.start_from;
@@ -320,7 +328,10 @@ impl Subscriptions {
                 .fetch_all(&mut *conn)
                 .await
                 .unwrap_or_default();
-                crate::metrics::record_query_duration("subscription_fetch_batch", q_start.elapsed());
+                crate::metrics::record_query_duration(
+                    "subscription_fetch_batch",
+                    q_start.elapsed(),
+                );
 
                 if rows.is_empty() {
                     if let Some(l) = &mut listener {
@@ -346,7 +357,9 @@ impl Subscriptions {
                         causation_id: row.get("causation_id"),
                         correlation_id: row.get("correlation_id"),
                         event_version: row.try_get::<i32, _>("event_version").unwrap_or(1),
-                        tenant_id: row.try_get::<Option<String>, _>("tenant_id").unwrap_or(None),
+                        tenant_id: row
+                            .try_get::<Option<String>, _>("tenant_id")
+                            .unwrap_or(None),
                         user_id: row.try_get::<Option<String>, _>("user_id").unwrap_or(None),
                         created_at: row.get("created_at"),
                     };

@@ -82,6 +82,7 @@ impl<F: SnapshotFolder> Snapshotter<F> {
             None => match self.config.tenant_strategy {
                 TenantStrategy::Single => "public".to_string(),
                 TenantStrategy::SchemaPerTenant => "<resolver>".to_string(),
+                TenantStrategy::Conjoined { .. } => "public".to_string(),
             },
         }
     }
@@ -89,6 +90,7 @@ impl<F: SnapshotFolder> Snapshotter<F> {
     fn resolve_schema(&self) -> Result<Option<String>> {
         match self.config.tenant_strategy {
             TenantStrategy::Single => Ok(self.config.schema.clone()),
+            TenantStrategy::Conjoined { .. } => Ok(self.config.schema.clone()),
             TenantStrategy::SchemaPerTenant => {
                 if let Some(ref explicit) = self.config.schema {
                     return Ok(Some(explicit.clone()));
@@ -211,7 +213,10 @@ impl<F: SnapshotFolder> Snapshotter<F> {
             .as_ref()
             .map(|s| s.trim_start_matches("tenant_").to_string())
             .or_else(|| {
-                if matches!(self.config.tenant_strategy, TenantStrategy::SchemaPerTenant) {
+                if matches!(
+                    self.config.tenant_strategy,
+                    TenantStrategy::SchemaPerTenant | TenantStrategy::Conjoined { .. }
+                ) {
                     Some("<resolver>".to_string())
                 } else {
                     None

@@ -78,6 +78,19 @@ impl ProjectionDaemon {
     fn resolve_schema(&self, context: &SessionContext) -> Result<Option<String>> {
         match self.config.tenant_strategy {
             TenantStrategy::Single => Ok(Some(self.config.schema.clone())),
+            TenantStrategy::Conjoined { .. } => {
+                if context.tenant.is_some() {
+                    Ok(Some(self.config.schema.clone()))
+                } else if let Some(resolver) = &self.config.tenant_resolver {
+                    if (resolver)().is_some() {
+                        Ok(Some(self.config.schema.clone()))
+                    } else {
+                        Err(crate::Error::TenantRequired)
+                    }
+                } else {
+                    Err(crate::Error::TenantRequired)
+                }
+            }
             TenantStrategy::SchemaPerTenant => {
                 if let Some(ref tenant) = context.tenant {
                     Ok(Some(tenant_schema_name(tenant)))

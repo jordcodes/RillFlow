@@ -4,6 +4,50 @@ use crate::Result;
 use indoc::formatdoc;
 use sqlx::PgPool;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TenantColumnType {
+    Text,
+    Uuid,
+}
+
+impl TenantColumnType {
+    pub fn as_sql(&self) -> &'static str {
+        match self {
+            TenantColumnType::Text => "text",
+            TenantColumnType::Uuid => "uuid",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TenantColumn {
+    pub name: String,
+    pub data_type: TenantColumnType,
+}
+
+impl TenantColumn {
+    pub fn new(name: impl Into<String>, data_type: TenantColumnType) -> Self {
+        Self {
+            name: name.into(),
+            data_type,
+        }
+    }
+
+    pub fn text(name: impl Into<String>) -> Self {
+        Self::new(name, TenantColumnType::Text)
+    }
+
+    pub fn uuid(name: impl Into<String>) -> Self {
+        Self::new(name, TenantColumnType::Uuid)
+    }
+}
+
+impl Default for TenantColumn {
+    fn default() -> Self {
+        Self::uuid("tenant_id")
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SchemaManager {
     pool: PgPool,
@@ -19,13 +63,17 @@ impl SchemaManager {
         let existing_schemas = self.existing_schemas().await?;
 
         let base_schema = config.base_schema.trim();
-        self.plan_for_schema(&mut plan, base_schema, &existing_schemas)
+        let tenant_column = match &config.tenancy_mode {
+            TenancyMode::Conjoined { column } => Some(column),
+            _ => None,
+        };
+        self.plan_for_schema(&mut plan, base_schema, &existing_schemas, tenant_column)
             .await?;
 
         if let TenancyMode::SchemaPerTenant { tenants } = &config.tenancy_mode {
             for tenant in tenants {
                 let schema = tenant.schema.trim();
-                self.plan_for_schema(&mut plan, schema, &existing_schemas)
+                self.plan_for_schema(&mut plan, schema, &existing_schemas, None)
                     .await?;
             }
         }
@@ -59,6 +107,7 @@ impl SchemaManager {
         plan: &mut SchemaPlan,
         schema: &str,
         schema_exists: bool,
+        tenant_column: Option<&TenantColumn>,
     ) -> Result<()> {
         if !schema_exists {
             plan.push_action(
@@ -76,35 +125,59 @@ impl SchemaManager {
             HashSet::new()
         };
 
-        ensure_table(plan, schema, &existing_tables, "docs", build_docs_table_sql);
-        ensure_table(
-            plan,
-            schema,
-            &existing_tables,
-            "docs_history",
-            build_docs_history_table_sql,
-        );
-        ensure_table(
-            plan,
-            schema,
-            &existing_tables,
-            "events",
-            build_events_table_sql,
-        );
-        ensure_table(
-            plan,
-            schema,
-            &existing_tables,
-            "events_archive",
-            build_events_archive_table_sql,
-        );
-        ensure_table(
-            plan,
-            schema,
-            &existing_tables,
-            "projections",
-            build_projections_table_sql,
-        );
+        let docs_exists = existing_tables.contains("docs");
+        let docs_history_exists = existing_tables.contains("docs_history");
+        let events_exists = existing_tables.contains("events");
+        let events_archive_exists = existing_tables.contains("events_archive");
+        let projections_exists = existing_tables.contains("projections");
+        let snapshots_exists = existing_tables.contains("snapshots");
+        let stream_aliases_exists = existing_tables.contains("stream_aliases");
+
+        ensure_table(plan, schema, &existing_tables, "docs", |s| {
+            build_docs_table_sql(s, tenant_column)
+        });
+        if docs_exists {
+            if let Some(column) = tenant_column {
+                self.ensure_tenant_column(plan, schema, "docs", column)
+                    .await?;
+            }
+        }
+        ensure_table(plan, schema, &existing_tables, "docs_history", |s| {
+            build_docs_history_table_sql(s, tenant_column)
+        });
+        if docs_history_exists {
+            if let Some(column) = tenant_column {
+                self.ensure_tenant_column(plan, schema, "docs_history", column)
+                    .await?;
+            }
+        }
+        ensure_table(plan, schema, &existing_tables, "events", |s| {
+            build_events_table_sql(s, tenant_column)
+        });
+        if events_exists {
+            if let Some(column) = tenant_column {
+                self.ensure_tenant_column(plan, schema, "events", column)
+                    .await?;
+            }
+        }
+        ensure_table(plan, schema, &existing_tables, "events_archive", |s| {
+            build_events_archive_table_sql(s, tenant_column)
+        });
+        if events_archive_exists {
+            if let Some(column) = tenant_column {
+                self.ensure_tenant_column(plan, schema, "events_archive", column)
+                    .await?;
+            }
+        }
+        ensure_table(plan, schema, &existing_tables, "projections", |s| {
+            build_projections_table_sql(s, tenant_column)
+        });
+        if projections_exists {
+            if let Some(column) = tenant_column {
+                self.ensure_tenant_column(plan, schema, "projections", column)
+                    .await?;
+            }
+        }
 
         // event schema registry
         ensure_table(
@@ -188,22 +261,26 @@ impl SchemaManager {
         );
 
         // Snapshots support
-        ensure_table(
-            plan,
-            schema,
-            &existing_tables,
-            "snapshots",
-            build_snapshots_table_sql,
-        );
+        ensure_table(plan, schema, &existing_tables, "snapshots", |s| {
+            build_snapshots_table_sql(s, tenant_column)
+        });
+        if snapshots_exists {
+            if let Some(column) = tenant_column {
+                self.ensure_tenant_column(plan, schema, "snapshots", column)
+                    .await?;
+            }
+        }
 
         // Stream aliases
-        ensure_table(
-            plan,
-            schema,
-            &existing_tables,
-            "stream_aliases",
-            build_stream_aliases_table_sql,
-        );
+        ensure_table(plan, schema, &existing_tables, "stream_aliases", |s| {
+            build_stream_aliases_table_sql(s, tenant_column)
+        });
+        if stream_aliases_exists {
+            if let Some(column) = tenant_column {
+                self.ensure_tenant_column(plan, schema, "stream_aliases", column)
+                    .await?;
+            }
+        }
 
         // Subscription consumer groups (per-group checkpoints and leases)
         ensure_table(
@@ -237,6 +314,7 @@ impl SchemaManager {
         plan: &mut SchemaPlan,
         schema: &str,
         existing_schemas: &HashSet<String>,
+        tenant_column: Option<&TenantColumn>,
     ) -> Result<()> {
         let schema = schema.trim();
 
@@ -255,7 +333,8 @@ impl SchemaManager {
 
         let exists = existing_schemas.contains(schema);
         plan.mark_schema(schema);
-        self.plan_core_schema(plan, schema, exists).await
+        self.plan_core_schema(plan, schema, exists, tenant_column)
+            .await
     }
 
     async fn existing_tables(&self, schema: &str) -> Result<HashSet<String>> {
@@ -277,6 +356,43 @@ impl SchemaManager {
         .await?;
         Ok(rows.into_iter().collect())
     }
+
+    async fn existing_columns(&self, schema: &str, table: &str) -> Result<HashSet<String>> {
+        let rows = sqlx::query_scalar::<_, String>(
+            "select column_name from information_schema.columns where table_schema = $1 and table_name = $2",
+        )
+        .bind(schema)
+        .bind(table)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
+
+    async fn ensure_tenant_column(
+        &self,
+        plan: &mut SchemaPlan,
+        schema: &str,
+        table: &str,
+        column: &TenantColumn,
+    ) -> Result<()> {
+        let columns = self.existing_columns(schema, table).await?;
+        if columns.contains(&column.name) {
+            return Ok(());
+        }
+
+        let table_name = qualified_name(schema, table);
+        let action = format!(
+            "alter table {} add column if not exists {} {}",
+            table_name,
+            quote_ident(&column.name),
+            column.data_type.as_sql()
+        );
+        plan.push_action(
+            format!("add {} column to {}", quote_ident(&column.name), table_name),
+            action,
+        );
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -296,6 +412,13 @@ impl SchemaConfig {
             ..Self::default()
         }
     }
+
+    pub fn conjoined_with(column: TenantColumn) -> Self {
+        Self {
+            base_schema: "public".to_string(),
+            tenancy_mode: TenancyMode::conjoined(column),
+        }
+    }
 }
 
 impl Default for SchemaConfig {
@@ -311,6 +434,7 @@ impl Default for SchemaConfig {
 pub enum TenancyMode {
     SingleTenant,
     SchemaPerTenant { tenants: Vec<TenantSchema> },
+    Conjoined { column: TenantColumn },
 }
 
 impl TenancyMode {
@@ -321,6 +445,10 @@ impl TenancyMode {
     {
         let tenants = tenants.into_iter().map(Into::into).collect();
         Self::SchemaPerTenant { tenants }
+    }
+
+    pub fn conjoined(column: TenantColumn) -> Self {
+        Self::Conjoined { column }
     }
 }
 
@@ -436,10 +564,20 @@ fn ensure_index<F>(
     }
 }
 
-fn build_docs_table_sql(schema: &str) -> String {
+fn build_docs_table_sql(schema: &str, tenant_column: Option<&TenantColumn>) -> String {
+    let tenant_column_sql = tenant_column
+        .map(|col| {
+            format!(
+                "            {} {} null,\n",
+                quote_ident(&col.name),
+                col.data_type.as_sql()
+            )
+        })
+        .unwrap_or_default();
     formatdoc!(
         "
         create table if not exists {table} (
+{tenant_column}
             id uuid primary key,
             doc jsonb not null,
             version int not null default 0,
@@ -452,14 +590,25 @@ fn build_docs_table_sql(schema: &str) -> String {
         )
         ",
         table = qualified_name(schema, "docs"),
+        tenant_column = tenant_column_sql,
     )
 }
 
-fn build_docs_history_table_sql(schema: &str) -> String {
+fn build_docs_history_table_sql(schema: &str, tenant_column: Option<&TenantColumn>) -> String {
+    let tenant_column_sql = tenant_column
+        .map(|col| {
+            format!(
+                "            {} {} null,\n",
+                quote_ident(&col.name),
+                col.data_type.as_sql()
+            )
+        })
+        .unwrap_or_default();
     formatdoc!(
         "
         create table if not exists {table} (
             hist_id bigserial primary key,
+{tenant_column}
             id uuid not null,
             version int not null,
             doc jsonb not null,
@@ -469,13 +618,24 @@ fn build_docs_history_table_sql(schema: &str) -> String {
         )
         ",
         table = qualified_name(schema, "docs_history"),
+        tenant_column = tenant_column_sql,
     )
 }
 
-fn build_events_table_sql(schema: &str) -> String {
+fn build_events_table_sql(schema: &str, tenant_column: Option<&TenantColumn>) -> String {
+    let tenant_column_sql = tenant_column
+        .map(|col| {
+            format!(
+                "            {} {} null,\n",
+                quote_ident(&col.name),
+                col.data_type.as_sql()
+            )
+        })
+        .unwrap_or_default();
     formatdoc!(
         "
         create table if not exists {table} (
+{tenant_column}
             global_seq bigserial primary key,
             stream_id uuid not null,
             stream_seq int not null,
@@ -493,13 +653,24 @@ fn build_events_table_sql(schema: &str) -> String {
         )
         ",
         table = qualified_name(schema, "events"),
+        tenant_column = tenant_column_sql,
     )
 }
 
-fn build_events_archive_table_sql(schema: &str) -> String {
+fn build_events_archive_table_sql(schema: &str, tenant_column: Option<&TenantColumn>) -> String {
+    let tenant_column_sql = tenant_column
+        .map(|col| {
+            format!(
+                "            {} {} null,\n",
+                quote_ident(&col.name),
+                col.data_type.as_sql()
+            )
+        })
+        .unwrap_or_default();
     formatdoc!(
         "
         create table if not exists {table} (
+{tenant_column}
             global_seq bigint not null,
             stream_id uuid not null,
             stream_seq int not null,
@@ -517,19 +688,31 @@ fn build_events_archive_table_sql(schema: &str) -> String {
         )
         ",
         table = qualified_name(schema, "events_archive"),
+        tenant_column = tenant_column_sql,
     )
 }
 
-fn build_projections_table_sql(schema: &str) -> String {
+fn build_projections_table_sql(schema: &str, tenant_column: Option<&TenantColumn>) -> String {
+    let tenant_column_sql = tenant_column
+        .map(|col| {
+            format!(
+                "            {} {} null,\n",
+                quote_ident(&col.name),
+                col.data_type.as_sql()
+            )
+        })
+        .unwrap_or_default();
     formatdoc!(
         "
         create table if not exists {table} (
+{tenant_column}
             name text primary key,
             last_seq bigint not null default 0,
             updated_at timestamptz not null default now()
         )
         ",
         table = qualified_name(schema, "projections"),
+        tenant_column = tenant_column_sql,
     )
 }
 
@@ -648,10 +831,20 @@ fn build_docs_fts_triggers_sql(schema: &str) -> String {
     )
 }
 
-fn build_snapshots_table_sql(schema: &str) -> String {
+fn build_snapshots_table_sql(schema: &str, tenant_column: Option<&TenantColumn>) -> String {
+    let tenant_column_sql = tenant_column
+        .map(|col| {
+            format!(
+                "            {} {} null,\n",
+                quote_ident(&col.name),
+                col.data_type.as_sql()
+            )
+        })
+        .unwrap_or_default();
     formatdoc!(
         "
         create table if not exists {table} (
+{tenant_column}
             stream_id uuid primary key,
             version int not null,
             body jsonb not null,
@@ -659,6 +852,7 @@ fn build_snapshots_table_sql(schema: &str) -> String {
         )
         ",
         table = qualified_name(schema, "snapshots"),
+        tenant_column = tenant_column_sql,
     )
 }
 
@@ -723,16 +917,27 @@ fn build_event_schemas_table_sql(schema: &str) -> String {
     )
 }
 
-fn build_stream_aliases_table_sql(schema: &str) -> String {
+fn build_stream_aliases_table_sql(schema: &str, tenant_column: Option<&TenantColumn>) -> String {
+    let tenant_column_sql = tenant_column
+        .map(|col| {
+            format!(
+                "            {} {} null,\n",
+                quote_ident(&col.name),
+                col.data_type.as_sql()
+            )
+        })
+        .unwrap_or_default();
     formatdoc!(
         r#"
         create table if not exists {table} (
+{tenant_column}
             alias text primary key,
             stream_id uuid not null,
             created_at timestamptz not null default now()
         )
         "#,
         table = qualified_name(schema, "stream_aliases"),
+        tenant_column = tenant_column_sql,
     )
 }
 

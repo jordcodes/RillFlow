@@ -3,14 +3,17 @@ use rillflow::Store;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use testcontainers::{
+    GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage, ImageExt,
 };
 use uuid::Uuid;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-struct Doc { id: Uuid, v: i32 }
+struct Doc {
+    id: Uuid,
+    v: i32,
+}
 
 #[tokio::test]
 async fn batch_writer_upsert_update_delete() -> Result<()> {

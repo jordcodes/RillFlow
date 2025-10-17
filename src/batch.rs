@@ -1,12 +1,11 @@
 use crate::{Result, documents::Documents};
 use serde::Serialize;
 use serde_json::Value;
-use sqlx::PgPool;
 use std::collections::HashMap;
 use uuid::Uuid;
 
 pub struct BatchWriter {
-    pool: PgPool,
+    documents: Documents,
     // upserts without OCC
     upserts: HashMap<Uuid, Value>,
     // updates with OCC (expected version)
@@ -16,9 +15,9 @@ pub struct BatchWriter {
 }
 
 impl BatchWriter {
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(documents: Documents) -> Self {
         Self {
-            pool,
+            documents,
             upserts: HashMap::new(),
             updates_expected: Vec::new(),
             deletes: Vec::new(),
@@ -47,9 +46,7 @@ impl BatchWriter {
     }
 
     pub async fn flush(&mut self) -> Result<FlushOutcome> {
-        let docs = Documents {
-            pool: self.pool.clone(),
-        };
+        let docs = self.documents.clone();
         let mut outcome = FlushOutcome::default();
 
         if !self.upserts.is_empty() {

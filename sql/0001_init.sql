@@ -1,5 +1,6 @@
 -- documents
 create table if not exists docs (
+    tenant_id text null,
     id uuid primary key,
     doc jsonb not null,
     version int not null default 0,
@@ -36,6 +37,7 @@ end$$;
 -- document change history
 create table if not exists docs_history (
     hist_id bigserial primary key,
+    tenant_id text null,
     id uuid not null,
     version int not null,
     doc jsonb not null,
@@ -142,6 +144,7 @@ where (headers ? 'idempotency_key');
 
 -- stream aliases (human key to stream_id)
 create table if not exists stream_aliases (
+    tenant_id text null,
     alias text primary key,
     stream_id uuid not null,
     created_at timestamptz not null default now()
@@ -149,6 +152,7 @@ create table if not exists stream_aliases (
 
 -- projection checkpoints
 create table if not exists projections (
+    tenant_id text null,
     name text primary key,
     last_seq bigint not null default 0,
     updated_at timestamptz not null default now()
@@ -165,6 +169,7 @@ create table if not exists event_schemas (
 
 -- snapshots
 create table if not exists snapshots (
+    tenant_id text null,
     stream_id uuid primary key,
     version int not null,
     body jsonb not null,

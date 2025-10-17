@@ -1,10 +1,10 @@
-use std::{fmt, marker::PhantomData};
+use std::{fmt, marker::PhantomData, sync::Arc};
 
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, QueryBuilder, types::Json};
 
-use crate::Result;
+use crate::{Error, Result, schema, store::TenantStrategy};
 
 /// Direction for sorting results.
 #[derive(Clone, Copy, Debug)]
@@ -87,6 +87,7 @@ pub(crate) struct QuerySpec {
     group_by: Vec<GroupBySpec>,
     aggregates: Vec<AggregateSpec>,
     includes: Vec<IncludeSpec>,
+    tenant_filter: Option<(String, String)>,
 }
 
 impl Default for QuerySpec {
@@ -101,6 +102,7 @@ impl Default for QuerySpec {
             group_by: Vec::new(),
             aggregates: Vec::new(),
             includes: Vec::new(),
+            tenant_filter: None,
         }
     }
 }
@@ -108,6 +110,14 @@ impl Default for QuerySpec {
 impl QuerySpec {
     pub(crate) fn push_filter(&mut self, predicate: Predicate) {
         self.filters.push(predicate);
+    }
+
+    pub(crate) fn set_tenant_filter(
+        &mut self,
+        column: impl Into<String>,
+        value: impl Into<String>,
+    ) {
+        self.tenant_filter = Some((column.into(), value.into()));
     }
 
     pub(crate) fn filters(&self) -> &[Predicate] {
@@ -179,6 +189,7 @@ impl QuerySpec {
             group_by,
             aggregates,
             includes,
+            tenant_filter,
         } = self;
 
         let mut builder = QueryBuilder::new("select ");
@@ -284,8 +295,15 @@ impl QuerySpec {
         }
 
         let mut has_where = false;
+        if let Some((column, value)) = tenant_filter {
+            builder.push(" where docs.");
+            builder.push(schema::quote_ident(&column));
+            builder.push(" = ");
+            builder.push_bind(value);
+            has_where = true;
+        }
         if !filters.is_empty() {
-            builder.push(" where ");
+            builder.push(if has_where { " and " } else { " where " });
             has_where = true;
             let mut iter = filters.into_iter();
             if let Some(first) = iter.next() {
@@ -371,6 +389,14 @@ pub struct DocumentQueryContext {
 impl DocumentQueryContext {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn set_tenant_filter(
+        &mut self,
+        column: impl Into<String>,
+        value: impl Into<String>,
+    ) {
+        self.spec.set_tenant_filter(column.into(), value.into());
     }
 
     pub fn full_text_search(&mut self, query: impl Into<String>) -> &mut Self {
@@ -1088,6 +1114,9 @@ fn push_numeric_cmp(
 pub struct DocumentQuery<T> {
     pool: PgPool,
     spec: QuerySpec,
+    tenant_strategy: TenantStrategy,
+    tenant_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
+    tenant: Option<String>,
     _marker: PhantomData<T>,
 }
 
@@ -1104,10 +1133,18 @@ impl<T> fmt::Debug for DocumentQuery<T> {
 }
 
 impl<T> DocumentQuery<T> {
-    pub(crate) fn new(pool: PgPool) -> Self {
+    pub(crate) fn new(
+        pool: PgPool,
+        tenant_strategy: TenantStrategy,
+        tenant_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
+        tenant: Option<String>,
+    ) -> Self {
         Self {
             pool,
             spec: QuerySpec::default(),
+            tenant_strategy,
+            tenant_resolver,
+            tenant,
             _marker: PhantomData,
         }
     }
@@ -1198,9 +1235,31 @@ impl<T> DocumentQuery<T> {
         self
     }
 
-    fn build_query(self) -> (PgPool, QueryBuilder<'static, Postgres>) {
+    fn resolve_conjoined_tenant(&self) -> Result<Option<String>> {
+        match &self.tenant_strategy {
+            TenantStrategy::Conjoined { .. } => {
+                if let Some(t) = &self.tenant {
+                    return Ok(Some(t.clone()));
+                }
+                if let Some(resolver) = &self.tenant_resolver {
+                    if let Some(t) = (resolver)() {
+                        return Ok(Some(t));
+                    }
+                }
+                Err(Error::TenantRequired)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn build_query(mut self) -> Result<(PgPool, QueryBuilder<'static, Postgres>)> {
+        if let TenantStrategy::Conjoined { column } = &self.tenant_strategy {
+            if let Some(tenant) = self.resolve_conjoined_tenant()? {
+                self.spec.set_tenant_filter(column.name.clone(), tenant);
+            }
+        }
         let pool = self.pool.clone();
-        self.spec.build_query(pool)
+        Ok(self.spec.build_query(pool))
     }
 }
 
@@ -1209,7 +1268,7 @@ where
     T: DeserializeOwned,
 {
     pub async fn fetch_all(self) -> Result<Vec<T>> {
-        let (pool, mut builder) = self.build_query();
+        let (pool, mut builder) = self.build_query()?;
         let sql_captured = builder.sql().to_string();
         let query = builder.build_query_as::<(Value,)>();
         let start = std::time::Instant::now();
@@ -1238,7 +1297,7 @@ where
     }
 
     pub async fn fetch_optional(self) -> Result<Option<T>> {
-        let (pool, mut builder) = self.build_query();
+        let (pool, mut builder) = self.build_query()?;
         let sql_captured = builder.sql().to_string();
         let query = builder.build_query_as::<(Value,)>();
         let start = std::time::Instant::now();
@@ -1265,7 +1324,7 @@ where
     }
 
     pub async fn fetch_one(self) -> Result<T> {
-        let (pool, mut builder) = self.build_query();
+        let (pool, mut builder) = self.build_query()?;
         let sql_captured = builder.sql().to_string();
         let query = builder.build_query_as::<(Value,)>();
         let start = std::time::Instant::now();

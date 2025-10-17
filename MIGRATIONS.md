@@ -17,11 +17,12 @@ cargo test --test integration_postgres
 
 The `sql/0001_init.sql` migration creates:
 
-- `docs`: JSONB document store with optimistic version column
+- `docs`: JSONB document store with optimistic version column and optional `tenant_id` for conjoined tenancy
 - `events`: append-only event store with global and stream sequence numbers
   - Columns include `headers jsonb`, `causation_id uuid`, `correlation_id uuid`, and `created_at`.
-- `projections`: checkpoint table for projection processors
- - `snapshots`: snapshotting table for aggregates (`stream_id uuid pk, version int, body jsonb, created_at timestamptz`).
+- `projections`: checkpoint table for projection processors (adds `tenant_id` in conjoined mode)
+- `snapshots`: snapshotting table for aggregates (`stream_id uuid pk, version int, body jsonb, created_at timestamptz`).
+- `stream_aliases`: human-friendly stream aliases (includes `tenant_id` in conjoined mode).
 
 Rillflow's schema manager (CLI) can also create projection runtime support tables:
 

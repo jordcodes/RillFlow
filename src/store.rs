@@ -4,7 +4,7 @@ use crate::{
     documents::{DocumentSession, Documents},
     events::{AppendOptions, Events},
     projections::Projections,
-    schema::{SchemaConfig, TenancyMode, TenantSchema},
+    schema::{SchemaConfig, TenancyMode, TenantColumn, TenantSchema},
     subscriptions::Subscriptions,
 };
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -22,10 +22,24 @@ use tokio::time::sleep;
 
 type TenantResolver = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TenantStrategy {
     Single,
     SchemaPerTenant,
+    Conjoined { column: TenantColumn },
+}
+
+impl TenantStrategy {
+    pub fn conjoined(column: TenantColumn) -> Self {
+        Self::Conjoined { column }
+    }
+
+    pub fn tenant_column(&self) -> Option<&TenantColumn> {
+        match self {
+            TenantStrategy::Conjoined { column } => Some(column),
+            _ => None,
+        }
+    }
 }
 
 pub(crate) fn tenant_schema_name(tenant: &str) -> String {
@@ -91,9 +105,12 @@ impl Store {
     }
 
     pub fn docs(&self) -> Documents {
-        Documents {
-            pool: self.pool.clone(),
-        }
+        Documents::new(
+            self.pool.clone(),
+            self.tenant_strategy.clone(),
+            self.tenant_resolver.clone(),
+            self.session_context.tenant.clone(),
+        )
     }
 
     /// Obtain a `DocumentSession` using the store's current session defaults.
@@ -112,7 +129,7 @@ impl Store {
             defaults: self.session_defaults.clone(),
             use_advisory_lock: self.session_advisory_locks,
             context: self.session_context.clone(),
-            tenant_strategy: self.tenant_strategy,
+            tenant_strategy: self.tenant_strategy.clone(),
             ensured_tenants: self.ensured_tenants.clone(),
             tenant_resolver: self.tenant_resolver.clone(),
             enforce_tenant: self.enforce_tenant,
@@ -146,6 +163,7 @@ impl Store {
     pub async fn ensure_tenant(&self, tenant: &str) -> Result<()> {
         match self.tenant_strategy {
             TenantStrategy::Single => Ok(()),
+            TenantStrategy::Conjoined { .. } => Ok(()),
             TenantStrategy::SchemaPerTenant => {
                 let schema = tenant_schema_name(tenant);
 
@@ -212,6 +230,7 @@ impl Store {
     pub async fn drop_tenant(&self, tenant: &str) -> Result<()> {
         match self.tenant_strategy {
             TenantStrategy::Single => Err(crate::Error::TenantNotFound(tenant.to_string())),
+            TenantStrategy::Conjoined { .. } => Ok(()),
             TenantStrategy::SchemaPerTenant => {
                 let schema = tenant_schema_name(tenant);
                 let stmt = format!(
@@ -226,18 +245,24 @@ impl Store {
     }
 
     pub async fn tenant_exists(&self, tenant: &str) -> Result<bool> {
-        let schema = tenant_schema_name(tenant);
-        let exists: bool = sqlx::query_scalar(
-            "select exists (select 1 from information_schema.schemata where schema_name = $1)",
-        )
-        .bind(&schema)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(exists)
+        match self.tenant_strategy {
+            TenantStrategy::SchemaPerTenant => {
+                let schema = tenant_schema_name(tenant);
+                let exists: bool = sqlx::query_scalar(
+                    "select exists (select 1 from information_schema.schemata where schema_name = $1)",
+                )
+                .bind(&schema)
+                .fetch_one(&self.pool)
+                .await?;
+                Ok(exists)
+            }
+            TenantStrategy::Conjoined { .. } => Ok(true),
+            TenantStrategy::Single => Ok(false),
+        }
     }
 
     pub fn tenant_strategy(&self) -> TenantStrategy {
-        self.tenant_strategy
+        self.tenant_strategy.clone()
     }
 
     pub fn tenant_resolver(&self) -> Option<&TenantResolver> {
@@ -270,19 +295,19 @@ impl Store {
     pub fn projections(&self) -> Projections {
         Projections::new(
             self.pool.clone(),
-            self.tenant_strategy,
+            self.tenant_strategy.clone(),
             self.tenant_resolver.clone(),
         )
     }
 
     pub fn batch(&self) -> crate::batch::BatchWriter {
-        crate::batch::BatchWriter::new(self.pool.clone())
+        crate::batch::BatchWriter::new(self.docs())
     }
 
     pub fn subscriptions(&self) -> Subscriptions {
         Subscriptions::new_with_strategy(
             self.pool.clone(),
-            self.tenant_strategy,
+            self.tenant_strategy.clone(),
             self.tenant_resolver.clone(),
         )
     }
@@ -406,7 +431,10 @@ impl StoreBuilder {
 
     pub fn tenant_strategy(mut self, strategy: TenantStrategy) -> Self {
         self.tenant_strategy = strategy;
-        if matches!(self.tenant_strategy, TenantStrategy::SchemaPerTenant) {
+        if matches!(
+            self.tenant_strategy,
+            TenantStrategy::SchemaPerTenant | TenantStrategy::Conjoined { .. }
+        ) {
             self.enforce_tenant = true;
         }
         self
@@ -425,12 +453,14 @@ impl StoreBuilder {
     }
 
     pub async fn build(self) -> Result<Store> {
-        if matches!(self.tenant_strategy, TenantStrategy::SchemaPerTenant)
-            && self.tenant_resolver.is_none()
+        if matches!(
+            self.tenant_strategy,
+            TenantStrategy::SchemaPerTenant | TenantStrategy::Conjoined { .. }
+        ) && self.tenant_resolver.is_none()
             && self.enforce_tenant
         {
             panic!(
-                "StoreBuilder requires tenant_resolver or allow_missing_tenant() when TenantStrategy::SchemaPerTenant is configured."
+                "StoreBuilder requires tenant_resolver or allow_missing_tenant() when a tenant-aware strategy (schema-per-tenant or conjoined) is configured."
             );
         }
 
@@ -553,22 +583,26 @@ impl SessionBuilder {
     /// Build a new `DocumentSession` applying the configured defaults.
     pub fn build(self) -> DocumentSession {
         let resolver_present = self.tenant_resolver.is_some();
+        let tenant_strategy = self.tenant_strategy.clone();
 
         let mut events = self.store.events();
         events.use_advisory_lock = self.use_advisory_lock;
 
         let mut session = DocumentSession::new(self.store.pool.clone(), events, self.context);
-        session.set_tenant_strategy(self.tenant_strategy);
+        session.set_tenant_strategy(tenant_strategy.clone());
         session.set_tenant_cache(self.ensured_tenants);
         session.set_tenant_resolver(self.tenant_resolver);
 
         if self.enforce_tenant
-            && matches!(self.tenant_strategy, TenantStrategy::SchemaPerTenant)
+            && matches!(
+                tenant_strategy,
+                TenantStrategy::SchemaPerTenant | TenantStrategy::Conjoined { .. }
+            )
             && session.context().tenant.is_none()
             && !resolver_present
         {
             panic!(
-                "DocumentSession requires tenant context or tenant_resolver (call allow_missing_tenant for system jobs) when using TenantStrategy::SchemaPerTenant."
+                "DocumentSession requires tenant context or tenant_resolver (call allow_missing_tenant for system jobs) when using a tenant-aware strategy."
             );
         }
 

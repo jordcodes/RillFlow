@@ -44,6 +44,19 @@ impl Projections {
     fn resolve_schema(&self, context: &SessionContext) -> Result<Option<String>> {
         match self.tenant_strategy {
             TenantStrategy::Single => Ok(None),
+            TenantStrategy::Conjoined { .. } => {
+                if context.tenant.is_some() {
+                    Ok(None)
+                } else if let Some(resolver) = &self.tenant_resolver {
+                    if (resolver)().is_some() {
+                        Ok(None)
+                    } else {
+                        Err(crate::Error::TenantRequired)
+                    }
+                } else {
+                    Err(crate::Error::TenantRequired)
+                }
+            }
             TenantStrategy::SchemaPerTenant => {
                 if let Some(ref tenant) = context.tenant {
                     Ok(Some(tenant_schema_name(tenant)))

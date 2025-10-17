@@ -14,8 +14,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
+#[derive(Clone)]
 pub struct Documents {
     pub(crate) pool: PgPool,
+    tenant_strategy: TenantStrategy,
+    tenant_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
+    tenant: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -30,42 +34,114 @@ pub struct DocumentMetadata {
 }
 
 impl Documents {
+    pub(crate) fn new(
+        pool: PgPool,
+        tenant_strategy: TenantStrategy,
+        tenant_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
+        tenant: Option<String>,
+    ) -> Self {
+        Self {
+            pool,
+            tenant_strategy,
+            tenant_resolver,
+            tenant,
+        }
+    }
+
+    pub fn with_tenant(mut self, tenant: impl Into<String>) -> Self {
+        self.tenant = Some(tenant.into());
+        self
+    }
+
+    fn tenant_column(&self) -> Option<&str> {
+        match &self.tenant_strategy {
+            TenantStrategy::Conjoined { column } => Some(column.name.as_str()),
+            _ => None,
+        }
+    }
+
+    fn resolve_conjoined_tenant(&self) -> Result<Option<String>> {
+        match &self.tenant_strategy {
+            TenantStrategy::Conjoined { .. } => {
+                if let Some(t) = &self.tenant {
+                    return Ok(Some(t.clone()));
+                }
+                if let Some(resolver) = &self.tenant_resolver {
+                    if let Some(t) = (resolver)() {
+                        return Ok(Some(t));
+                    }
+                }
+                Err(Error::TenantRequired)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn tenant_label(&self) -> Option<&str> {
+        match &self.tenant_strategy {
+            TenantStrategy::Conjoined { .. } => self.tenant.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn metrics_label(&self) -> Option<&str> {
+        if self.tenant_column().is_some() {
+            self.tenant_label()
+        } else {
+            Some("public")
+        }
+    }
+
+    fn push_tenant_filter<'a>(
+        &self,
+        qb: &mut QueryBuilder<'a, Postgres>,
+        tenant: Option<&'a String>,
+    ) {
+        if let (Some(column), Some(value)) = (self.tenant_column(), tenant) {
+            qb.push(format!("{} = ", schema::quote_ident(column)));
+            qb.push_bind(value);
+            qb.push(" and ");
+        }
+    }
+
     pub async fn upsert<T: Serialize>(&self, id: &Uuid, doc: &T) -> Result<i32> {
         let json = serde_json::to_value(doc)?;
-        let version: i32 = sqlx::query_scalar(
-            r#"
-            with up as (
-                insert into docs (id, doc, version, created_by, last_modified_by)
-                values ($1, $2, 1, current_user, current_user)
-                on conflict (id) do update
-                  set doc = excluded.doc,
-                      version = docs.version + 1,
-                      updated_at = now(),
-                      last_modified_by = current_user
-                returning version
-            ) select version from up
-            "#,
-        )
-        .bind(id)
-        .bind(&json)
-        .fetch_one(&self.pool)
-        .await?;
+        let tenant_value = self.resolve_conjoined_tenant()?;
+        let mut qb = QueryBuilder::<Postgres>::new("with up as ( insert into docs (");
+        if let (Some(column), Some(value)) = (self.tenant_column(), tenant_value.as_ref()) {
+            qb.push(format!("{}, ", schema::quote_ident(column)));
+            qb.push("id, doc, version, created_by, last_modified_by) values (");
+            qb.push_bind(value);
+            qb.push(", ");
+        } else {
+            qb.push("id, doc, version, created_by, last_modified_by) values (");
+        }
+        qb.push_bind(id);
+        qb.push(", ");
+        qb.push_bind(&json);
+        qb.push(", 1, current_user, current_user) on conflict (id) do update set doc = excluded.doc, version = docs.version + 1, updated_at = now(), last_modified_by = current_user returning version ) select version from up");
+
+        let version: i32 = qb.build_query_scalar::<i32>().fetch_one(&self.pool).await?;
         Ok(version)
     }
 
     pub async fn get<T: DeserializeOwned>(&self, id: &Uuid) -> Result<Option<(T, i32)>> {
+        let tenant_value = self.resolve_conjoined_tenant()?;
+        let tenant_ref = tenant_value.as_ref();
+        let mut qb =
+            QueryBuilder::<Postgres>::new("select doc, version, deleted_at from docs where ");
+        self.push_tenant_filter(&mut qb, tenant_ref);
+        qb.push("id = ");
+        qb.push_bind(id);
         let row: Option<(Value, i32, Option<chrono::DateTime<chrono::Utc>>)> =
-            sqlx::query_as("select doc, version, deleted_at from docs where id = $1")
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await?;
+            qb.build_query_as().fetch_optional(&self.pool).await?;
 
         if let Some((value, version, deleted_at)) = row {
             if deleted_at.is_some() {
                 return Ok(None);
             }
             let doc: T = serde_json::from_value(value)?;
-            metrics::record_doc_read(Some("public"));
+            metrics::record_doc_read(self.metrics_label());
             Ok(Some((doc, version)))
         } else {
             Ok(None)
@@ -76,13 +152,23 @@ impl Documents {
         &self,
         id: &Uuid,
     ) -> Result<Option<(T, DocumentMetadata)>> {
-        let row: Option<(Value, i32, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>, Option<String>, Option<String>)> =
-            sqlx::query_as(
-                "select doc, version, created_at, updated_at, deleted_at, created_by, last_modified_by from docs where id = $1",
-            )
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
+        let tenant_value = self.resolve_conjoined_tenant()?;
+        let tenant_ref = tenant_value.as_ref();
+        let mut qb = QueryBuilder::<Postgres>::new(
+            "select doc, version, created_at, updated_at, deleted_at, created_by, last_modified_by from docs where ",
+        );
+        self.push_tenant_filter(&mut qb, tenant_ref);
+        qb.push("id = ");
+        qb.push_bind(id);
+        let row: Option<(
+            Value,
+            i32,
+            chrono::DateTime<chrono::Utc>,
+            chrono::DateTime<chrono::Utc>,
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<String>,
+            Option<String>,
+        )> = qb.build_query_as().fetch_optional(&self.pool).await?;
 
         match row {
             Some((
@@ -120,22 +206,27 @@ impl Documents {
         expected: Option<i32>,
     ) -> Result<i32> {
         let json = serde_json::to_value(doc)?;
+        let tenant_value = self.resolve_conjoined_tenant()?;
+        let tenant_ref = tenant_value.as_ref();
         match expected {
             Some(ver) => {
-                let rows = sqlx::query(
-                    r#"update docs set doc=$2, version=version+1, updated_at=now(), last_modified_by=current_user
-                        where id=$1 and version=$3 and deleted_at is null"#,
-                )
-                .bind(id)
-                .bind(&json)
-                .bind(ver)
-                .execute(&self.pool)
-                .await?;
+                let mut qb = QueryBuilder::<Postgres>::new("update docs set doc = ");
+                qb.push_bind(&json);
+                qb.push(
+                    ", version = version + 1, updated_at = now(), last_modified_by = current_user where ",
+                );
+                self.push_tenant_filter(&mut qb, tenant_ref);
+                qb.push("id = ");
+                qb.push_bind(id);
+                qb.push(" and version = ");
+                qb.push_bind(ver);
+                qb.push(" and deleted_at is null");
+                let rows = qb.build().execute(&self.pool).await?;
                 if rows.rows_affected() == 1 {
-                    metrics::record_doc_write(None, 1);
+                    metrics::record_doc_write(self.metrics_label(), 1);
                     Ok(ver + 1)
                 } else {
-                    metrics::record_doc_conflict(Some("public"));
+                    metrics::record_doc_conflict(self.metrics_label());
                     Err(Error::DocVersionConflict)
                 }
             }
@@ -151,12 +242,17 @@ impl Documents {
         T: DeserializeOwned + Serialize,
         F: FnOnce(&mut T),
     {
+        let tenant_value = self.resolve_conjoined_tenant()?;
+        let tenant_ref = tenant_value.as_ref();
         let mut tx = self.pool.begin().await?;
-        let row: Option<(Value, i32)> =
-            sqlx::query_as("select doc, version from docs where id = $1 for update")
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await?;
+        let row: Option<(Value, i32)> = {
+            let mut qb = QueryBuilder::<Postgres>::new("select doc, version from docs where ");
+            self.push_tenant_filter(&mut qb, tenant_ref);
+            qb.push("id = ");
+            qb.push_bind(id);
+            qb.push(" for update");
+            qb.build_query_as().fetch_optional(&mut *tx).await?
+        };
         let (mut doc, ver) = match row {
             Some((v, ver)) => (serde_json::from_value::<T>(v)?, ver),
             None => return Err(Error::DocNotFound),
@@ -166,15 +262,18 @@ impl Documents {
         }
         mutator(&mut doc);
         let json = serde_json::to_value(&doc)?;
-        let rows = sqlx::query(
-            r#"update docs set doc=$2, version=version+1, updated_at=now()
-                where id=$1 and version=$3 and deleted_at is null"#,
-        )
-        .bind(id)
-        .bind(&json)
-        .bind(ver)
-        .execute(&mut *tx)
-        .await?;
+        let mut qb = QueryBuilder::<Postgres>::new("update docs set doc = ");
+        qb.push_bind(&json);
+        qb.push(
+            ", version = version + 1, updated_at = now(), last_modified_by = current_user where ",
+        );
+        self.push_tenant_filter(&mut qb, tenant_ref);
+        qb.push("id = ");
+        qb.push_bind(id);
+        qb.push(" and version = ");
+        qb.push_bind(ver);
+        qb.push(" and deleted_at is null");
+        let rows = qb.build().execute(&mut *tx).await?;
         if rows.rows_affected() != 1 {
             return Err(Error::DocVersionConflict);
         }
@@ -192,8 +291,13 @@ impl Documents {
     ) -> Result<i32> {
         if patches.is_empty() {
             // No-op; return current version
-            let ver: Option<i32> = sqlx::query_scalar("select version from docs where id = $1")
-                .bind(id)
+            let tenant_value = self.resolve_conjoined_tenant()?;
+            let mut qb = QueryBuilder::<Postgres>::new("select version from docs where ");
+            self.push_tenant_filter(&mut qb, tenant_value.as_ref());
+            qb.push("id = ");
+            qb.push_bind(id);
+            let ver: Option<i32> = qb
+                .build_query_scalar::<i32>()
                 .fetch_optional(&self.pool)
                 .await?;
             return ver.ok_or(Error::DocNotFound);
@@ -209,6 +313,9 @@ impl Documents {
                 parent_paths.insert(parts[..parts.len() - 1].to_vec());
             }
         }
+
+        let tenant_value = self.resolve_conjoined_tenant()?;
+        let tenant_ref = tenant_value.as_ref();
 
         let mut qb = QueryBuilder::<Postgres>::new("update docs set doc = ");
         let total_ops = parent_paths.len() + patches.len();
@@ -233,7 +340,11 @@ impl Documents {
             qb.push_bind(Json(value.clone()));
             qb.push(", true)");
         }
-        qb.push(", version = version + 1, updated_at = now(), last_modified_by = current_user where id = ");
+        qb.push(
+            ", version = version + 1, updated_at = now(), last_modified_by = current_user where ",
+        );
+        self.push_tenant_filter(&mut qb, tenant_ref);
+        qb.push("id = ");
         qb.push_bind(id);
         if let Some(ver) = expected {
             qb.push(" and version = ");
@@ -246,10 +357,10 @@ impl Documents {
 
         let query = qb.build_query_as::<(i32,)>();
         if let Some((new_ver,)) = query.fetch_optional(&self.pool).await? {
-            metrics::record_doc_write(Some("public"), 1);
+            metrics::record_doc_write(self.metrics_label(), 1);
             Ok(new_ver)
         } else if expected.is_some() {
-            metrics::record_doc_conflict(Some("public"));
+            metrics::record_doc_conflict(self.metrics_label());
             Err(Error::DocVersionConflict)
         } else {
             Err(Error::DocNotFound)
@@ -271,18 +382,29 @@ impl Documents {
     pub async fn get_field(&self, id: &Uuid, path: &str) -> Result<Option<Value>> {
         let parts: Vec<String> = path.split('.').map(|segment| segment.to_owned()).collect();
 
-        let value: Option<Option<Value>> =
-            sqlx::query_scalar("select doc #> $2 as field from docs where id = $1")
-                .bind(id)
-                .bind(parts)
-                .fetch_optional(&self.pool)
-                .await?;
+        let tenant_value = self.resolve_conjoined_tenant()?;
+        let mut qb = QueryBuilder::<Postgres>::new("select doc #> ");
+        qb.push_bind(parts);
+        qb.push(" as field from docs where ");
+        self.push_tenant_filter(&mut qb, tenant_value.as_ref());
+        qb.push("id = ");
+        qb.push_bind(id);
+
+        let value: Option<Option<Value>> = qb
+            .build_query_scalar::<Option<Value>>()
+            .fetch_optional(&self.pool)
+            .await?;
 
         Ok(value.flatten())
     }
 
     pub fn query<T>(&self) -> DocumentQuery<T> {
-        DocumentQuery::new(self.pool.clone())
+        DocumentQuery::new(
+            self.pool.clone(),
+            self.tenant_strategy.clone(),
+            self.tenant_resolver.clone(),
+            self.tenant.clone(),
+        )
     }
 
     pub async fn execute_compiled<Q, R>(&self, query: Q) -> Result<Vec<R>>
@@ -292,6 +414,11 @@ impl Documents {
     {
         let mut ctx = DocumentQueryContext::new();
         query.configure(&mut ctx);
+        if let TenantStrategy::Conjoined { column } = &self.tenant_strategy {
+            if let Some(tenant) = self.resolve_conjoined_tenant()? {
+                ctx.set_tenant_filter(column.name.clone(), tenant);
+            }
+        }
         let (pool, mut builder) = ctx.into_spec().build_query(self.pool.clone());
         let query = builder.build_query_as::<(serde_json::Value,)>();
         let rows = query.fetch_all(&pool).await?;
@@ -301,7 +428,7 @@ impl Documents {
     }
 
     pub fn session(&self) -> DocumentSession {
-        DocumentSession::new(
+        let mut session = DocumentSession::new(
             self.pool.clone(),
             Events {
                 pool: self.pool.clone(),
@@ -309,7 +436,15 @@ impl Documents {
                 apply_inline: false,
             },
             crate::context::SessionContext::default(),
-        )
+        );
+        session.set_tenant_strategy(self.tenant_strategy.clone());
+        if let Some(resolver) = &self.tenant_resolver {
+            session.set_tenant_resolver(Some(resolver.clone()));
+        }
+        if let Some(ref tenant) = self.tenant {
+            session.context_mut().tenant = Some(tenant.clone());
+        }
+        session
     }
 
     /// Bulk upsert documents. Returns number of rows inserted/updated.
@@ -325,27 +460,30 @@ impl Documents {
             docs.push(Json(v));
         }
 
-        let recs: Vec<(Uuid,)> = sqlx::query_as(
-            r#"
-            with input as (
-              select unnest($1::uuid[]) as id, unnest($2::jsonb[]) as doc
-            )
-            insert into docs (id, doc, version, created_by, last_modified_by)
-            select id, doc, 1, current_user, current_user from input
-            on conflict (id) do update set
-              doc = excluded.doc,
-              version = docs.version + 1,
-              updated_at = now(),
-              last_modified_by = current_user
-            returning id
-            "#,
-        )
-        .bind(&ids)
-        .bind(&docs)
-        .fetch_all(&self.pool)
-        .await?;
+        let tenant_value = self.resolve_conjoined_tenant()?;
+        let tenant_ref = tenant_value.as_ref();
+        let mut qb = QueryBuilder::<Postgres>::new("with input as ( select unnest(");
+        qb.push_bind(&ids);
+        qb.push("::uuid[]) as id, unnest(");
+        qb.push_bind(&docs);
+        qb.push("::jsonb[]) as doc ) insert into docs (");
+        if let (Some(column), Some(value)) = (self.tenant_column(), tenant_ref) {
+            qb.push(format!("{}, ", schema::quote_ident(column)));
+            qb.push("id, doc, version, created_by, last_modified_by) select ");
+            qb.push_bind(value);
+            qb.push(", id, doc, 1, current_user, current_user from input ");
+        } else {
+            qb.push("id, doc, version, created_by, last_modified_by) select id, doc, 1, current_user, current_user from input ");
+        }
+        qb.push(
+            "on conflict (id) do update set doc = excluded.doc, version = docs.version + 1, updated_at = now(), last_modified_by = current_user returning id",
+        );
+
+        let recs: Vec<(Uuid,)> = qb.build_query_as().fetch_all(&self.pool).await?;
         let affected = recs.len();
-        metrics::record_doc_write(Some("public"), affected as u64);
+        if affected > 0 {
+            metrics::record_doc_write(self.metrics_label(), affected as u64);
+        }
         Ok(affected)
     }
 
@@ -368,35 +506,31 @@ impl Documents {
             vers.push(*ver);
         }
 
-        let recs: Vec<(Uuid,)> = sqlx::query_as(
-            r#"
-            with t as (
-              select unnest($1::uuid[]) as id,
-                     unnest($2::jsonb[]) as doc,
-                     unnest($3::int[])   as expected
-            )
-            update docs d
-            set doc = t.doc,
-                version = d.version + 1,
-                updated_at = now(),
-                last_modified_by = current_user
-            from t
-            where d.id = t.id and d.version = t.expected
-            returning d.id
-            "#,
-        )
-        .bind(&ids)
-        .bind(&docs)
-        .bind(&vers)
-        .fetch_all(&self.pool)
-        .await?;
+        let tenant_value = self.resolve_conjoined_tenant()?;
+        let tenant_ref = tenant_value.as_ref();
+        let mut qb = QueryBuilder::<Postgres>::new("with t as ( select unnest(");
+        qb.push_bind(&ids);
+        qb.push("::uuid[]) as id, unnest(");
+        qb.push_bind(&docs);
+        qb.push("::jsonb[]) as doc, unnest(");
+        qb.push_bind(&vers);
+        qb.push("::int[]) as expected ) update docs d set doc = t.doc, version = d.version + 1, updated_at = now(), last_modified_by = current_user from t where d.id = t.id");
+        if let (Some(column), Some(value)) = (self.tenant_column(), tenant_ref) {
+            qb.push(" and d.");
+            qb.push(schema::quote_ident(column));
+            qb.push(" = ");
+            qb.push_bind(value);
+        }
+        qb.push(" and d.version = t.expected returning d.id");
+
+        let recs: Vec<(Uuid,)> = qb.build_query_as().fetch_all(&self.pool).await?;
         let updated = recs.len();
         let conflicts = items.len() - updated;
         if updated > 0 {
-            metrics::record_doc_write(Some("public"), updated as u64);
+            metrics::record_doc_write(self.metrics_label(), updated as u64);
         }
         if conflicts > 0 {
-            metrics::record_doc_conflict(Some("public"));
+            metrics::record_doc_conflict(self.metrics_label());
         }
         Ok((updated, conflicts))
     }
@@ -406,10 +540,13 @@ impl Documents {
         if ids.is_empty() {
             return Ok(0);
         }
-        let result = sqlx::query("delete from docs where id = any($1)")
-            .bind(ids)
-            .execute(&self.pool)
-            .await?;
+        let tenant_value = self.resolve_conjoined_tenant()?;
+        let mut qb = QueryBuilder::<Postgres>::new("delete from docs where ");
+        self.push_tenant_filter(&mut qb, tenant_value.as_ref());
+        qb.push("id = any(");
+        qb.push_bind(ids);
+        qb.push(")");
+        let result = qb.build().execute(&self.pool).await?;
         Ok(result.rows_affected() as u64)
     }
 }
@@ -503,6 +640,38 @@ impl DocumentSession {
         self.tenant_resolver = resolver;
     }
 
+    fn conjoined_column_name(&self) -> Option<&str> {
+        match &self.tenant_strategy {
+            TenantStrategy::Conjoined { column } => Some(column.name.as_str()),
+            _ => None,
+        }
+    }
+
+    fn conjoined_tenant_value(&self) -> Result<Option<String>> {
+        match &self.tenant_strategy {
+            TenantStrategy::Conjoined { .. } => self
+                .context
+                .tenant
+                .as_ref()
+                .cloned()
+                .ok_or(Error::TenantRequired)
+                .map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    fn push_tenant_filter<'a>(
+        &self,
+        builder: &mut QueryBuilder<'a, Postgres>,
+        tenant: Option<&'a String>,
+    ) {
+        if let (Some(column), Some(value)) = (self.conjoined_column_name(), tenant) {
+            builder.push(format!("{} = ", schema::quote_ident(column)));
+            builder.push_bind(value);
+            builder.push(" and ");
+        }
+    }
+
     pub(crate) fn new(
         pool: PgPool,
         events_api: Events,
@@ -525,6 +694,20 @@ impl DocumentSession {
     fn tenant_schema(&mut self) -> Result<Option<String>> {
         match self.tenant_strategy {
             TenantStrategy::Single => Ok(None),
+            TenantStrategy::Conjoined { .. } => {
+                if self.context.tenant.is_some() {
+                    Ok(None)
+                } else if let Some(resolver) = &self.tenant_resolver {
+                    if let Some(tenant) = (resolver)() {
+                        self.context.tenant = Some(tenant);
+                        Ok(None)
+                    } else {
+                        Err(Error::TenantRequired)
+                    }
+                } else {
+                    Err(Error::TenantRequired)
+                }
+            }
             TenantStrategy::SchemaPerTenant => {
                 if let Some(ref tenant) = self.context.tenant {
                     Ok(Some(tenant_schema_name(tenant)))
@@ -570,20 +753,27 @@ impl DocumentSession {
         }
 
         let schema = self.tenant_schema()?;
+        let tenant_value = self.conjoined_tenant_value()?;
         let mut conn = self.pool.acquire().await?;
         let row = if let Some(ref schema_name) = schema {
             let mut tx = conn.begin().await?;
             Self::set_local_search_path_tx(&mut tx, schema_name).await?;
-            let row: Option<(Value, i32, Option<chrono::DateTime<chrono::Utc>>)> =
-                sqlx::query_as("select doc, version, deleted_at from docs where id = $1")
-                    .bind(id)
-                    .fetch_optional(&mut *tx)
-                    .await?;
+            let mut qb =
+                QueryBuilder::<Postgres>::new("select doc, version, deleted_at from docs where ");
+            self.push_tenant_filter(&mut qb, tenant_value.as_ref());
+            qb.push("id = ");
+            qb.push_bind(id);
+            let query = qb.build_query_as::<(Value, i32, Option<chrono::DateTime<chrono::Utc>>)>();
+            let row = query.fetch_optional(&mut *tx).await?;
             tx.commit().await?;
             row
         } else {
-            sqlx::query_as("select doc, version, deleted_at from docs where id = $1")
-                .bind(id)
+            let mut qb =
+                QueryBuilder::<Postgres>::new("select doc, version, deleted_at from docs where ");
+            self.push_tenant_filter(&mut qb, tenant_value.as_ref());
+            qb.push("id = ");
+            qb.push_bind(id);
+            qb.build_query_as::<(Value, i32, Option<chrono::DateTime<chrono::Utc>>)>()
                 .fetch_optional(&mut *conn)
                 .await?
         };
@@ -818,11 +1008,13 @@ impl DocumentSession {
                 return Err(Error::TenantNotFound(schema_name.clone()));
             }
         }
+        let tenant_value = self.conjoined_tenant_value()?;
         let mut tx = self.pool.begin().await?;
 
         if let Some(ref schema_name) = schema {
             Self::set_local_search_path_tx(&mut tx, schema_name).await?;
         }
+        let tenant_value_ref = tenant_value.as_ref();
         let mut mutations = Vec::with_capacity(self.staged.len());
         let mut write_count = 0u64;
 
@@ -831,19 +1023,20 @@ impl DocumentSession {
             match op.action {
                 SessionAction::Upsert { value, expected } => {
                     let version = if let Some(expected) = expected {
-                        let rec: Option<(i32,)> = sqlx::query_as(
-                            r#"update docs
-                               set doc = $2,
-                                   version = version + 1,
-                                   updated_at = now()
-                               where id = $1 and version = $3 and deleted_at is null
-                               returning version"#,
-                        )
-                        .bind(op.id)
-                        .bind(&value)
-                        .bind(expected)
-                        .fetch_optional(&mut *tx)
-                        .await?;
+                        let mut qb = QueryBuilder::<Postgres>::new("update docs set doc = ");
+                        qb.push_bind(&value);
+                        qb.push(
+                            ", version = version + 1, updated_at = now(), last_modified_by = current_user where ",
+                        );
+                        self.push_tenant_filter(&mut qb, tenant_value_ref);
+                        qb.push("id = ");
+                        qb.push_bind(op.id);
+                        qb.push(" and version = ");
+                        qb.push_bind(expected);
+                        qb.push(" and deleted_at is null returning version");
+
+                        let rec: Option<(i32,)> =
+                            qb.build_query_as().fetch_optional(&mut *tx).await?;
 
                         match rec {
                             Some((ver,)) => ver,
@@ -853,21 +1046,25 @@ impl DocumentSession {
                             }
                         }
                     } else {
-                        sqlx::query_scalar(
-                            r#"with up as (
-                                   insert into docs (id, doc, version)
-                                   values ($1, $2, 1)
-                                   on conflict (id) do update
-                                     set doc = excluded.doc,
-                                         version = docs.version + 1,
-                                         updated_at = now()
-                                   returning version)
-                               select version from up"#,
-                        )
-                        .bind(op.id)
-                        .bind(&value)
-                        .fetch_one(&mut *tx)
-                        .await?
+                        let mut qb =
+                            QueryBuilder::<Postgres>::new("with up as ( insert into docs (");
+                        if let (Some(column), Some(tenant)) =
+                            (self.conjoined_column_name(), tenant_value_ref)
+                        {
+                            qb.push(format!("{}, ", schema::quote_ident(column)));
+                            qb.push("id, doc, version, created_by, last_modified_by) values (");
+                            qb.push_bind(tenant);
+                            qb.push(", ");
+                        } else {
+                            qb.push("id, doc, version, created_by, last_modified_by) values (");
+                        }
+                        qb.push_bind(op.id);
+                        qb.push(", ");
+                        qb.push_bind(&value);
+                        qb.push(
+                            ", 1, current_user, current_user) on conflict (id) do update set doc = excluded.doc, version = docs.version + 1, updated_at = now(), last_modified_by = current_user returning version) select version from up",
+                        );
+                        qb.build_query_scalar().fetch_one(&mut *tx).await?
                     };
 
                     mutations.push(IdentityMutation::Upsert {
@@ -879,22 +1076,24 @@ impl DocumentSession {
                 }
                 SessionAction::Delete { expected } => {
                     if let Some(expected) = expected {
-                        let result = sqlx::query(
-                            "delete from docs where id = $1 and version = $2 and deleted_at is null",
-                        )
-                        .bind(op.id)
-                        .bind(expected)
-                        .execute(&mut *tx)
-                        .await?;
+                        let mut qb = QueryBuilder::<Postgres>::new("delete from docs where ");
+                        self.push_tenant_filter(&mut qb, tenant_value_ref);
+                        qb.push("id = ");
+                        qb.push_bind(op.id);
+                        qb.push(" and version = ");
+                        qb.push_bind(expected);
+                        qb.push(" and deleted_at is null");
+                        let result = qb.build().execute(&mut *tx).await?;
                         if result.rows_affected() == 0 {
                             metrics::record_doc_conflict(self.context.tenant.as_deref());
                             return Err(Error::DocVersionConflict);
                         }
                     } else {
-                        sqlx::query("delete from docs where id = $1")
-                            .bind(op.id)
-                            .execute(&mut *tx)
-                            .await?;
+                        let mut qb = QueryBuilder::<Postgres>::new("delete from docs where ");
+                        self.push_tenant_filter(&mut qb, tenant_value_ref);
+                        qb.push("id = ");
+                        qb.push_bind(op.id);
+                        qb.build().execute(&mut *tx).await?;
                     }
                     mutations.push(IdentityMutation::Delete { id: op.id });
                 }
@@ -926,17 +1125,27 @@ impl DocumentSession {
 
         if !snapshot_ops.is_empty() {
             for op in &snapshot_ops {
-                if let Err(err) = sqlx::query(
-                    r#"insert into snapshots(stream_id, version, body)
-                        values ($1, $2, $3)
-                        on conflict (stream_id) do update set version = excluded.version, body = excluded.body, created_at = now()"#,
-                )
-                .bind(op.stream_id)
-                .bind(op.version)
-                .bind(&op.body)
-                .execute(&mut *tx)
-                .await
+                let mut qb = QueryBuilder::<Postgres>::new("insert into snapshots (");
+                if let (Some(column), Some(tenant)) =
+                    (self.conjoined_column_name(), tenant_value_ref)
                 {
+                    qb.push(format!("{}, ", schema::quote_ident(column)));
+                    qb.push("stream_id, version, body) values (");
+                    qb.push_bind(tenant);
+                    qb.push(", ");
+                } else {
+                    qb.push("stream_id, version, body) values (");
+                }
+                qb.push_bind(op.stream_id);
+                qb.push(", ");
+                qb.push_bind(op.version);
+                qb.push(", ");
+                qb.push_bind(&op.body);
+                qb.push(
+                    ") on conflict (stream_id) do update set version = excluded.version, body = excluded.body, created_at = now()",
+                );
+
+                if let Err(err) = qb.build().execute(&mut *tx).await {
                     self.event_ops = event_ops;
                     self.snapshot_ops = snapshot_ops;
                     return Err(err.into());
