@@ -432,6 +432,53 @@ enum DocsCmd {
         #[arg(long)]
         tenant: Option<String>,
     },
+    /// Duplicated fields management commands
+    #[command(subcommand)]
+    DuplicatedFields(DuplicatedFieldsCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum DuplicatedFieldsCmd {
+    /// List currently configured duplicated fields
+    List {
+        #[arg(long)]
+        tenant: Option<String>,
+    },
+    /// Suggest adding a duplicated field (prints DDL preview)
+    Suggest {
+        /// JSONB path (e.g., "email", "profile.age")
+        field: String,
+        /// Column name (e.g., "d_email")
+        #[arg(long)]
+        column: String,
+        /// PostgreSQL type (text, integer, bigint, numeric, boolean, timestamptz, uuid, jsonb)
+        #[arg(long)]
+        field_type: String,
+        /// Whether to create an index on this column
+        #[arg(long, default_value_t = true)]
+        indexed: bool,
+        /// Index type (btree, hash, gin, gist)
+        #[arg(long, default_value = "btree")]
+        index_type: String,
+        /// Transform expression (e.g., "lower({value})")
+        #[arg(long)]
+        transform: Option<String>,
+        #[arg(long)]
+        tenant: Option<String>,
+    },
+    /// Backfill existing data into duplicated columns
+    Backfill {
+        /// Column name to backfill (e.g., "d_email")
+        column: String,
+        /// Batch size for updates
+        #[arg(long, default_value_t = 1000)]
+        batch_size: i64,
+        /// Dry run (show what would be done)
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        #[arg(long)]
+        tenant: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -536,6 +583,7 @@ async fn main() -> rillflow::Result<()> {
     let config = SchemaConfig {
         base_schema: cli.schema,
         tenancy_mode,
+        duplicated_fields: Vec::new(),
     };
 
     let mut builder = Store::builder(&url);
@@ -1124,6 +1172,217 @@ async fn main() -> rillflow::Result<()> {
                     println!("{}", line);
                 }
             }
+            DocsCmd::DuplicatedFields(dup_cmd) => match dup_cmd {
+                DuplicatedFieldsCmd::List { tenant } => {
+                    use rillflow::schema::quote_ident;
+                    let schema = tenant
+                        .as_deref()
+                        .map(|t| rillflow::store::tenant_schema_name(t))
+                        .unwrap_or_else(|| "public".to_string());
+
+                    // Query information_schema to find columns that look like duplicated fields
+                    let rows: Vec<(String, String, String)> = sqlx::query_as(
+                        "SELECT column_name, data_type, is_nullable
+                         FROM information_schema.columns
+                         WHERE table_schema = $1
+                           AND table_name = 'docs'
+                           AND column_name LIKE 'd_%'
+                         ORDER BY ordinal_position",
+                    )
+                    .bind(&schema)
+                    .fetch_all(store.pool())
+                    .await?;
+
+                    if rows.is_empty() {
+                        println!("No duplicated fields found in schema '{}'", schema);
+                        println!(
+                            "\nTo add duplicated fields, use the 'suggest' command or configure them in code:"
+                        );
+                        println!(
+                            "  rillflow docs duplicated-fields suggest <field> --column <name> --field-type <type>"
+                        );
+                    } else {
+                        println!("Duplicated fields in schema '{}':", schema);
+                        println!("{:<20} {:<15} {:<10}", "Column", "Type", "Nullable");
+                        println!("{}", "-".repeat(50));
+                        for (col, typ, nullable) in rows {
+                            println!("{:<20} {:<15} {:<10}", col, typ, nullable);
+                        }
+                    }
+                }
+                DuplicatedFieldsCmd::Suggest {
+                    field,
+                    column,
+                    field_type,
+                    indexed,
+                    index_type,
+                    transform,
+                    tenant,
+                } => {
+                    use rillflow::schema::{DuplicatedField, DuplicatedFieldType, IndexType};
+
+                    let schema = tenant
+                        .as_deref()
+                        .map(|t| rillflow::store::tenant_schema_name(t))
+                        .unwrap_or_else(|| "public".to_string());
+
+                    // Parse field type
+                    let pg_type = match field_type.to_lowercase().as_str() {
+                        "text" => DuplicatedFieldType::Text,
+                        "integer" | "int" => DuplicatedFieldType::Integer,
+                        "bigint" => DuplicatedFieldType::BigInt,
+                        "numeric" | "decimal" => DuplicatedFieldType::Numeric,
+                        "boolean" | "bool" => DuplicatedFieldType::Boolean,
+                        "timestamptz" | "timestamp" => DuplicatedFieldType::Timestamptz,
+                        "uuid" => DuplicatedFieldType::Uuid,
+                        "jsonb" => DuplicatedFieldType::Jsonb,
+                        _ => {
+                            eprintln!("Error: Unknown field type '{}'", field_type);
+                            eprintln!(
+                                "Supported types: text, integer, bigint, numeric, boolean, timestamptz, uuid, jsonb"
+                            );
+                            return Ok(());
+                        }
+                    };
+
+                    let idx_type = match index_type.to_lowercase().as_str() {
+                        "btree" => IndexType::BTree,
+                        "hash" => IndexType::Hash,
+                        "gin" => IndexType::Gin,
+                        "gist" => IndexType::Gist,
+                        _ => {
+                            eprintln!("Error: Unknown index type '{}'", index_type);
+                            eprintln!("Supported types: btree, hash, gin, gist");
+                            return Ok(());
+                        }
+                    };
+
+                    let mut dup_field =
+                        DuplicatedField::new(field.clone(), column.clone(), pg_type)
+                            .with_indexed(*indexed)
+                            .with_index_type(idx_type);
+
+                    if let Some(ref t) = transform {
+                        dup_field = dup_field.with_transform(t.clone());
+                    }
+
+                    println!(
+                        "Suggested configuration for duplicated field '{}' -> '{}':",
+                        field, column
+                    );
+                    println!("\n// Rust code:");
+                    println!(
+                        "use rillflow::schema::{{DuplicatedField, DuplicatedFieldType, IndexType, SchemaConfig}};"
+                    );
+                    println!();
+                    println!("let config = SchemaConfig::single_tenant()");
+                    print!(
+                        "    .add_duplicated_field(\n        DuplicatedField::new(\"{}\", \"{}\", DuplicatedFieldType::{:?})",
+                        field, column, pg_type
+                    );
+                    if *indexed {
+                        print!("\n            .with_indexed(true)");
+                        if idx_type != IndexType::BTree {
+                            print!("\n            .with_index_type(IndexType::{:?})", idx_type);
+                        }
+                    }
+                    if let Some(ref t) = transform {
+                        print!("\n            .with_transform(\"{}\")", t);
+                    }
+                    println!("\n    );");
+                    println!();
+                    println!("store.schema().sync(&config).await?;");
+                    println!("\n// Extraction SQL that will be used:");
+                    println!("{}", dup_field.extraction_sql());
+                }
+                DuplicatedFieldsCmd::Backfill {
+                    column,
+                    batch_size,
+                    dry_run,
+                    tenant,
+                } => {
+                    use rillflow::schema::quote_ident;
+                    let schema = tenant
+                        .as_deref()
+                        .map(|t| rillflow::store::tenant_schema_name(t))
+                        .unwrap_or_else(|| "public".to_string());
+
+                    // Check if column exists
+                    let exists: bool = sqlx::query_scalar(
+                        "SELECT EXISTS (
+                            SELECT 1 FROM information_schema.columns
+                            WHERE table_schema = $1 AND table_name = 'docs' AND column_name = $2
+                        )",
+                    )
+                    .bind(&schema)
+                    .bind(&column)
+                    .fetch_one(store.pool())
+                    .await?;
+
+                    if !exists {
+                        eprintln!(
+                            "Error: Column '{}' does not exist in {}.docs",
+                            column, schema
+                        );
+                        eprintln!(
+                            "Add the duplicated field to your SchemaConfig and run schema-sync first."
+                        );
+                        return Ok(());
+                    }
+
+                    // Count rows that need backfilling
+                    let count: i64 = sqlx::query_scalar(&format!(
+                        "SELECT COUNT(*) FROM {}.docs WHERE {} IS NULL",
+                        quote_ident(&schema),
+                        quote_ident(&column)
+                    ))
+                    .fetch_one(store.pool())
+                    .await?;
+
+                    if count == 0 {
+                        println!(
+                            "All rows already have '{}' populated. No backfill needed.",
+                            column
+                        );
+                        return Ok(());
+                    }
+
+                    println!("Found {} rows where '{}' is NULL", count, column);
+
+                    if *dry_run {
+                        println!("\n[DRY RUN] Would backfill in batches of {}", batch_size);
+                        println!("Run without --dry-run to execute the backfill.");
+                        return Ok(());
+                    }
+
+                    println!("Starting backfill in batches of {}...", batch_size);
+
+                    let mut total_updated = 0i64;
+                    loop {
+                        let updated: u64 = sqlx::query(&format!(
+                            "UPDATE {schema}.docs SET doc = doc
+                             WHERE {col} IS NULL
+                             AND id IN (SELECT id FROM {schema}.docs WHERE {col} IS NULL LIMIT $1)",
+                            schema = quote_ident(&schema),
+                            col = quote_ident(&column)
+                        ))
+                        .bind(batch_size)
+                        .execute(store.pool())
+                        .await?
+                        .rows_affected();
+
+                        total_updated += updated as i64;
+
+                        if updated == 0 {
+                            break;
+                        }
+
+                        println!("  Updated {} rows (total: {})", updated, total_updated);
+                    }
+
+                    println!("\nBackfill complete! Updated {} rows total.", total_updated);
+                }
+            },
             DocsCmd::Verify { tenant } => {
                 let mut conn = store.pool().acquire().await?;
                 if let Some(t) = tenant.as_deref() {
@@ -1326,6 +1585,7 @@ async fn main() -> rillflow::Result<()> {
                         let config = SchemaConfig {
                             base_schema: schema.clone(),
                             tenancy_mode,
+                            duplicated_fields: Vec::new(),
                         };
                         let plan = store.schema().plan(&config).await?;
                         if plan.is_empty() {

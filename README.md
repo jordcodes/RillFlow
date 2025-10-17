@@ -127,6 +127,7 @@ cargo run --features cli --bin rillflow -- schema-plan --database-url "$DATABASE
 - JSONB document store with optimistic versioning
 - Document session unit-of-work with identity map + staged writes
 - LINQ-like document query DSL (filters, sorting, paging, projections)
+- **Duplicated fields** for high-performance queries (10-100x faster than JSONB indexing)
 - Composable compiled queries for cached predicates and reuse
 - Event streams with expected-version checks
   - Envelopes: headers, causation_id, correlation_id, created_at (API: read envelopes, append with headers)
@@ -369,6 +370,42 @@ async fn active_customers(store: &Store) -> rillflow::Result<Vec<Customer>> {
         .await
 }
 ```
+
+### Duplicated Fields (High-Performance Indexing)
+
+For frequently queried JSONB fields, duplicate them into native PostgreSQL columns for 10-100x faster queries:
+
+```rust
+use rillflow::schema::{DuplicatedField, DuplicatedFieldType, SchemaConfig};
+
+let config = SchemaConfig::single_tenant()
+    .add_duplicated_field(
+        DuplicatedField::new("email", "d_email", DuplicatedFieldType::Text)
+            .with_indexed(true)
+            .with_transform("lower({value})")  // Case-insensitive
+    )
+    .add_duplicated_field(
+        DuplicatedField::new("age", "d_age", DuplicatedFieldType::Integer)
+            .with_indexed(true)
+    );
+
+store.schema().sync(&config).await?;
+
+// Queries automatically use duplicated columns when available
+let customers = store
+    .docs()
+    .query::<Customer>()
+    .filter(Predicate::eq("email", "user@example.com"))  // Uses d_email column + index
+    .filter(Predicate::gt("age", 25.0))                   // Uses d_age column + index
+    .fetch_all()
+    .await?;
+```
+
+**How it works:**
+- PostgreSQL triggers automatically sync duplicated columns with JSONB `doc` on INSERT/UPDATE
+- Query DSL transparently rewrites predicates to use duplicated columns
+- Supports nested paths (`profile.age`), transforms (`lower({value})`), and all PostgreSQL types
+- See [MIGRATIONS.md](MIGRATIONS.md) for detailed configuration and backfilling strategies
 
 ### Document Repository (OCC and soft delete)
 

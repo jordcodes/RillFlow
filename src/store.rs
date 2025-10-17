@@ -202,6 +202,7 @@ impl Store {
                         tenancy_mode: TenancyMode::SchemaPerTenant {
                             tenants: vec![TenantSchema::new(&schema)],
                         },
+                        duplicated_fields: Vec::new(),
                     };
                     self.schema().sync(&config).await
                 }

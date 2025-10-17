@@ -1,4 +1,4 @@
-use std::{fmt, marker::PhantomData, sync::Arc};
+use std::{collections::HashMap, fmt, marker::PhantomData, sync::Arc};
 
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -88,6 +88,8 @@ pub(crate) struct QuerySpec {
     aggregates: Vec<AggregateSpec>,
     includes: Vec<IncludeSpec>,
     tenant_filter: Option<(String, String)>,
+    /// Maps JSONB paths (e.g., "email") to duplicated column names (e.g., "d_email")
+    duplicated_fields_map: HashMap<String, String>,
 }
 
 impl Default for QuerySpec {
@@ -103,6 +105,7 @@ impl Default for QuerySpec {
             aggregates: Vec::new(),
             includes: Vec::new(),
             tenant_filter: None,
+            duplicated_fields_map: HashMap::new(),
         }
     }
 }
@@ -118,6 +121,14 @@ impl QuerySpec {
         value: impl Into<String>,
     ) {
         self.tenant_filter = Some((column.into(), value.into()));
+    }
+
+    pub(crate) fn set_duplicated_fields_map(&mut self, map: HashMap<String, String>) {
+        self.duplicated_fields_map = map;
+    }
+
+    pub(crate) fn duplicated_fields_map(&self) -> &HashMap<String, String> {
+        &self.duplicated_fields_map
     }
 
     pub(crate) fn filters(&self) -> &[Predicate] {
@@ -190,6 +201,7 @@ impl QuerySpec {
             aggregates,
             includes,
             tenant_filter,
+            duplicated_fields_map: _,
         } = self;
 
         let mut builder = QueryBuilder::new("select ");
@@ -216,7 +228,7 @@ impl QuerySpec {
                             builder.push(".doc #> ");
                             builder.push_bind(field.path.parts().to_vec());
                         } else {
-                            push_json_expr(&mut builder, &field.path);
+                            push_json_expr(&mut builder, &field.path, &self.duplicated_fields_map);
                         }
                     }
                     builder.push(") as doc");
@@ -251,7 +263,7 @@ impl QuerySpec {
                             } => {
                                 builder.push_bind(alias.clone());
                                 builder.push(", sum((");
-                                push_text_expr(&mut builder, path);
+                                push_text_expr(&mut builder, path, &self.duplicated_fields_map);
                                 builder.push(")::numeric)");
                             }
                             AggregateSpec::Avg {
@@ -260,7 +272,7 @@ impl QuerySpec {
                             } => {
                                 builder.push_bind(alias.clone());
                                 builder.push(", avg((");
-                                push_text_expr(&mut builder, path);
+                                push_text_expr(&mut builder, path, &self.duplicated_fields_map);
                                 builder.push(")::numeric)");
                             }
                             AggregateSpec::Min {
@@ -269,7 +281,7 @@ impl QuerySpec {
                             } => {
                                 builder.push_bind(alias.clone());
                                 builder.push(", min((");
-                                push_text_expr(&mut builder, path);
+                                push_text_expr(&mut builder, path, &self.duplicated_fields_map);
                                 builder.push(")::numeric)");
                             }
                             AggregateSpec::Max {
@@ -278,7 +290,7 @@ impl QuerySpec {
                             } => {
                                 builder.push_bind(alias.clone());
                                 builder.push(", max((");
-                                push_text_expr(&mut builder, path);
+                                push_text_expr(&mut builder, path, &self.duplicated_fields_map);
                                 builder.push(")::numeric)");
                             }
                         }
@@ -291,7 +303,7 @@ impl QuerySpec {
         builder.push(" from docs");
         // includes
         for inc in &includes {
-            inc.push_join(&mut builder);
+            inc.push_join(&mut builder, &self.duplicated_fields_map);
         }
 
         let mut has_where = false;
@@ -307,11 +319,11 @@ impl QuerySpec {
             has_where = true;
             let mut iter = filters.into_iter();
             if let Some(first) = iter.next() {
-                first.push_sql(&mut builder);
+                first.push_sql(&mut builder, &self.duplicated_fields_map);
             }
             for predicate in iter {
                 builder.push(" and ");
-                predicate.push_sql(&mut builder);
+                predicate.push_sql(&mut builder, &self.duplicated_fields_map);
             }
         }
         if !include_deleted {
@@ -330,7 +342,7 @@ impl QuerySpec {
                 if let Some(src) = &g.source {
                     push_text_expr_from_source(&mut builder, src, &g.path);
                 } else {
-                    push_text_expr(&mut builder, &g.path);
+                    push_text_expr(&mut builder, &g.path, &self.duplicated_fields_map);
                 }
             }
         }
@@ -348,7 +360,7 @@ impl QuerySpec {
                         if let Some(src) = &spec.source {
                             push_text_expr_from_source(&mut builder, src, &spec.path);
                         } else {
-                            push_text_expr(&mut builder, &spec.path);
+                            push_text_expr(&mut builder, &spec.path, &self.duplicated_fields_map);
                         }
                         builder.push(" ");
                         builder.push(direction.as_str());
@@ -358,7 +370,7 @@ impl QuerySpec {
                         if let Some(src) = &spec.source {
                             push_text_expr_from_source(&mut builder, src, &spec.path);
                         } else {
-                            push_text_expr(&mut builder, &spec.path);
+                            push_text_expr(&mut builder, &spec.path, &self.duplicated_fields_map);
                         }
                         builder.push(")::numeric) ");
                         builder.push(direction.as_str());
@@ -397,6 +409,14 @@ impl DocumentQueryContext {
         value: impl Into<String>,
     ) {
         self.spec.set_tenant_filter(column.into(), value.into());
+    }
+
+    pub fn set_duplicated_fields(&mut self, fields: &[crate::schema::DuplicatedField]) {
+        let map: HashMap<String, String> = fields
+            .iter()
+            .map(|f| (f.jsonb_path.clone(), f.column_name.clone()))
+            .collect();
+        self.spec.set_duplicated_fields_map(map);
     }
 
     pub fn full_text_search(&mut self, query: impl Into<String>) -> &mut Self {
@@ -878,29 +898,41 @@ impl Predicate {
         Self::Or(predicates)
     }
 
-    fn push_sql(&self, builder: &mut QueryBuilder<'_, Postgres>) {
+    fn push_sql(
+        &self,
+        builder: &mut QueryBuilder<'_, Postgres>,
+        duplicated_map: &HashMap<String, String>,
+    ) {
         match self {
             Predicate::Eq { path, value } => {
                 builder.push("(");
-                push_json_expr(builder, path);
+                push_json_expr(builder, path, duplicated_map);
                 builder.push(" = ");
                 builder.push_bind(Json(value.clone()));
                 builder.push(")");
             }
             Predicate::Ne { path, value } => {
                 builder.push("(");
-                push_json_expr(builder, path);
+                push_json_expr(builder, path, duplicated_map);
                 builder.push(" <> ");
                 builder.push_bind(Json(value.clone()));
                 builder.push(")");
             }
-            Predicate::Gt { path, value } => push_numeric_cmp(builder, path, *value, ">"),
-            Predicate::Ge { path, value } => push_numeric_cmp(builder, path, *value, ">="),
-            Predicate::Lt { path, value } => push_numeric_cmp(builder, path, *value, "<"),
-            Predicate::Le { path, value } => push_numeric_cmp(builder, path, *value, "<="),
+            Predicate::Gt { path, value } => {
+                push_numeric_cmp(builder, path, *value, ">", duplicated_map)
+            }
+            Predicate::Ge { path, value } => {
+                push_numeric_cmp(builder, path, *value, ">=", duplicated_map)
+            }
+            Predicate::Lt { path, value } => {
+                push_numeric_cmp(builder, path, *value, "<", duplicated_map)
+            }
+            Predicate::Le { path, value } => {
+                push_numeric_cmp(builder, path, *value, "<=", duplicated_map)
+            }
             Predicate::Contains { path, value } => {
                 builder.push("(");
-                push_json_expr(builder, path);
+                push_json_expr(builder, path, duplicated_map);
                 builder.push(" @> ");
                 builder.push_bind(Json(value.clone()));
                 builder.push(")");
@@ -910,7 +942,7 @@ impl Predicate {
                     builder.push("false");
                 } else {
                     builder.push("(");
-                    push_json_expr(builder, path);
+                    push_json_expr(builder, path, duplicated_map);
                     builder.push(" in (");
                     let mut separated = builder.separated(", ");
                     for value in values {
@@ -922,7 +954,7 @@ impl Predicate {
             }
             Predicate::Exists(path) => {
                 builder.push("(");
-                push_json_expr(builder, path);
+                push_json_expr(builder, path, duplicated_map);
                 builder.push(" is not null)");
             }
             Predicate::FullTextMatches { query, language } => {
@@ -950,7 +982,7 @@ impl Predicate {
                 case_insensitive,
             } => {
                 builder.push("(");
-                push_text_expr(builder, path);
+                push_text_expr(builder, path, duplicated_map);
                 builder.push(if *case_insensitive { " ~* " } else { " ~ " });
                 builder.push_bind(pattern.clone());
                 builder.push(")");
@@ -958,7 +990,7 @@ impl Predicate {
             Predicate::Between { path, low, high } => {
                 builder.push("(");
                 builder.push("(");
-                push_text_expr(builder, path);
+                push_text_expr(builder, path, duplicated_map);
                 builder.push(")::numeric between ");
                 builder.push_bind(*low);
                 builder.push(" and ");
@@ -967,7 +999,7 @@ impl Predicate {
             }
             Predicate::Not(inner) => {
                 builder.push("not (");
-                inner.push_sql(builder);
+                inner.push_sql(builder, duplicated_map);
                 builder.push(")");
             }
             Predicate::And(predicates) => {
@@ -977,11 +1009,11 @@ impl Predicate {
                     builder.push("(");
                     let mut iter = predicates.iter();
                     if let Some(first) = iter.next() {
-                        first.push_sql(builder);
+                        first.push_sql(builder, duplicated_map);
                     }
                     for predicate in iter {
                         builder.push(" and ");
-                        predicate.push_sql(builder);
+                        predicate.push_sql(builder, duplicated_map);
                     }
                     builder.push(")");
                 }
@@ -993,11 +1025,11 @@ impl Predicate {
                     builder.push("(");
                     let mut iter = predicates.iter();
                     if let Some(first) = iter.next() {
-                        first.push_sql(builder);
+                        first.push_sql(builder, duplicated_map);
                     }
                     for predicate in iter {
                         builder.push(" or ");
-                        predicate.push_sql(builder);
+                        predicate.push_sql(builder, duplicated_map);
                     }
                     builder.push(")");
                 }
@@ -1016,7 +1048,11 @@ pub(crate) enum AggregateSpec {
 }
 
 impl AggregateSpec {
-    fn push_sql(&self, builder: &mut QueryBuilder<'_, Postgres>) {
+    fn push_sql(
+        &self,
+        builder: &mut QueryBuilder<'_, Postgres>,
+        duplicated_map: &HashMap<String, String>,
+    ) {
         match self {
             AggregateSpec::Count { alias } => {
                 builder.push("count(*) as ");
@@ -1024,25 +1060,25 @@ impl AggregateSpec {
             }
             AggregateSpec::Sum { path, alias } => {
                 builder.push("sum((");
-                push_text_expr(builder, path);
+                push_text_expr(builder, path, duplicated_map);
                 builder.push(")::numeric) as ");
                 builder.push(alias.as_str());
             }
             AggregateSpec::Avg { path, alias } => {
                 builder.push("avg((");
-                push_text_expr(builder, path);
+                push_text_expr(builder, path, duplicated_map);
                 builder.push(")::numeric) as ");
                 builder.push(alias.as_str());
             }
             AggregateSpec::Min { path, alias } => {
                 builder.push("min((");
-                push_text_expr(builder, path);
+                push_text_expr(builder, path, duplicated_map);
                 builder.push(")::numeric) as ");
                 builder.push(alias.as_str());
             }
             AggregateSpec::Max { path, alias } => {
                 builder.push("max((");
-                push_text_expr(builder, path);
+                push_text_expr(builder, path, duplicated_map);
                 builder.push(")::numeric) as ");
                 builder.push(alias.as_str());
             }
@@ -1060,7 +1096,11 @@ pub(crate) struct IncludeSpec {
 }
 
 impl IncludeSpec {
-    fn push_join(&self, builder: &mut QueryBuilder<'_, Postgres>) {
+    fn push_join(
+        &self,
+        builder: &mut QueryBuilder<'_, Postgres>,
+        duplicated_map: &HashMap<String, String>,
+    ) {
         builder.push(" left join ");
         builder.push(&self.table);
         builder.push(" ");
@@ -1070,19 +1110,46 @@ impl IncludeSpec {
         builder.push(".");
         builder.push(&self.foreign_key);
         builder.push(" = (");
-        push_text_expr(builder, &self.local_path);
+        push_text_expr(builder, &self.local_path, duplicated_map);
         builder.push(")::uuid");
     }
 }
 
-fn push_json_expr(builder: &mut QueryBuilder<'_, Postgres>, path: &JsonPath) {
-    builder.push("docs.doc #> ");
-    builder.push_bind(path.parts().to_vec());
+fn push_json_expr(
+    builder: &mut QueryBuilder<'_, Postgres>,
+    path: &JsonPath,
+    duplicated_map: &HashMap<String, String>,
+) {
+    // Check if this path has a duplicated column
+    let path_str = path.parts().join(".");
+    if let Some(column_name) = duplicated_map.get(&path_str) {
+        // Use the duplicated column directly - it's already the right type
+        builder.push("docs.");
+        builder.push(&schema::quote_ident(column_name));
+    } else {
+        // Fall back to JSONB extraction
+        builder.push("docs.doc #> ");
+        builder.push_bind(path.parts().to_vec());
+    }
 }
 
-fn push_text_expr(builder: &mut QueryBuilder<'_, Postgres>, path: &JsonPath) {
-    builder.push("docs.doc #>> ");
-    builder.push_bind(path.parts().to_vec());
+fn push_text_expr(
+    builder: &mut QueryBuilder<'_, Postgres>,
+    path: &JsonPath,
+    duplicated_map: &HashMap<String, String>,
+) {
+    // Check if this path has a duplicated column
+    let path_str = path.parts().join(".");
+    if let Some(column_name) = duplicated_map.get(&path_str) {
+        // Use the duplicated column directly, cast to text if needed
+        builder.push("docs.");
+        builder.push(&schema::quote_ident(column_name));
+        builder.push("::text");
+    } else {
+        // Fall back to JSONB text extraction
+        builder.push("docs.doc #>> ");
+        builder.push_bind(path.parts().to_vec());
+    }
 }
 
 fn push_text_expr_from_source(
@@ -1100,9 +1167,10 @@ fn push_numeric_cmp(
     path: &JsonPath,
     value: f64,
     op: &str,
+    duplicated_map: &HashMap<String, String>,
 ) {
     builder.push("((");
-    push_text_expr(builder, path);
+    push_text_expr(builder, path, duplicated_map);
     builder.push(")::numeric ");
     builder.push(op);
     builder.push(" ");

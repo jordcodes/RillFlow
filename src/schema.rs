@@ -10,6 +10,153 @@ pub enum TenantColumnType {
     Uuid,
 }
 
+/// Supported PostgreSQL types for duplicated fields
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DuplicatedFieldType {
+    Text,
+    Integer,
+    BigInt,
+    Numeric,
+    Boolean,
+    Timestamptz,
+    Uuid,
+    Jsonb,
+}
+
+impl DuplicatedFieldType {
+    pub fn as_sql(&self) -> &'static str {
+        match self {
+            DuplicatedFieldType::Text => "text",
+            DuplicatedFieldType::Integer => "integer",
+            DuplicatedFieldType::BigInt => "bigint",
+            DuplicatedFieldType::Numeric => "numeric",
+            DuplicatedFieldType::Boolean => "boolean",
+            DuplicatedFieldType::Timestamptz => "timestamptz",
+            DuplicatedFieldType::Uuid => "uuid",
+            DuplicatedFieldType::Jsonb => "jsonb",
+        }
+    }
+}
+
+/// Index types for duplicated field columns
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IndexType {
+    BTree,
+    Hash,
+    Gin,
+    Gist,
+}
+
+impl IndexType {
+    pub fn as_sql(&self) -> &'static str {
+        match self {
+            IndexType::BTree => "btree",
+            IndexType::Hash => "hash",
+            IndexType::Gin => "gin",
+            IndexType::Gist => "gist",
+        }
+    }
+}
+
+/// Configuration for a JSONB field to be duplicated into a native PostgreSQL column.
+/// This provides significant performance improvements (10-100x) for frequently queried fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DuplicatedField {
+    /// JSONB path to the field (e.g., "email", "profile.age", "metadata.tags")
+    pub jsonb_path: String,
+    /// Name of the PostgreSQL column to create (e.g., "d_email", "d_profile_age")
+    pub column_name: String,
+    /// PostgreSQL type for the duplicated column
+    pub pg_type: DuplicatedFieldType,
+    /// Whether the column allows NULL values
+    pub nullable: bool,
+    /// Whether to create an index on this column
+    pub indexed: bool,
+    /// Type of index to create (only used if indexed=true)
+    pub index_type: IndexType,
+    /// Optional SQL expression to transform the value (e.g., "lower({value})" for case-insensitive)
+    pub transform: Option<String>,
+}
+
+impl DuplicatedField {
+    pub fn new(
+        jsonb_path: impl Into<String>,
+        column_name: impl Into<String>,
+        pg_type: DuplicatedFieldType,
+    ) -> Self {
+        Self {
+            jsonb_path: jsonb_path.into(),
+            column_name: column_name.into(),
+            pg_type,
+            nullable: true,
+            indexed: true,
+            index_type: IndexType::BTree,
+            transform: None,
+        }
+    }
+
+    pub fn with_nullable(mut self, nullable: bool) -> Self {
+        self.nullable = nullable;
+        self
+    }
+
+    pub fn with_indexed(mut self, indexed: bool) -> Self {
+        self.indexed = indexed;
+        self
+    }
+
+    pub fn with_index_type(mut self, index_type: IndexType) -> Self {
+        self.index_type = index_type;
+        self
+    }
+
+    pub fn with_transform(mut self, transform: impl Into<String>) -> Self {
+        self.transform = Some(transform.into());
+        self
+    }
+
+    /// Generate the SQL expression to extract this field from the doc JSONB column
+    pub fn extraction_sql(&self) -> String {
+        let parts: Vec<&str> = self.jsonb_path.split('.').collect();
+
+        let base_expr = if parts.len() == 1 {
+            // Simple path: doc->>'field'
+            format!("NEW.doc->>'{}'", parts[0])
+        } else {
+            // Nested path: doc->'parent'->>'child' or doc#>>'{parent,child}'
+            let parent_path = parts[..parts.len() - 1].join("','");
+            let leaf = parts[parts.len() - 1];
+            format!("NEW.doc#>>'{{{},{}}}'", parent_path, leaf)
+        };
+
+        // Apply type cast if needed
+        let casted_expr = match self.pg_type {
+            DuplicatedFieldType::Text => base_expr,
+            DuplicatedFieldType::Integer => format!("({})::integer", base_expr),
+            DuplicatedFieldType::BigInt => format!("({})::bigint", base_expr),
+            DuplicatedFieldType::Numeric => format!("({})::numeric", base_expr),
+            DuplicatedFieldType::Boolean => format!("({})::boolean", base_expr),
+            DuplicatedFieldType::Timestamptz => format!("({})::timestamptz", base_expr),
+            DuplicatedFieldType::Uuid => format!("({})::uuid", base_expr),
+            DuplicatedFieldType::Jsonb => {
+                // For JSONB, use -> operator to preserve JSON type
+                if parts.len() == 1 {
+                    format!("NEW.doc->'{}'", parts[0])
+                } else {
+                    format!("NEW.doc#>'{{{}}}'", parts.join("','"))
+                }
+            }
+        };
+
+        // Apply transform if specified
+        if let Some(ref transform) = self.transform {
+            transform.replace("{value}", &casted_expr)
+        } else {
+            casted_expr
+        }
+    }
+}
+
 impl TenantColumnType {
     pub fn as_sql(&self) -> &'static str {
         match self {
@@ -67,14 +214,26 @@ impl SchemaManager {
             TenancyMode::Conjoined { column } => Some(column),
             _ => None,
         };
-        self.plan_for_schema(&mut plan, base_schema, &existing_schemas, tenant_column)
-            .await?;
+        self.plan_for_schema(
+            &mut plan,
+            base_schema,
+            &existing_schemas,
+            tenant_column,
+            &config.duplicated_fields,
+        )
+        .await?;
 
         if let TenancyMode::SchemaPerTenant { tenants } = &config.tenancy_mode {
             for tenant in tenants {
                 let schema = tenant.schema.trim();
-                self.plan_for_schema(&mut plan, schema, &existing_schemas, None)
-                    .await?;
+                self.plan_for_schema(
+                    &mut plan,
+                    schema,
+                    &existing_schemas,
+                    None,
+                    &config.duplicated_fields,
+                )
+                .await?;
             }
         }
 
@@ -108,6 +267,7 @@ impl SchemaManager {
         schema: &str,
         schema_exists: bool,
         tenant_column: Option<&TenantColumn>,
+        duplicated_fields: &[DuplicatedField],
     ) -> Result<()> {
         if !schema_exists {
             plan.push_action(
@@ -144,6 +304,11 @@ impl SchemaManager {
         if docs_exists {
             if let Some(column) = tenant_column {
                 self.ensure_tenant_column(plan, schema, "docs", column)
+                    .await?;
+            }
+            // Ensure duplicated field columns exist
+            if !duplicated_fields.is_empty() {
+                self.ensure_duplicated_columns(plan, schema, "docs", duplicated_fields)
                     .await?;
             }
         }
@@ -231,6 +396,34 @@ impl SchemaManager {
             ),
             build_docs_fts_triggers_sql(schema),
         );
+
+        // Duplicated fields function and triggers
+        if !duplicated_fields.is_empty() {
+            plan.push_action(
+                format!(
+                    "create function {}.rf_docs_duplicated_sync()",
+                    quote_ident(schema)
+                ),
+                build_duplicated_fields_fn_sql(schema, duplicated_fields),
+            );
+            plan.push_action(
+                format!(
+                    "create triggers for {}.docs duplicated fields sync",
+                    quote_ident(schema)
+                ),
+                build_duplicated_fields_triggers_sql(schema),
+            );
+
+            // Create indexes for duplicated fields
+            for field in duplicated_fields {
+                if field.indexed {
+                    let index_name = format!("{}_idx", field.column_name);
+                    ensure_index(plan, schema, &existing_indexes, &index_name, |s| {
+                        build_duplicated_field_index_sql(s, field)
+                    });
+                }
+            }
+        }
 
         // History function and triggers
         plan.push_action(
@@ -346,6 +539,7 @@ impl SchemaManager {
         schema: &str,
         existing_schemas: &HashSet<String>,
         tenant_column: Option<&TenantColumn>,
+        duplicated_fields: &[DuplicatedField],
     ) -> Result<()> {
         let schema = schema.trim();
 
@@ -364,7 +558,7 @@ impl SchemaManager {
 
         let exists = existing_schemas.contains(schema);
         plan.mark_schema(schema);
-        self.plan_core_schema(plan, schema, exists, tenant_column)
+        self.plan_core_schema(plan, schema, exists, tenant_column, duplicated_fields)
             .await
     }
 
@@ -424,12 +618,48 @@ impl SchemaManager {
         );
         Ok(())
     }
+
+    async fn ensure_duplicated_columns(
+        &self,
+        plan: &mut SchemaPlan,
+        schema: &str,
+        table: &str,
+        duplicated_fields: &[DuplicatedField],
+    ) -> Result<()> {
+        let existing_columns = self.existing_columns(schema, table).await?;
+
+        for field in duplicated_fields {
+            if existing_columns.contains(&field.column_name) {
+                continue;
+            }
+
+            let table_name = qualified_name(schema, table);
+            let nullable = if field.nullable { "null" } else { "not null" };
+            let action = format!(
+                "alter table {} add column if not exists {} {} {}",
+                table_name,
+                quote_ident(&field.column_name),
+                field.pg_type.as_sql(),
+                nullable
+            );
+            plan.push_action(
+                format!(
+                    "add duplicated field column {} to {}",
+                    quote_ident(&field.column_name),
+                    table_name
+                ),
+                action,
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct SchemaConfig {
     pub base_schema: String,
     pub tenancy_mode: TenancyMode,
+    pub duplicated_fields: Vec<DuplicatedField>,
 }
 
 impl SchemaConfig {
@@ -448,7 +678,18 @@ impl SchemaConfig {
         Self {
             base_schema: "public".to_string(),
             tenancy_mode: TenancyMode::conjoined(column),
+            duplicated_fields: Vec::new(),
         }
+    }
+
+    pub fn with_duplicated_fields(mut self, fields: Vec<DuplicatedField>) -> Self {
+        self.duplicated_fields = fields;
+        self
+    }
+
+    pub fn add_duplicated_field(mut self, field: DuplicatedField) -> Self {
+        self.duplicated_fields.push(field);
+        self
     }
 }
 
@@ -457,6 +698,7 @@ impl Default for SchemaConfig {
         Self {
             base_schema: "public".to_string(),
             tenancy_mode: TenancyMode::SingleTenant,
+            duplicated_fields: Vec::new(),
         }
     }
 }
@@ -1109,6 +1351,78 @@ pub fn quote_ident(value: &str) -> String {
     format!("\"{}\"", escaped)
 }
 
+fn build_duplicated_fields_fn_sql(schema: &str, duplicated_fields: &[DuplicatedField]) -> String {
+    let mut assignments = Vec::new();
+
+    for field in duplicated_fields {
+        let column = quote_ident(&field.column_name);
+        let extraction = field.extraction_sql();
+        assignments.push(format!("  NEW.{} := {};", column, extraction));
+    }
+
+    let assignments_sql = assignments.join("\n");
+
+    formatdoc!(
+        r#"
+        create or replace function {schema}.rf_docs_duplicated_sync() returns trigger as $$
+        begin
+{assignments}
+          return NEW;
+        end;
+        $$ language plpgsql;
+        "#,
+        schema = quote_ident(schema),
+        assignments = assignments_sql,
+    )
+}
+
+fn build_duplicated_fields_triggers_sql(schema: &str) -> String {
+    let tbl = qualified_name(schema, "docs");
+    let fnq = format!(
+        "{}.{}",
+        quote_ident(schema),
+        quote_ident("rf_docs_duplicated_sync")
+    );
+    formatdoc!(
+        r#"
+        do $$
+        begin
+          if not exists (
+            select 1 from pg_trigger t
+            join pg_class c on c.oid = t.tgrelid
+            join pg_namespace n on n.oid = c.relnamespace
+            where t.tgname = 'rf_docs_duplicated_biu' and c.relname = 'docs' and n.nspname = {schema_lit}
+          ) then
+            execute 'create trigger rf_docs_duplicated_biu before insert or update of doc on {tbl} for each row execute function {fnq}()';
+          end if;
+        end$$;
+        "#,
+        schema_lit = format!("'{}'", schema),
+        tbl = tbl,
+        fnq = fnq,
+    )
+}
+
+fn build_duplicated_field_index_sql(schema: &str, field: &DuplicatedField) -> String {
+    let index_name = format!("{}_idx", field.column_name);
+    let using_clause = if field.index_type == IndexType::BTree {
+        String::new() // btree is default, no need to specify
+    } else {
+        format!(" using {}", field.index_type.as_sql())
+    };
+
+    formatdoc!(
+        "
+        create index if not exists {index} on {table}{using}
+            ({column})
+        ",
+        index = quote_ident(&index_name),
+        table = qualified_name(schema, "docs"),
+        using = using_clause,
+        column = quote_ident(&field.column_name),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1121,5 +1435,33 @@ mod tests {
     #[test]
     fn quote_handles_quotes() {
         assert_eq!(quote_ident("weird\"name"), "\"weird\"\"name\"");
+    }
+
+    #[test]
+    fn duplicated_field_extraction_simple() {
+        let field = DuplicatedField::new("email", "d_email", DuplicatedFieldType::Text);
+        assert_eq!(field.extraction_sql(), "NEW.doc->>'email'");
+    }
+
+    #[test]
+    fn duplicated_field_extraction_nested() {
+        let field = DuplicatedField::new("profile.age", "d_age", DuplicatedFieldType::Integer);
+        assert_eq!(
+            field.extraction_sql(),
+            "(NEW.doc#>>'{profile,age}')::integer"
+        );
+    }
+
+    #[test]
+    fn duplicated_field_extraction_with_transform() {
+        let field = DuplicatedField::new("email", "d_email_lower", DuplicatedFieldType::Text)
+            .with_transform("lower({value})");
+        assert_eq!(field.extraction_sql(), "lower(NEW.doc->>'email')");
+    }
+
+    #[test]
+    fn duplicated_field_extraction_jsonb() {
+        let field = DuplicatedField::new("metadata", "d_metadata", DuplicatedFieldType::Jsonb);
+        assert_eq!(field.extraction_sql(), "NEW.doc->'metadata'");
     }
 }
