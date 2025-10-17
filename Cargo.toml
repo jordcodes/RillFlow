@@ -51,6 +51,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2.0.17"
 tracing = "0.1"
+upcasting-derive = { path = "upcasting_derive" }
 tracing-subscriber = { version = "0.3", features = [
     "env-filter",
     "fmt",

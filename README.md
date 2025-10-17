@@ -165,6 +165,7 @@ Further reading:
 
 - [`examples/upcasting.rs`](examples/upcasting.rs) – runnable sample with async lookups.
 - [UPCASTING.md](UPCASTING.md) – full migration guide and best practices.
+- `#[derive(rillflow::Upcaster)]` proc macro covers boilerplate for simple version bumps (see guide).
 
 
 ### Tenants health check

@@ -56,6 +56,35 @@ registry.register_async(async_transformation);
 Alternatively the new `sync_upcaster!` and `async_upcaster!` macros wrap the same builders in a more
 compact syntax.
 
+### Derive Support
+
+When transformations live in standalone functions, the `#[derive(rillflow::Upcaster)]` macro can
+generate the trait implementation:
+
+```rust
+fn promote_currency(body: &serde_json::Value) -> rillflow::Result<serde_json::Value> {
+    let mut updated = body.clone();
+    updated["currency"] = serde_json::json!("USD");
+    Ok(updated)
+}
+
+#[derive(rillflow::Upcaster)]
+#[upcaster(
+    from_type = "OrderPlaced",
+    from_version = 1,
+    to_type = "OrderPlaced",
+    to_version = 2,
+    transform = "crate::promote_currency"
+)]
+struct OrderPlacedV1ToV2;
+
+let mut registry = UpcasterRegistry::new();
+registry.register(OrderPlacedV1ToV2);
+```
+
+The `#[upcaster(...)]` attribute accepts `from_type`, `from_version`, `to_type`,
+`to_version`, and a function `transform` path returning `rillflow::Result<serde_json::Value>`.
+
 ### Example
 
 ```rust
