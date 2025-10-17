@@ -85,3 +85,8 @@ path = "examples/session_defaults.rs"
 [dev-dependencies]
 testcontainers = "0.25.0"
 anyhow = "1"
+criterion = "0.5"
+
+[[bench]]
+name = "upcasting"
+harness = false

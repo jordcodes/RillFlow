@@ -21,6 +21,7 @@ pub mod upcasting;
 
 pub use aggregates::{Aggregate, AggregateRepository, AggregateSession};
 pub use context::{SessionContext, SessionContextBuilder};
+pub use documents::DocumentSession;
 pub use error::{Error, Result};
 pub use events::EventEnvelope;
 pub use events::{Event, Expected};
@@ -30,9 +31,9 @@ pub use schema::{
 };
 pub use store::SessionBuilder;
 pub use store::Store;
-pub use upcasting::{AsyncUpcaster, Upcaster, UpcasterRegistry};
-
-pub use documents::DocumentSession;
+pub use upcasting::{
+    AsyncUpcaster, AsyncUpcasterBuilder, Upcaster, UpcasterBuilder, UpcasterRegistry,
+};
 
 pub mod prelude {
     pub use crate::events::AppendOptions;

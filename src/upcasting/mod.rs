@@ -4,6 +4,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 type EventKey = (String, i32);
@@ -182,6 +184,224 @@ impl UpcasterRegistry {
         }
 
         Ok(())
+    }
+}
+
+/// Builder for constructing simple closure-based upcasters without defining a concrete type.
+pub struct UpcasterBuilder {
+    from_type: String,
+    from_version: i32,
+    to_type: String,
+    to_version: i32,
+    handler: Option<Box<dyn Fn(&Value) -> Result<Value> + Send + Sync>>,
+}
+
+impl UpcasterBuilder {
+    pub fn new(from_type: impl Into<String>) -> Self {
+        Self {
+            from_type: from_type.into(),
+            from_version: 0,
+            to_type: String::new(),
+            to_version: 0,
+            handler: None,
+        }
+    }
+
+    pub fn from_version(mut self, version: i32) -> Self {
+        self.from_version = version;
+        self
+    }
+
+    pub fn to(mut self, to_type: impl Into<String>, version: i32) -> Self {
+        self.to_type = to_type.into();
+        self.to_version = version;
+        self
+    }
+
+    pub fn handler<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(&Value) -> Result<Value> + Send + Sync + 'static,
+    {
+        self.handler = Some(Box::new(handler));
+        self
+    }
+
+    pub fn build(self) -> Result<ClosureUpcaster> {
+        let handler = self.handler.ok_or_else(|| Error::QueryError {
+            query: "upcaster builder".into(),
+            context: "missing handler".into(),
+        })?;
+
+        Ok(ClosureUpcaster {
+            from_type: self.from_type,
+            from_version: self.from_version,
+            to_type: self.to_type,
+            to_version: self.to_version,
+            handler,
+        })
+    }
+}
+
+/// Builder for async upcasters backed by closures.
+pub struct AsyncUpcasterBuilder {
+    from_type: String,
+    from_version: i32,
+    to_type: String,
+    to_version: i32,
+    handler: Option<
+        Box<
+            dyn Fn(Value, &PgPool) -> Pin<Box<dyn Future<Output = Result<Value>> + Send>>
+                + Send
+                + Sync,
+        >,
+    >,
+}
+
+impl AsyncUpcasterBuilder {
+    pub fn new(from_type: impl Into<String>) -> Self {
+        Self {
+            from_type: from_type.into(),
+            from_version: 0,
+            to_type: String::new(),
+            to_version: 0,
+            handler: None,
+        }
+    }
+
+    pub fn from_version(mut self, version: i32) -> Self {
+        self.from_version = version;
+        self
+    }
+
+    pub fn to(mut self, to_type: impl Into<String>, version: i32) -> Self {
+        self.to_type = to_type.into();
+        self.to_version = version;
+        self
+    }
+
+    pub fn handler<F, Fut>(mut self, handler: F) -> Self
+    where
+        F: Fn(Value, &PgPool) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Value>> + Send + 'static,
+    {
+        self.handler = Some(Box::new(move |value: Value, pool| {
+            Box::pin(handler(value, pool))
+        }));
+        self
+    }
+
+    pub fn build(self) -> Result<ClosureAsyncUpcaster> {
+        let handler = self.handler.ok_or_else(|| Error::QueryError {
+            query: "async upcaster builder".into(),
+            context: "missing handler".into(),
+        })?;
+
+        Ok(ClosureAsyncUpcaster {
+            from_type: self.from_type,
+            from_version: self.from_version,
+            to_type: self.to_type,
+            to_version: self.to_version,
+            handler,
+        })
+    }
+}
+
+pub struct ClosureUpcaster {
+    from_type: String,
+    from_version: i32,
+    to_type: String,
+    to_version: i32,
+    handler: Box<dyn Fn(&Value) -> Result<Value> + Send + Sync>,
+}
+
+impl Upcaster for ClosureUpcaster {
+    fn from_type(&self) -> &str {
+        &self.from_type
+    }
+
+    fn from_version(&self) -> i32 {
+        self.from_version
+    }
+
+    fn to_type(&self) -> &str {
+        &self.to_type
+    }
+
+    fn to_version(&self) -> i32 {
+        self.to_version
+    }
+
+    fn upcast(&self, body: &Value) -> Result<Value> {
+        (self.handler)(body)
+    }
+}
+
+pub struct ClosureAsyncUpcaster {
+    from_type: String,
+    from_version: i32,
+    to_type: String,
+    to_version: i32,
+    handler: Box<
+        dyn Fn(Value, &PgPool) -> Pin<Box<dyn Future<Output = Result<Value>> + Send>> + Send + Sync,
+    >,
+}
+
+/// Macro helper for constructing synchronous upcasters with minimal boilerplate.
+#[macro_export]
+macro_rules! sync_upcaster {
+    (from $from_ty:expr, $from_ver:expr => $to_ty:expr, $to_ver:expr, |$val:ident| $body:block) => {{
+        $crate::upcasting::UpcasterBuilder::new($from_ty)
+            .from_version($from_ver)
+            .to($to_ty, $to_ver)
+            .handler(|value| {
+                let mut $val = value.clone();
+                $body
+            })
+            .build()
+            .expect("invalid upcaster definition")
+    }};
+}
+
+/// Macro helper for constructing async upcasters backed by an async block.
+#[macro_export]
+macro_rules! async_upcaster {
+    (from $from_ty:expr, $from_ver:expr => $to_ty:expr, $to_ver:expr, |$val:ident, $pool:ident| $body:block) => {{
+        $crate::upcasting::AsyncUpcasterBuilder::new($from_ty)
+            .from_version($from_ver)
+            .to($to_ty, $to_ver)
+            .handler(|value, pool| {
+                let pool = pool.clone();
+                async move {
+                    let mut $val = value;
+                    let $pool = pool;
+                    $body
+                }
+            })
+            .build()
+            .expect("invalid async upcaster definition")
+    }};
+}
+
+#[async_trait]
+impl AsyncUpcaster for ClosureAsyncUpcaster {
+    fn from_type(&self) -> &str {
+        &self.from_type
+    }
+
+    fn from_version(&self) -> i32 {
+        self.from_version
+    }
+
+    fn to_type(&self) -> &str {
+        &self.to_type
+    }
+
+    fn to_version(&self) -> i32 {
+        self.to_version
+    }
+
+    async fn upcast(&self, body: &Value, pool: &PgPool) -> Result<Value> {
+        (self.handler)(body.clone(), pool).await
     }
 }
 
@@ -448,5 +668,77 @@ mod tests {
         assert_eq!(envelope.event_version, 3);
         assert_eq!(envelope.body["currency"], "USD");
         assert_eq!(envelope.body["enriched"], true);
+    }
+
+    #[test]
+    fn builder_constructs_sync_upcaster() {
+        let upcaster = UpcasterBuilder::new("OrderPlaced")
+            .from_version(1)
+            .to("OrderPlaced", 2)
+            .handler(|body| {
+                let mut updated = body.clone();
+                updated["flag"] = json!(true);
+                Ok(updated)
+            })
+            .build()
+            .unwrap();
+
+        let mut envelope = EventEnvelope {
+            global_seq: 1,
+            stream_id: uuid::Uuid::nil(),
+            stream_seq: 1,
+            typ: "OrderPlaced".into(),
+            body: json!({"order_id": 1}),
+            headers: Value::Null,
+            causation_id: None,
+            correlation_id: None,
+            event_version: 1,
+            tenant_id: None,
+            user_id: None,
+            created_at: chrono::Utc::now(),
+        };
+
+        let mut registry = UpcasterRegistry::new();
+        registry.register(upcaster);
+        registry.upcast_sync(&mut envelope).unwrap();
+        assert_eq!(envelope.event_version, 2);
+        assert_eq!(envelope.body["flag"], true);
+    }
+
+    #[test]
+    fn macro_constructs_upcasters() {
+        let sync = crate::sync_upcaster!(from "OrderPlaced", 1 => "OrderPlaced", 2, |order| {
+            order["flag"] = json!(true);
+            Ok(order)
+        });
+        let mut registry = UpcasterRegistry::new();
+        registry.register(sync);
+
+        let mut envelope = EventEnvelope {
+            global_seq: 1,
+            stream_id: uuid::Uuid::nil(),
+            stream_seq: 1,
+            typ: "OrderPlaced".into(),
+            body: json!({"order_id": 5}),
+            headers: Value::Null,
+            causation_id: None,
+            correlation_id: None,
+            event_version: 1,
+            tenant_id: None,
+            user_id: None,
+            created_at: chrono::Utc::now(),
+        };
+
+        registry.upcast_sync(&mut envelope).unwrap();
+        assert_eq!(envelope.event_version, 2);
+        assert_eq!(envelope.body["flag"], true);
+
+        let async_upcaster = crate::async_upcaster!(from "OrderPlaced", 2 => "OrderPlaced", 3, |event, _pool| {
+            event["tag"] = json!("macro");
+            Ok(event)
+        });
+
+        assert_eq!(AsyncUpcaster::from_version(&async_upcaster), 2);
+        assert_eq!(AsyncUpcaster::to_version(&async_upcaster), 3);
     }
 }

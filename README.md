@@ -161,6 +161,11 @@ let store = Store::builder(&url)
 
 Once supplied, the registry is honored by `Store::events()`, aggregate repositories, projection APIs, and the projection daemon during reads.
 
+Further reading:
+
+- [`examples/upcasting.rs`](examples/upcasting.rs) – runnable sample with async lookups.
+- [UPCASTING.md](UPCASTING.md) – full migration guide and best practices.
+
 
 ### Tenants health check
 
