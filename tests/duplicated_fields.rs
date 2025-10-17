@@ -312,7 +312,7 @@ async fn test_duplicated_fields_with_nested_paths() {
             .unwrap();
 
     assert_eq!(row.0, "Alice Smith");
-    assert_eq!(row.1, true);
+    assert!(row.1);
 }
 
 #[tokio::test]

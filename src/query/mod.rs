@@ -127,6 +127,7 @@ impl QuerySpec {
         self.duplicated_fields_map = map;
     }
 
+    #[allow(dead_code)]
     pub(crate) fn duplicated_fields_map(&self) -> &HashMap<String, String> {
         &self.duplicated_fields_map
     }
@@ -239,7 +240,7 @@ impl QuerySpec {
                 let use_aggs: Vec<AggregateSpec> = if aggs_sel.is_empty() {
                     aggregates
                 } else {
-                    aggs_sel.drain(..).collect()
+                    std::mem::take(&mut aggs_sel)
                 };
                 builder.push("jsonb_build_object(");
                 if use_aggs.is_empty() {
@@ -1048,6 +1049,7 @@ pub(crate) enum AggregateSpec {
 }
 
 impl AggregateSpec {
+    #[allow(dead_code)]
     fn push_sql(
         &self,
         builder: &mut QueryBuilder<'_, Postgres>,
@@ -1092,6 +1094,7 @@ pub(crate) struct IncludeSpec {
     local_path: JsonPath,
     foreign_key: String,
     alias: String,
+    #[allow(dead_code)]
     select_fields: Vec<(String, String)>,
 }
 
@@ -1125,7 +1128,7 @@ fn push_json_expr(
     if let Some(column_name) = duplicated_map.get(&path_str) {
         // Use the duplicated column directly - it's already the right type
         builder.push("docs.");
-        builder.push(&schema::quote_ident(column_name));
+        builder.push(schema::quote_ident(column_name));
     } else {
         // Fall back to JSONB extraction
         builder.push("docs.doc #> ");
@@ -1143,7 +1146,7 @@ fn push_text_expr(
     if let Some(column_name) = duplicated_map.get(&path_str) {
         // Use the duplicated column directly, cast to text if needed
         builder.push("docs.");
-        builder.push(&schema::quote_ident(column_name));
+        builder.push(schema::quote_ident(column_name));
         builder.push("::text");
     } else {
         // Fall back to JSONB text extraction

@@ -81,6 +81,7 @@ pub struct Store {
     ensured_tenants: Arc<RwLock<HashSet<String>>>,
     tenant_resolver: Option<TenantResolver>,
     enforce_tenant: bool,
+    #[allow(dead_code)]
     prepared_statement_cache_size: Option<usize>,
 }
 

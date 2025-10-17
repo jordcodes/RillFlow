@@ -160,6 +160,7 @@ impl Documents {
         self.push_tenant_filter(&mut qb, tenant_ref);
         qb.push("id = ");
         qb.push_bind(id);
+        #[allow(clippy::type_complexity)]
         let row: Option<(
             Value,
             i32,

@@ -122,6 +122,7 @@ impl Subscriptions {
         }
     }
 
+    #[allow(dead_code)]
     fn push_tenant_filter<'a>(
         &self,
         qb: &mut sqlx::QueryBuilder<'a, sqlx::Postgres>,

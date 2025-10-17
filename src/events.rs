@@ -211,6 +211,7 @@ impl Events {
         qb.push("stream_id = ");
         qb.push_bind(stream_id);
         qb.push(") select * from combined order by stream_seq asc");
+        #[allow(clippy::type_complexity)]
         let rows: Vec<(
             i64,
             Uuid,
@@ -425,7 +426,12 @@ impl Events {
 
             // Apply inline projections inside the same transaction for immediate consistency
             if self.apply_inline {
-                if let Ok(handlers) = INLINE_HANDLERS.get_or_init(Default::default).lock() {
+                let handlers = INLINE_HANDLERS
+                    .get_or_init(Default::default)
+                    .lock()
+                    .map(|guard| guard.iter().cloned().collect::<Vec<_>>())
+                    .ok();
+                if let Some(handlers) = handlers {
                     for h in handlers.iter() {
                         h.apply(&event.typ, &event.body, tx).await?;
                     }

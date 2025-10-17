@@ -50,7 +50,7 @@ impl BatchWriter {
         let mut outcome = FlushOutcome::default();
 
         if !self.upserts.is_empty() {
-            let items: Vec<(Uuid, Value)> = self.upserts.drain().map(|(id, v)| (id, v)).collect();
+            let items: Vec<(Uuid, Value)> = self.upserts.drain().collect();
             let affected = docs.bulk_upsert(&items).await?;
             outcome.upserts = affected;
         }

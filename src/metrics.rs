@@ -57,6 +57,7 @@ static QUERY_DURATIONS: OnceLock<Mutex<HashMap<String, (u64, u64)>>> = OnceLock:
 static SLOW_QUERY_COUNT: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
 static SLOW_QUERY_THRESHOLD_MS: OnceLock<std::sync::atomic::AtomicU64> = OnceLock::new();
 static SLOW_QUERY_EXPLAIN: OnceLock<std::sync::atomic::AtomicBool> = OnceLock::new();
+#[allow(clippy::type_complexity)]
 static PROJECTION_STATS: OnceLock<Mutex<HashMap<String, (u64, u64, u64)>>> = OnceLock::new();
 
 #[derive(Default, Clone)]

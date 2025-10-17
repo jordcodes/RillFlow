@@ -410,7 +410,7 @@ impl<T: MultiStreamProjection> ProjectionHandler for MultiStreamAdapter<T> {
         body: &Value,
         tx: &mut Transaction<'_, Postgres>,
     ) -> Result<()> {
-        if self.0.event_types().iter().any(|t| *t == event_type) {
+        if self.0.event_types().contains(&event_type) {
             self.0.apply_multi(event_type, body, tx).await
         } else {
             Ok(())

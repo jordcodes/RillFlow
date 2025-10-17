@@ -44,6 +44,7 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[allow(dead_code)]
 pub trait WithContext<T> {
     fn context(self, msg: impl Into<String>) -> Result<T>;
 }
