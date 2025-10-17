@@ -3,13 +3,16 @@ use std::time::Duration;
 
 use crate::{
     Error, Result, SessionContext,
+    events::{EventEnvelope, Events},
     projections::ProjectionHandler,
     schema,
     store::{TenantStrategy, tenant_schema_name},
+    upcasting::UpcasterRegistry,
 };
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, QueryBuilder, types::Json};
 use tracing::{info, instrument, warn};
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct ProjectionWorkerConfig {
@@ -50,6 +53,7 @@ pub struct ProjectionDaemon {
     pool: PgPool,
     config: ProjectionWorkerConfig,
     registrations: Vec<ProjectionRegistration>,
+    upcaster_registry: Option<Arc<UpcasterRegistry>>,
 }
 
 impl ProjectionDaemon {
@@ -58,6 +62,7 @@ impl ProjectionDaemon {
             pool,
             config,
             registrations: Vec::new(),
+            upcaster_registry: None,
         }
     }
 
@@ -66,7 +71,13 @@ impl ProjectionDaemon {
             pool,
             config: ProjectionWorkerConfig::default(),
             registrations: Vec::new(),
+            upcaster_registry: None,
         }
+    }
+
+    pub fn with_upcasters(mut self, registry: Arc<UpcasterRegistry>) -> Self {
+        self.upcaster_registry = Some(registry);
+        self
     }
 
     pub fn register(&mut self, name: impl Into<String>, handler: Arc<dyn ProjectionHandler>) {
@@ -228,15 +239,28 @@ impl ProjectionDaemon {
         // Build query with optional tenant filter for conjoined mode
         let tenant_value = self.resolve_conjoined_tenant(&context)?;
         let tenant_ref = tenant_value.as_ref();
-        let mut qb =
-            QueryBuilder::<Postgres>::new("select global_seq, event_type, body from events where ");
+        let mut qb = QueryBuilder::<Postgres>::new(
+            "select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, user_id, created_at from events where ",
+        );
         self.push_tenant_filter(&mut qb, tenant_ref);
         qb.push("global_seq > ");
         qb.push_bind(last_seq);
         qb.push(" order by global_seq asc limit ");
         qb.push_bind(self.config.batch_size);
 
-        let rows: Vec<(i64, String, Value)> = qb.build_query_as().fetch_all(&mut *tx).await?;
+        let rows: Vec<(
+            i64,
+            Uuid,
+            i32,
+            String,
+            Value,
+            Value,
+            Option<Uuid>,
+            Option<Uuid>,
+            i32,
+            Option<String>,
+            chrono::DateTime<chrono::Utc>,
+        )> = qb.build_query_as().fetch_all(&mut *tx).await?;
         crate::metrics::record_query_duration("projection_fetch_batch", q_start.elapsed());
 
         if rows.is_empty() {
@@ -249,19 +273,71 @@ impl ProjectionDaemon {
         let mut new_last = last_seq;
         let mut processed: usize = 0;
         let batch_apply_start = std::time::Instant::now();
-        for (seq, typ, body) in rows {
+        for (
+            seq,
+            stream_id,
+            stream_seq,
+            typ,
+            body,
+            headers,
+            causation_id,
+            correlation_id,
+            event_version,
+            user_id,
+            created_at,
+        ) in rows
+        {
             // apply within the same transaction to keep read model + checkpoint atomic
-            if let Err(err) = reg.handler.apply(&typ, &body, &mut tx).await {
-                // record to DLQ, set backoff, advance checkpoint to skip poison pill for now
-                warn!(error = %err, seq = seq, event_type = %typ, "projection handler failed; sending to DLQ and backing off");
-                self.insert_dlq(&mut tx, name, seq, &typ, &body, &format!("{}", err))
+            let mut envelope = EventEnvelope {
+                global_seq: seq,
+                stream_id,
+                stream_seq,
+                typ,
+                body,
+                headers,
+                causation_id,
+                correlation_id,
+                event_version,
+                tenant_id: tenant_value.clone(),
+                user_id,
+                created_at,
+            };
+
+            if let Some(registry) = &self.upcaster_registry {
+                registry
+                    .upcast_with_pool(&mut envelope, Some(&self.pool))
                     .await?;
+            } else {
+                Events::apply_legacy_upcasters(&mut envelope);
+            }
+
+            if let Err(err) = reg
+                .handler
+                .apply(&envelope.typ, &envelope.body, &mut tx)
+                .await
+            {
+                // record to DLQ, set backoff, advance checkpoint to skip poison pill for now
+                warn!(
+                    error = %err,
+                    seq = envelope.global_seq,
+                    event_type = %envelope.typ,
+                    "projection handler failed; sending to DLQ and backing off"
+                );
+                self.insert_dlq(
+                    &mut tx,
+                    name,
+                    envelope.global_seq,
+                    &envelope.typ,
+                    &envelope.body,
+                    &format!("{}", err),
+                )
+                .await?;
                 self.increment_attempts_and_set_backoff(name).await?;
-                new_last = seq;
+                new_last = envelope.global_seq;
                 break;
             }
 
-            new_last = seq;
+            new_last = envelope.global_seq;
             processed += 1;
             crate::metrics::record_proj_events_processed(context.tenant.as_deref(), 1);
         }
@@ -768,6 +844,7 @@ pub struct ProjectionDaemonBuilder {
     pool: PgPool,
     config: ProjectionWorkerConfig,
     registrations: Vec<ProjectionRegistration>,
+    upcaster_registry: Option<Arc<UpcasterRegistry>>,
 }
 
 impl ProjectionDaemonBuilder {
@@ -810,8 +887,15 @@ impl ProjectionDaemonBuilder {
         });
         self
     }
+    pub fn upcasters(mut self, registry: Arc<UpcasterRegistry>) -> Self {
+        self.upcaster_registry = Some(registry);
+        self
+    }
     pub fn build(self) -> ProjectionDaemon {
         let mut daemon = ProjectionDaemon::new(self.pool, self.config);
+        if let Some(registry) = self.upcaster_registry {
+            daemon = daemon.with_upcasters(registry);
+        }
         for r in self.registrations {
             daemon.registrations.push(r);
         }

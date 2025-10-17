@@ -6,6 +6,7 @@ use crate::{
     projections::Projections,
     schema::{SchemaConfig, TenancyMode, TenantColumn, TenantSchema},
     subscriptions::Subscriptions,
+    upcasting::UpcasterRegistry,
 };
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use sqlx::{
@@ -83,6 +84,7 @@ pub struct Store {
     enforce_tenant: bool,
     #[allow(dead_code)]
     prepared_statement_cache_size: Option<usize>,
+    upcaster_registry: Option<Arc<UpcasterRegistry>>,
 }
 
 impl Store {
@@ -98,6 +100,7 @@ impl Store {
             tenant_resolver: None,
             enforce_tenant: false,
             prepared_statement_cache_size: None,
+            upcaster_registry: None,
         })
     }
 
@@ -111,6 +114,7 @@ impl Store {
             self.tenant_strategy.clone(),
             self.tenant_resolver.clone(),
             self.session_context.tenant.clone(),
+            self.upcaster_registry.clone(),
         )
     }
 
@@ -283,12 +287,14 @@ impl Store {
     }
 
     pub fn events(&self) -> Events {
-        Events::new(
+        let mut events = Events::new(
             self.pool.clone(),
             self.tenant_strategy.clone(),
             self.tenant_resolver.clone(),
             self.session_context.tenant.clone(),
-        )
+        );
+        events.set_upcasters(self.upcaster_registry.clone());
+        events
     }
 
     pub fn live(&self) -> crate::live::Live {
@@ -300,6 +306,7 @@ impl Store {
             self.pool.clone(),
             self.tenant_strategy.clone(),
             self.tenant_resolver.clone(),
+            self.upcaster_registry.clone(),
         )
     }
 
@@ -321,6 +328,10 @@ impl Store {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    pub fn upcaster_registry(&self) -> Option<Arc<UpcasterRegistry>> {
+        self.upcaster_registry.clone()
     }
 
     /// Lightweight liveness check for the connection pool.
@@ -369,6 +380,7 @@ pub struct StoreBuilder {
     tenant_resolver: Option<TenantResolver>,
     enforce_tenant: bool,
     prepared_statement_cache_size: Option<usize>,
+    upcaster_registry: Option<Arc<UpcasterRegistry>>,
 }
 
 /// Builder for `DocumentSession` instances with preconfigured defaults.
@@ -396,6 +408,7 @@ impl StoreBuilder {
             tenant_resolver: None,
             enforce_tenant: true,
             prepared_statement_cache_size: None,
+            upcaster_registry: None,
         }
     }
 
@@ -440,6 +453,11 @@ impl StoreBuilder {
         ) {
             self.enforce_tenant = true;
         }
+        self
+    }
+
+    pub fn upcasters(mut self, registry: UpcasterRegistry) -> Self {
+        self.upcaster_registry = Some(Arc::new(registry));
         self
     }
 
@@ -493,6 +511,7 @@ impl StoreBuilder {
             tenant_resolver: self.tenant_resolver.clone(),
             enforce_tenant: self.enforce_tenant,
             prepared_statement_cache_size: self.prepared_statement_cache_size,
+            upcaster_registry: self.upcaster_registry.clone(),
         })
     }
 }

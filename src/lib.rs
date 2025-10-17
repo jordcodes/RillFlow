@@ -17,6 +17,7 @@ pub mod store;
 pub mod subscriptions;
 pub mod testing;
 pub mod tracing;
+pub mod upcasting;
 
 pub use aggregates::{Aggregate, AggregateRepository, AggregateSession};
 pub use context::{SessionContext, SessionContextBuilder};
@@ -29,11 +30,15 @@ pub use schema::{
 };
 pub use store::SessionBuilder;
 pub use store::Store;
+pub use upcasting::{AsyncUpcaster, Upcaster, UpcasterRegistry};
 
 pub use documents::DocumentSession;
 
 pub mod prelude {
     pub use crate::events::AppendOptions;
     pub use crate::store::SessionBuilder;
-    pub use crate::{Event, Expected, Result, Store};
+    pub use crate::{
+        Event, Expected, Result, Store,
+        upcasting::{AsyncUpcaster, Upcaster, UpcasterRegistry},
+    };
 }

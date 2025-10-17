@@ -34,6 +34,10 @@ pub enum Error {
         #[source]
         source: Box<Error>,
     },
+    #[error("upcasting requires a database pool for {event_type} v{version}")]
+    UpcastingPoolRequired { event_type: String, version: i32 },
+    #[error("upcasting cycle detected for {event_type} v{version}")]
+    UpcastingCycle { event_type: String, version: i32 },
     #[error("{context}: {source}")]
     Context {
         context: String,

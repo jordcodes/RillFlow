@@ -1,5 +1,5 @@
 use crate::projections::ProjectionHandler;
-use crate::{Error, Result, metrics, schema, store::TenantStrategy};
+use crate::{Error, Result, metrics, schema, store::TenantStrategy, upcasting::UpcasterRegistry};
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, QueryBuilder, Transaction};
@@ -44,6 +44,7 @@ pub struct Events {
     pub(crate) tenant_strategy: TenantStrategy,
     pub(crate) tenant_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
     pub(crate) tenant: Option<String>,
+    pub(crate) upcaster_registry: Option<Arc<UpcasterRegistry>>,
 }
 
 #[derive(Clone, Debug)]
@@ -76,12 +77,22 @@ impl Events {
             tenant_strategy,
             tenant_resolver,
             tenant,
+            upcaster_registry: None,
         }
     }
 
     pub fn with_tenant(mut self, tenant: impl Into<String>) -> Self {
         self.tenant = Some(tenant.into());
         self
+    }
+
+    pub fn with_upcasters(mut self, registry: Arc<UpcasterRegistry>) -> Self {
+        self.upcaster_registry = Some(registry);
+        self
+    }
+
+    pub(crate) fn set_upcasters(&mut self, registry: Option<Arc<UpcasterRegistry>>) {
+        self.upcaster_registry = registry;
     }
 
     pub(crate) fn set_tenant(&mut self, tenant: Option<String>) {
@@ -139,6 +150,30 @@ impl Events {
             qb.push(format!("{} = ", schema::quote_ident(column)));
             qb.push_bind(value);
             qb.push(" and ");
+        }
+    }
+
+    pub(crate) fn apply_legacy_upcasters(envelope: &mut EventEnvelope) {
+        loop {
+            let maybe = {
+                let guard = UPCASTERS.get_or_init(Default::default);
+                guard.lock().ok().and_then(|map| {
+                    map.get(&(envelope.typ.clone(), envelope.event_version))
+                        .cloned()
+                })
+            };
+
+            let Some(upcaster) = maybe else {
+                break;
+            };
+
+            match (upcaster)(envelope.body.clone()) {
+                Ok(new_body) => {
+                    envelope.body = new_body;
+                    envelope.event_version += 1;
+                }
+                Err(_) => break,
+            }
         }
     }
 
@@ -227,7 +262,7 @@ impl Events {
             chrono::DateTime<chrono::Utc>,
         )> = qb.build_query_as().fetch_all(&self.pool).await?;
 
-        Ok(rows
+        let mut envelopes: Vec<EventEnvelope> = rows
             .into_iter()
             .map(
                 |(
@@ -235,7 +270,7 @@ impl Events {
                     stream_id,
                     stream_seq,
                     typ,
-                    mut body,
+                    body,
                     headers,
                     causation_id,
                     correlation_id,
@@ -243,40 +278,36 @@ impl Events {
                     tenant_id,
                     user_id,
                     created_at,
-                )| {
-                    // Apply upcasters if registered, chaining from current version.
-                    let mut next = event_version;
-                    while let Some(up) = UPCASTERS
-                        .get_or_init(Default::default)
-                        .lock()
-                        .ok()
-                        .and_then(|m| m.get(&(typ.clone(), next)).cloned())
-                    {
-                        match (up)(body.clone()) {
-                            Ok(new_body) => {
-                                body = new_body;
-                                next += 1;
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    EventEnvelope {
-                        global_seq,
-                        stream_id,
-                        stream_seq,
-                        typ,
-                        body,
-                        headers,
-                        causation_id,
-                        correlation_id,
-                        event_version: next,
-                        tenant_id,
-                        user_id,
-                        created_at,
-                    }
+                )| EventEnvelope {
+                    global_seq,
+                    stream_id,
+                    stream_seq,
+                    typ,
+                    body,
+                    headers,
+                    causation_id,
+                    correlation_id,
+                    event_version,
+                    tenant_id,
+                    user_id,
+                    created_at,
                 },
             )
-            .collect())
+            .collect();
+
+        if let Some(registry) = &self.upcaster_registry {
+            for envelope in &mut envelopes {
+                registry
+                    .upcast_with_pool(envelope, Some(&self.pool))
+                    .await?;
+            }
+        } else {
+            for envelope in &mut envelopes {
+                Self::apply_legacy_upcasters(envelope);
+            }
+        }
+
+        Ok(envelopes)
     }
 
     pub async fn append_with(
@@ -552,7 +583,11 @@ impl Events {
 type UpcasterFn = Arc<dyn Fn(Value) -> Result<Value> + Send + Sync + 'static>;
 static UPCASTERS: OnceLock<Mutex<HashMap<(String, i32), UpcasterFn>>> = OnceLock::new();
 
-/// Register an event upcaster that transforms a given event type from a specific version to the next version.
+/// Legacy global upcaster registration.
+///
+/// Prefer building a [`UpcasterRegistry`](crate::upcasting::UpcasterRegistry) and wiring it through
+/// [`Store::builder().upcasters`](crate::store::StoreBuilder::upcasters). This helper will be removed in a future release once dependent crates migrate.
+#[deprecated(note = "Use UpcasterRegistry with Store::builder().upcasters(...) instead")]
 pub fn register_upcaster(event_type: &str, from_version: i32, upcaster: UpcasterFn) {
     let map = UPCASTERS.get_or_init(Default::default);
     if let Ok(mut m) = map.lock() {

@@ -103,6 +103,64 @@ cargo run --bin rillflow -- snapshots compact-once --threshold 200 --batch 200 -
 cargo run --bin rillflow -- snapshots run-until-idle --threshold 200 --batch 200 --database-url "$DATABASE_URL" --schema public
 ```
 
+### Event Upcasting
+
+Transparent upcasting lets you evolve event payloads without rewriting historical rows. Implement the provided traits and register them on the store builder:
+
+```rust
+use rillflow::upcasting::{Upcaster, AsyncUpcaster, UpcasterRegistry};
+
+struct OrderPlacedV1ToV2;
+
+impl Upcaster for OrderPlacedV1ToV2 {
+    fn from_type(&self) -> &str { "OrderPlaced" }
+    fn from_version(&self) -> i32 { 1 }
+    fn to_type(&self) -> &str { "OrderPlaced" }
+    fn to_version(&self) -> i32 { 2 }
+    fn upcast(&self, body: &serde_json::Value) -> rillflow::Result<serde_json::Value> {
+        let mut updated = body.clone();
+        updated["currency"] = serde_json::json!("USD");
+        Ok(updated)
+    }
+}
+
+struct OrderPlacedV2ToV3;
+
+#[async_trait::async_trait]
+impl AsyncUpcaster for OrderPlacedV2ToV3 {
+    fn from_type(&self) -> &str { "OrderPlaced" }
+    fn from_version(&self) -> i32 { 2 }
+    fn to_type(&self) -> &str { "OrderPlaced" }
+    fn to_version(&self) -> i32 { 3 }
+
+    async fn upcast(
+        &self,
+        body: &serde_json::Value,
+        pool: &sqlx::PgPool,
+    ) -> rillflow::Result<serde_json::Value> {
+        let mut updated = body.clone();
+        let customer_id = body["customer_id"].as_str().unwrap_or_default();
+        let label: String = sqlx::query_scalar("select upper($1::text)")
+            .bind(customer_id)
+            .fetch_one(pool)
+            .await?;
+        updated["customer_label"] = serde_json::json!(label);
+        Ok(updated)
+    }
+}
+
+let mut registry = UpcasterRegistry::new();
+registry.register(OrderPlacedV1ToV2);
+registry.register_async(OrderPlacedV2ToV3);
+
+let store = Store::builder(&url)
+    .upcasters(registry)
+    .build()
+    .await?;
+```
+
+Once supplied, the registry is honored by `Store::events()`, aggregate repositories, projection APIs, and the projection daemon during reads.
+
 
 ### Tenants health check
 

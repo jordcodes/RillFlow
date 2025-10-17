@@ -122,7 +122,9 @@ async fn export_table(
 use clap::{ArgAction, Parser, Subcommand};
 use rillflow::projection_runtime::{ProjectionDaemon, ProjectionWorkerConfig};
 use rillflow::subscriptions::{SubscriptionFilter, SubscriptionOptions, Subscriptions};
-use rillflow::{SchemaConfig, Store, TenancyMode, TenantSchema, TenantStrategy};
+use rillflow::{
+    SchemaConfig, Store, TenancyMode, TenantSchema, TenantStrategy, upcasting::UpcasterRegistry,
+};
 use serde_json::Value as JsonValue;
 use sqlx::Row;
 use std::sync::Arc;
@@ -650,7 +652,8 @@ async fn main() -> rillflow::Result<()> {
             );
         }
         Commands::Projections(cmd) => {
-            let daemon = tenant_helper.projection_daemon(store.pool().clone());
+            let daemon =
+                tenant_helper.projection_daemon(store.pool().clone(), store.upcaster_registry());
             match cmd {
                 ProjectionsCmd::List {
                     tenant,
@@ -1779,11 +1782,20 @@ impl TenantHelper {
         }
     }
 
-    fn projection_daemon(&self, pool: PgPool) -> ProjectionDaemon {
+    fn projection_daemon(
+        &self,
+        pool: PgPool,
+        upcasters: Option<Arc<UpcasterRegistry>>,
+    ) -> ProjectionDaemon {
         let mut config = ProjectionWorkerConfig::default();
         config.tenant_strategy = self.strategy.clone();
         config.tenant_resolver = self.resolver.clone();
-        ProjectionDaemon::new(pool, config)
+        let daemon = ProjectionDaemon::new(pool, config);
+        if let Some(registry) = upcasters {
+            daemon.with_upcasters(registry)
+        } else {
+            daemon
+        }
     }
 
     fn subscriptions(&self, pool: PgPool) -> Subscriptions {

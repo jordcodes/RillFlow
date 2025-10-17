@@ -1,12 +1,14 @@
 use crate::{
     Result,
     context::SessionContext,
+    events::{EventEnvelope, Events},
     schema,
     store::{TenantStrategy, tenant_schema_name},
+    upcasting::UpcasterRegistry,
 };
 use async_trait::async_trait;
 use serde_json::Value;
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sqlx::{PgPool, Postgres, Transaction};
 
 use std::sync::Arc;
 
@@ -14,6 +16,7 @@ pub struct Projections {
     pool: PgPool,
     tenant_strategy: TenantStrategy,
     tenant_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
+    upcaster_registry: Option<Arc<UpcasterRegistry>>,
 }
 
 impl Projections {
@@ -21,11 +24,13 @@ impl Projections {
         pool: PgPool,
         tenant_strategy: TenantStrategy,
         tenant_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
+        upcaster_registry: Option<Arc<UpcasterRegistry>>,
     ) -> Self {
         Self {
             pool,
             tenant_strategy,
             tenant_resolver,
+            upcaster_registry,
         }
     }
 }
@@ -120,8 +125,20 @@ impl Projections {
         }
         let last_seq = Self::load_last_seq(&mut tx, name).await?;
 
-        let rows = sqlx::query(
-            "select global_seq, event_type, body from events where global_seq > $1 order by global_seq asc"
+        let rows: Vec<(
+            i64,
+            uuid::Uuid,
+            i32,
+            String,
+            Value,
+            Value,
+            Option<uuid::Uuid>,
+            Option<uuid::Uuid>,
+            i32,
+            Option<String>,
+            chrono::DateTime<chrono::Utc>,
+        )> = sqlx::query_as(
+            "select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, user_id, created_at from events where global_seq > $1 order by global_seq asc"
         )
         .bind(last_seq)
         .fetch_all(&mut *tx)
@@ -129,14 +146,48 @@ impl Projections {
 
         let mut new_last = last_seq;
 
-        for row in rows {
-            let event_type: String = row.get("event_type");
-            let body: Value = row.get("body");
-            let global_seq: i64 = row.get("global_seq");
+        for (
+            global_seq,
+            stream_id,
+            stream_seq,
+            event_type,
+            body,
+            headers,
+            causation_id,
+            correlation_id,
+            event_version,
+            user_id,
+            created_at,
+        ) in rows
+        {
+            let mut envelope = EventEnvelope {
+                global_seq,
+                stream_id,
+                stream_seq,
+                typ: event_type,
+                body,
+                headers,
+                causation_id,
+                correlation_id,
+                event_version,
+                tenant_id: schema_tenant.clone(),
+                user_id,
+                created_at,
+            };
 
-            handler.apply(&event_type, &body, &mut tx).await?;
+            if let Some(registry) = &self.upcaster_registry {
+                registry
+                    .upcast_with_pool(&mut envelope, Some(&self.pool))
+                    .await?;
+            } else {
+                Events::apply_legacy_upcasters(&mut envelope);
+            }
+
+            handler
+                .apply(&envelope.typ, &envelope.body, &mut tx)
+                .await?;
             crate::metrics::record_proj_events_processed(schema_tenant.as_deref(), 1);
-            new_last = global_seq;
+            new_last = envelope.global_seq;
         }
 
         Self::persist_checkpoint(&mut tx, name, new_last).await?;

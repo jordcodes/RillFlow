@@ -6,6 +6,7 @@ use crate::{
     query::{CompiledQuery, DocumentQuery, DocumentQueryContext},
     schema,
     store::{TenantStrategy, tenant_schema_name},
+    upcasting::UpcasterRegistry,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -20,6 +21,7 @@ pub struct Documents {
     tenant_strategy: TenantStrategy,
     tenant_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
     tenant: Option<String>,
+    upcaster_registry: Option<Arc<UpcasterRegistry>>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -39,12 +41,14 @@ impl Documents {
         tenant_strategy: TenantStrategy,
         tenant_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
         tenant: Option<String>,
+        upcaster_registry: Option<Arc<UpcasterRegistry>>,
     ) -> Self {
         Self {
             pool,
             tenant_strategy,
             tenant_resolver,
             tenant,
+            upcaster_registry,
         }
     }
 
@@ -429,14 +433,19 @@ impl Documents {
     }
 
     pub fn session(&self) -> DocumentSession {
+        let mut events = Events::new(
+            self.pool.clone(),
+            self.tenant_strategy.clone(),
+            self.tenant_resolver.clone(),
+            self.tenant.clone(),
+        );
+        if let Some(registry) = &self.upcaster_registry {
+            events = events.with_upcasters(registry.clone());
+        }
+
         let mut session = DocumentSession::new(
             self.pool.clone(),
-            Events::new(
-                self.pool.clone(),
-                self.tenant_strategy.clone(),
-                self.tenant_resolver.clone(),
-                self.tenant.clone(),
-            ),
+            events,
             crate::context::SessionContext::default(),
         );
         session.set_tenant_strategy(self.tenant_strategy.clone());
