@@ -1298,6 +1298,7 @@ where
 
     pub async fn fetch_optional(self) -> Result<Option<T>> {
         let (pool, mut builder) = self.build_query()?;
+        builder.push(" limit 1");
         let sql_captured = builder.sql().to_string();
         let query = builder.build_query_as::<(Value,)>();
         let start = std::time::Instant::now();
@@ -1325,6 +1326,7 @@ where
 
     pub async fn fetch_one(self) -> Result<T> {
         let (pool, mut builder) = self.build_query()?;
+        builder.push(" limit 1");
         let sql_captured = builder.sql().to_string();
         let query = builder.build_query_as::<(Value,)>();
         let start = std::time::Instant::now();

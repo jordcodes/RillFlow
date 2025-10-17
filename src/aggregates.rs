@@ -188,11 +188,38 @@ impl AggregateRepository {
 impl AggregateRepository {
     /// Load an aggregate using a snapshot when available, then tail events.
     pub async fn load_with_snapshot<A: Aggregate>(&self, stream_id: Uuid) -> Result<A> {
+        use crate::schema;
+        use crate::store::TenantStrategy;
+        use sqlx::QueryBuilder;
+
+        let tenant_value = match &self.events.tenant_strategy {
+            TenantStrategy::Conjoined { .. } => {
+                if let Some(t) = &self.events.tenant {
+                    Some(t.clone())
+                } else {
+                    return Err(crate::Error::TenantRequired);
+                }
+            }
+            _ => None,
+        };
+
         let snap: Option<(i32, serde_json::Value)> =
-            sqlx::query_as("select version, body from snapshots where stream_id = $1")
-                .bind(stream_id)
-                .fetch_optional(&self.events.pool)
-                .await?;
+            if let TenantStrategy::Conjoined { column } = &self.events.tenant_strategy {
+                // Conjoined mode: include tenant filter
+                let mut qb = QueryBuilder::new("select version, body from snapshots where ");
+                qb.push(format!("{} = ", schema::quote_ident(&column.name)));
+                qb.push_bind(tenant_value.as_ref().unwrap());
+                qb.push(" and stream_id = ");
+                qb.push_bind(stream_id);
+                qb.build_query_as()
+                    .fetch_optional(&self.events.pool)
+                    .await?
+            } else {
+                sqlx::query_as("select version, body from snapshots where stream_id = $1")
+                    .bind(stream_id)
+                    .fetch_optional(&self.events.pool)
+                    .await?
+            };
 
         let mut agg = A::new();
         let mut from_version = 0;
@@ -227,19 +254,45 @@ impl AggregateRepository {
         self.commit_for_aggregate(stream_id, aggregate, events)
             .await?;
         if new_version % snapshot_every == 0 {
+            use crate::schema;
+            use crate::store::TenantStrategy;
+            use sqlx::QueryBuilder;
+
             // Load latest state to snapshot the post-commit aggregate
             let latest: A = self.load(stream_id).await?;
             let body = serde_json::to_value(&latest)?;
-            sqlx::query(
-                r#"insert into snapshots(stream_id, version, body)
-                    values ($1, $2, $3)
-                    on conflict (stream_id) do update set version = excluded.version, body = excluded.body, created_at = now()"#,
-            )
-            .bind(stream_id)
-            .bind(new_version)
-            .bind(&body)
-            .execute(&self.events.pool)
-            .await?;
+
+            if let TenantStrategy::Conjoined { column } = &self.events.tenant_strategy {
+                // Conjoined mode: include tenant column
+                let tenant_value = self
+                    .events
+                    .tenant
+                    .as_ref()
+                    .ok_or(crate::Error::TenantRequired)?;
+                let mut qb = QueryBuilder::new("insert into snapshots(");
+                qb.push(schema::quote_ident(&column.name));
+                qb.push(", stream_id, version, body) values (");
+                qb.push_bind(tenant_value);
+                qb.push(", ");
+                qb.push_bind(stream_id);
+                qb.push(", ");
+                qb.push_bind(new_version);
+                qb.push(", ");
+                qb.push_bind(&body);
+                qb.push(") on conflict (stream_id) do update set version = excluded.version, body = excluded.body, created_at = now()");
+                qb.build().execute(&self.events.pool).await?;
+            } else {
+                sqlx::query(
+                    r#"insert into snapshots(stream_id, version, body)
+                        values ($1, $2, $3)
+                        on conflict (stream_id) do update set version = excluded.version, body = excluded.body, created_at = now()"#,
+                )
+                .bind(stream_id)
+                .bind(new_version)
+                .bind(&body)
+                .execute(&self.events.pool)
+                .await?;
+            }
         }
         Ok(())
     }

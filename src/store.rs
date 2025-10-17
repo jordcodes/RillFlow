@@ -281,11 +281,12 @@ impl Store {
     }
 
     pub fn events(&self) -> Events {
-        Events {
-            pool: self.pool.clone(),
-            use_advisory_lock: false,
-            apply_inline: false,
-        }
+        Events::new(
+            self.pool.clone(),
+            self.tenant_strategy.clone(),
+            self.tenant_resolver.clone(),
+            self.session_context.tenant.clone(),
+        )
     }
 
     pub fn live(&self) -> crate::live::Live {

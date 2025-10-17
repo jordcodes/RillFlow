@@ -70,6 +70,126 @@ async fn manual_ack_updates_checkpoint() -> Result<()> {
 }
 
 #[tokio::test]
+async fn conjoined_tenant_filtering_in_subscriptions() -> Result<()> {
+    let image = GenericImage::new("postgres", "16-alpine")
+        .with_exposed_port(5432.tcp())
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres");
+    let container = image.start().await?;
+    let host = container.get_host().await?;
+    let port = container.get_host_port_ipv4(5432).await?;
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres?sslmode=disable");
+
+    // Set up store with conjoined tenancy
+    let store = Store::builder(&url)
+        .tenant_strategy(rillflow::store::TenantStrategy::conjoined(
+            rillflow::schema::TenantColumn::text("tenant_id"),
+        ))
+        .tenant_resolver(|| Some("tenant_a".to_string()))
+        .build()
+        .await?;
+
+    // Sync schema with tenant column
+    let schema_config = rillflow::SchemaConfig {
+        base_schema: "public".into(),
+        tenancy_mode: rillflow::schema::TenancyMode::Conjoined {
+            column: rillflow::schema::TenantColumn::text("tenant_id"),
+        },
+    };
+    store.schema().sync(&schema_config).await?;
+
+    // Append events for tenant_a
+    let stream_a = Uuid::new_v4();
+    store
+        .events()
+        .with_tenant("tenant_a")
+        .append_stream(
+            stream_a,
+            Expected::Any,
+            vec![
+                Event::new("TenantA_Event1", &json!({"msg": "a1"})),
+                Event::new("TenantA_Event2", &json!({"msg": "a2"})),
+            ],
+        )
+        .await?;
+
+    // Append events for tenant_b
+    let stream_b = Uuid::new_v4();
+    store
+        .events()
+        .with_tenant("tenant_b")
+        .append_stream(
+            stream_b,
+            Expected::Any,
+            vec![
+                Event::new("TenantB_Event1", &json!({"msg": "b1"})),
+                Event::new("TenantB_Event2", &json!({"msg": "b2"})),
+            ],
+        )
+        .await?;
+
+    // Create subscription for tenant_a
+    let subs_a = store.subscriptions().with_tenant("tenant_a");
+    let filter = SubscriptionFilter::default();
+    let opts = SubscriptionOptions {
+        start_from: 0,
+        poll_interval: Duration::from_millis(100),
+        ..Default::default()
+    };
+    let (_handle, mut rx_a) = subs_a
+        .subscribe("sub_tenant_a", filter.clone(), opts.clone())
+        .await?;
+
+    // Create subscription for tenant_b
+    let subs_b = store.subscriptions().with_tenant("tenant_b");
+    let (_handle, mut rx_b) = subs_b.subscribe("sub_tenant_b", filter, opts).await?;
+
+    // Tenant A should only receive tenant A events
+    let env1 = timeout(Duration::from_secs(5), rx_a.recv())
+        .await?
+        .expect("tenant_a event 1");
+    assert_eq!(env1.typ, "TenantA_Event1");
+    assert_eq!(env1.tenant_id, Some("tenant_a".to_string()));
+
+    let env2 = timeout(Duration::from_secs(5), rx_a.recv())
+        .await?
+        .expect("tenant_a event 2");
+    assert_eq!(env2.typ, "TenantA_Event2");
+    assert_eq!(env2.tenant_id, Some("tenant_a".to_string()));
+
+    // Tenant B should only receive tenant B events
+    let env3 = timeout(Duration::from_secs(5), rx_b.recv())
+        .await?
+        .expect("tenant_b event 1");
+    assert_eq!(env3.typ, "TenantB_Event1");
+    assert_eq!(env3.tenant_id, Some("tenant_b".to_string()));
+
+    let env4 = timeout(Duration::from_secs(5), rx_b.recv())
+        .await?
+        .expect("tenant_b event 2");
+    assert_eq!(env4.typ, "TenantB_Event2");
+    assert_eq!(env4.tenant_id, Some("tenant_b".to_string()));
+
+    // Verify no cross-tenant leakage (should timeout)
+    let no_more_a = timeout(Duration::from_millis(500), rx_a.recv()).await;
+    assert!(
+        no_more_a.is_err(),
+        "tenant_a should not receive tenant_b events"
+    );
+
+    let no_more_b = timeout(Duration::from_millis(500), rx_b.recv()).await;
+    assert!(
+        no_more_b.is_err(),
+        "tenant_b should not receive tenant_a events"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn subscribe_and_receive_events() -> Result<()> {
     let image = GenericImage::new("postgres", "16-alpine")
         .with_exposed_port(5432.tcp())

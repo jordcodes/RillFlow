@@ -430,11 +430,12 @@ impl Documents {
     pub fn session(&self) -> DocumentSession {
         let mut session = DocumentSession::new(
             self.pool.clone(),
-            Events {
-                pool: self.pool.clone(),
-                use_advisory_lock: false,
-                apply_inline: false,
-            },
+            Events::new(
+                self.pool.clone(),
+                self.tenant_strategy.clone(),
+                self.tenant_resolver.clone(),
+                self.tenant.clone(),
+            ),
             crate::context::SessionContext::default(),
         );
         session.set_tenant_strategy(self.tenant_strategy.clone());
@@ -1009,6 +1010,7 @@ impl DocumentSession {
             }
         }
         let tenant_value = self.conjoined_tenant_value()?;
+        self.events_api.set_tenant(tenant_value.clone());
         let mut tx = self.pool.begin().await?;
 
         if let Some(ref schema_name) = schema {
