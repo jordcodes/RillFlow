@@ -133,6 +133,7 @@ async fn conjoined_tenant_filtering_in_projections() -> Result<()> {
         tenancy_mode: rillflow::schema::TenancyMode::Conjoined {
             column: rillflow::schema::TenantColumn::text("tenant_id"),
         },
+        duplicated_fields: Vec::new(),
     };
     store.schema().sync(&schema_config).await?;
     ensure_counters_table(store.pool()).await?;

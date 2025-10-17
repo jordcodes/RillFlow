@@ -279,7 +279,9 @@ impl AggregateRepository {
                 qb.push_bind(new_version);
                 qb.push(", ");
                 qb.push_bind(&body);
-                qb.push(") on conflict (stream_id) do update set version = excluded.version, body = excluded.body, created_at = now()");
+                qb.push(") on conflict (");
+                qb.push(schema::quote_ident(&column.name));
+                qb.push(", stream_id) do update set version = excluded.version, body = excluded.body, created_at = now()");
                 qb.build().execute(&self.events.pool).await?;
             } else {
                 sqlx::query(

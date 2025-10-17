@@ -103,6 +103,7 @@ async fn conjoined_tenant_filtering_in_snapshotter() -> Result<()> {
         tenancy_mode: rillflow::schema::TenancyMode::Conjoined {
             column: rillflow::schema::TenantColumn::text("tenant_id"),
         },
+        duplicated_fields: Vec::new(),
     };
     store.schema().sync(&schema_config).await?;
 

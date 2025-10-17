@@ -1112,18 +1112,23 @@ fn build_snapshots_table_sql(schema: &str, tenant_column: Option<&TenantColumn>)
             )
         })
         .unwrap_or_default();
+    let primary_key = tenant_column
+        .map(|col| format!("primary key ({}, stream_id)", quote_ident(&col.name)))
+        .unwrap_or_else(|| "primary key (stream_id)".to_string());
     formatdoc!(
         "
         create table if not exists {table} (
 {tenant_column}
-            stream_id uuid primary key,
+            stream_id uuid not null,
             version int not null,
             body jsonb not null,
-            created_at timestamptz not null default now()
+            created_at timestamptz not null default now(),
+            {primary_key}
         )
         ",
         table = qualified_name(schema, "snapshots"),
         tenant_column = tenant_column_sql,
+        primary_key = primary_key,
     )
 }
 

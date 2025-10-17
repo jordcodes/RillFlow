@@ -144,20 +144,16 @@ where (headers ? 'idempotency_key');
 
 -- stream aliases (human key to stream_id)
 create table if not exists stream_aliases (
-    tenant_id text null,
-    alias text not null,
+    alias text primary key,
     stream_id uuid not null,
-    created_at timestamptz not null default now(),
-    primary key (tenant_id, alias)
+    created_at timestamptz not null default now()
 );
 
 -- projection checkpoints
 create table if not exists projections (
-    tenant_id text null,
-    name text not null,
+    name text primary key,
     last_seq bigint not null default 0,
-    updated_at timestamptz not null default now(),
-    primary key (tenant_id, name)
+    updated_at timestamptz not null default now()
 );
 
 -- event schema registry
@@ -171,29 +167,24 @@ create table if not exists event_schemas (
 
 -- snapshots
 create table if not exists snapshots (
-    tenant_id text null,
-    stream_id uuid not null,
+    stream_id uuid primary key,
     version int not null,
     body jsonb not null,
-    created_at timestamptz not null default now(),
-    primary key (tenant_id, stream_id)
+    created_at timestamptz not null default now()
 );
 
 -- subscriptions (consumer checkpoints)
 create table if not exists subscriptions (
-    tenant_id text null,
-    name text not null,
+    name text primary key,
     last_seq bigint not null default 0,
     filter jsonb not null default '{}'::jsonb,
     paused boolean not null default false,
     backoff_until timestamptz null,
-    updated_at timestamptz not null default now(),
-    primary key (tenant_id, name)
+    updated_at timestamptz not null default now()
 );
 
 -- subscription consumer groups (per-group checkpoints)
 create table if not exists subscription_groups (
-    tenant_id text null,
     name text not null,
     grp text not null,
     last_seq bigint not null default 0,
@@ -201,7 +192,7 @@ create table if not exists subscription_groups (
     backoff_until timestamptz null,
     max_in_flight int null,
     updated_at timestamptz not null default now(),
-    primary key (tenant_id, name, grp)
+    primary key (name, grp)
 );
 
 -- backfill: add max_in_flight if table already existed
@@ -210,13 +201,12 @@ add column if not exists max_in_flight int null;
 
 -- subscription group leases (single worker per group)
 create table if not exists subscription_group_leases (
-    tenant_id text null,
     name text not null,
     grp text not null,
     leased_by text not null,
     lease_until timestamptz not null,
     updated_at timestamptz not null default now(),
-    primary key (tenant_id, name, grp)
+    primary key (name, grp)
 );
 
 -- subscription dead-letter queue

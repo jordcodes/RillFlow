@@ -176,16 +176,34 @@ impl<F: SnapshotFolder> Snapshotter<F> {
             // outside tx to avoid long-held transaction during folding
             tx.commit().await?;
             let (version, body) = self.folder.fold(stream_id).await?;
-            sqlx::query(
-                r#"insert into snapshots(stream_id, version, body)
-                    values ($1, $2, $3)
-                    on conflict (stream_id) do update set version = excluded.version, body = excluded.body, created_at = now()"#,
-            )
-            .bind(stream_id)
-            .bind(version)
-            .bind(body)
-            .execute(&self.pool)
-            .await?;
+
+            if let (Some(column), Some(tenant)) = (self.tenant_column(), tenant_ref) {
+                let mut qb = QueryBuilder::<Postgres>::new("insert into snapshots(");
+                qb.push(schema::quote_ident(column));
+                qb.push(", stream_id, version, body) values (");
+                qb.push_bind(tenant);
+                qb.push(", ");
+                qb.push_bind(stream_id);
+                qb.push(", ");
+                qb.push_bind(version);
+                qb.push(", ");
+                qb.push_bind(body);
+                qb.push(") on conflict (");
+                qb.push(schema::quote_ident(column));
+                qb.push(", stream_id) do update set version = excluded.version, body = excluded.body, created_at = now()");
+                qb.build().execute(&self.pool).await?;
+            } else {
+                sqlx::query(
+                    r#"insert into snapshots(stream_id, version, body)
+                        values ($1, $2, $3)
+                        on conflict (stream_id) do update set version = excluded.version, body = excluded.body, created_at = now()"#,
+                )
+                .bind(stream_id)
+                .bind(version)
+                .bind(body)
+                .execute(&self.pool)
+                .await?;
+            }
             processed += 1;
             info!(stream_id = %stream_id, head = head, snap_version = snap_ver, new_version = version, "snapshot written");
             // re-open a short transaction for search_path on next loop

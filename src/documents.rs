@@ -1135,17 +1135,25 @@ impl DocumentSession {
                     qb.push("stream_id, version, body) values (");
                     qb.push_bind(tenant);
                     qb.push(", ");
+                    qb.push_bind(op.stream_id);
+                    qb.push(", ");
+                    qb.push_bind(op.version);
+                    qb.push(", ");
+                    qb.push_bind(&op.body);
+                    qb.push(") on conflict (");
+                    qb.push(schema::quote_ident(column));
+                    qb.push(", stream_id) do update set version = excluded.version, body = excluded.body, created_at = now()");
                 } else {
                     qb.push("stream_id, version, body) values (");
+                    qb.push_bind(op.stream_id);
+                    qb.push(", ");
+                    qb.push_bind(op.version);
+                    qb.push(", ");
+                    qb.push_bind(&op.body);
+                    qb.push(
+                        ") on conflict (stream_id) do update set version = excluded.version, body = excluded.body, created_at = now()",
+                    );
                 }
-                qb.push_bind(op.stream_id);
-                qb.push(", ");
-                qb.push_bind(op.version);
-                qb.push(", ");
-                qb.push_bind(&op.body);
-                qb.push(
-                    ") on conflict (stream_id) do update set version = excluded.version, body = excluded.body, created_at = now()",
-                );
 
                 if let Err(err) = qb.build().execute(&mut *tx).await {
                     self.event_ops = event_ops;
