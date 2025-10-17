@@ -41,9 +41,9 @@ pub struct Events {
     pub(crate) pool: PgPool,
     pub(crate) use_advisory_lock: bool,
     pub(crate) apply_inline: bool,
-    tenant_strategy: TenantStrategy,
-    tenant_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
-    tenant: Option<String>,
+    pub(crate) tenant_strategy: TenantStrategy,
+    pub(crate) tenant_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
+    pub(crate) tenant: Option<String>,
 }
 
 #[derive(Clone, Debug)]

@@ -145,17 +145,19 @@ where (headers ? 'idempotency_key');
 -- stream aliases (human key to stream_id)
 create table if not exists stream_aliases (
     tenant_id text null,
-    alias text primary key,
+    alias text not null,
     stream_id uuid not null,
-    created_at timestamptz not null default now()
+    created_at timestamptz not null default now(),
+    primary key (tenant_id, alias)
 );
 
 -- projection checkpoints
 create table if not exists projections (
     tenant_id text null,
-    name text primary key,
+    name text not null,
     last_seq bigint not null default 0,
-    updated_at timestamptz not null default now()
+    updated_at timestamptz not null default now(),
+    primary key (tenant_id, name)
 );
 
 -- event schema registry
@@ -170,21 +172,23 @@ create table if not exists event_schemas (
 -- snapshots
 create table if not exists snapshots (
     tenant_id text null,
-    stream_id uuid primary key,
+    stream_id uuid not null,
     version int not null,
     body jsonb not null,
-    created_at timestamptz not null default now()
+    created_at timestamptz not null default now(),
+    primary key (tenant_id, stream_id)
 );
 
 -- subscriptions (consumer checkpoints)
 create table if not exists subscriptions (
     tenant_id text null,
-    name text primary key,
+    name text not null,
     last_seq bigint not null default 0,
     filter jsonb not null default '{}'::jsonb,
     paused boolean not null default false,
     backoff_until timestamptz null,
-    updated_at timestamptz not null default now()
+    updated_at timestamptz not null default now(),
+    primary key (tenant_id, name)
 );
 
 -- subscription consumer groups (per-group checkpoints)
@@ -197,7 +201,7 @@ create table if not exists subscription_groups (
     backoff_until timestamptz null,
     max_in_flight int null,
     updated_at timestamptz not null default now(),
-    primary key (name, grp)
+    primary key (tenant_id, name, grp)
 );
 
 -- backfill: add max_in_flight if table already existed
@@ -212,7 +216,7 @@ create table if not exists subscription_group_leases (
     leased_by text not null,
     lease_until timestamptz not null,
     updated_at timestamptz not null default now(),
-    primary key (name, grp)
+    primary key (tenant_id, name, grp)
 );
 
 -- subscription dead-letter queue
