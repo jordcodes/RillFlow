@@ -153,7 +153,12 @@ impl<F: SnapshotFolder> Snapshotter<F> {
         let mut qb = QueryBuilder::<Postgres>::new(
             "select e.stream_id, max(e.stream_seq) as head, coalesce(s.version, 0) as snap from events e left join snapshots s on s.stream_id = e.stream_id where ",
         );
-        self.push_tenant_filter(&mut qb, tenant_ref);
+        // Add tenant filter with table prefix to avoid ambiguity
+        if let (Some(column), Some(value)) = (self.tenant_column(), tenant_ref) {
+            qb.push(format!("e.{} = ", schema::quote_ident(column)));
+            qb.push_bind(value);
+            qb.push(" and ");
+        }
         qb.push("1=1 group by e.stream_id, s.version having max(e.stream_seq) - coalesce(s.version, 0) >= ");
         qb.push_bind(self.config.threshold_events);
         qb.push(" limit ");
@@ -212,7 +217,12 @@ impl<F: SnapshotFolder> Snapshotter<F> {
         let mut qb_candidates = QueryBuilder::<Postgres>::new(
             "select count(1) from (select e.stream_id from events e left join snapshots s on s.stream_id = e.stream_id where ",
         );
-        self.push_tenant_filter(&mut qb_candidates, tenant_ref);
+        // Add tenant filter with table prefix to avoid ambiguity
+        if let (Some(column), Some(value)) = (self.tenant_column(), tenant_ref) {
+            qb_candidates.push(format!("e.{} = ", schema::quote_ident(column)));
+            qb_candidates.push_bind(value);
+            qb_candidates.push(" and ");
+        }
         qb_candidates.push("1=1 group by e.stream_id, s.version having max(e.stream_seq) - coalesce(s.version, 0) >= ");
         qb_candidates.push_bind(self.config.threshold_events);
         qb_candidates.push(") t");

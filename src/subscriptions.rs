@@ -166,17 +166,41 @@ impl Subscriptions {
         start_from: i64,
     ) -> Result<()> {
         let filter_json = serde_json::to_value(filter)?;
-        // Note: subscriptions table is not tenant-scoped; it's global per subscription name
-        sqlx::query(
+        let tenant_value = self.resolve_conjoined_tenant()?;
+
+        let sql = if let (Some(col), Some(_)) = (self.tenant_column(), &tenant_value) {
+            // Conjoined mode: include tenant column in insert and conflict clause
+            format!(
+                r#"insert into subscriptions({}, name, last_seq, filter)
+                    values ($1, $2, $3, $4)
+                    on conflict ({}, name) do update set filter = excluded.filter, updated_at = now()"#,
+                schema::quote_ident(col),
+                schema::quote_ident(col)
+            )
+        } else {
+            // Single tenant or schema-per-tenant mode
             r#"insert into subscriptions(name, last_seq, filter)
                 values ($1, $2, $3)
-                on conflict (name) do update set filter = excluded.filter, updated_at = now()"#,
-        )
-        .bind(name)
-        .bind(start_from)
-        .bind(filter_json)
-        .execute(&self.pool)
-        .await?;
+                on conflict (name) do update set filter = excluded.filter, updated_at = now()"#
+                .to_string()
+        };
+
+        if let Some(tenant) = tenant_value {
+            sqlx::query(&sql)
+                .bind(tenant)
+                .bind(name)
+                .bind(start_from)
+                .bind(filter_json)
+                .execute(&self.pool)
+                .await?;
+        } else {
+            sqlx::query(&sql)
+                .bind(name)
+                .bind(start_from)
+                .bind(filter_json)
+                .execute(&self.pool)
+                .await?;
+        }
         Ok(())
     }
 
@@ -371,7 +395,16 @@ impl Subscriptions {
                 qb.push_bind(&filter.stream_ids);
                 qb.push("::uuid[] as ids, ");
                 qb.push_bind(&filter.stream_prefix);
-                qb.push("::text as prefix) select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, created_at from events, f where ");
+                qb.push("::text as prefix) select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, created_at");
+
+                // Include tenant column in SELECT if in conjoined mode
+                if let Some(column) = tenant_column_name.as_ref() {
+                    qb.push(", ");
+                    qb.push(schema::quote_ident(column));
+                    qb.push(" as tenant_id");
+                }
+
+                qb.push(" from events, f where ");
 
                 // Add tenant filter if in conjoined mode
                 if let (Some(column), Some(tenant_val)) =
