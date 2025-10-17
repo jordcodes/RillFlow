@@ -54,6 +54,7 @@ impl Default for Metrics {
 static METRICS: OnceLock<Metrics> = OnceLock::new();
 static TENANT_METRICS: OnceLock<Mutex<HashMap<String, TenantCounters>>> = OnceLock::new();
 static QUERY_DURATIONS: OnceLock<Mutex<HashMap<String, (u64, u64)>>> = OnceLock::new();
+static SLOW_QUERY_COUNT: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
 static SLOW_QUERY_THRESHOLD_MS: OnceLock<std::sync::atomic::AtomicU64> = OnceLock::new();
 static SLOW_QUERY_EXPLAIN: OnceLock<std::sync::atomic::AtomicBool> = OnceLock::new();
 static PROJECTION_STATS: OnceLock<Mutex<HashMap<String, (u64, u64, u64)>>> = OnceLock::new();
@@ -370,6 +371,14 @@ pub fn render_prometheus() -> String {
         }
     }
 
+    // slow query counters by op
+    if let Ok(map) = SLOW_QUERY_COUNT.get_or_init(Default::default).lock() {
+        for (op, count) in map.iter() {
+            let escaped = escape_label(op);
+            let _ = writeln!(s, "# TYPE slow_queries_total counter\nslow_queries_total{{op=\"{}\"}} {}", escaped, count);
+        }
+    }
+
     // projection stats: total events and batch durations
     if let Ok(map) = PROJECTION_STATS.get_or_init(Default::default).lock() {
         for (name, (events_total, batch_count, batch_sum_ms)) in map.iter() {
@@ -394,6 +403,12 @@ pub fn record_query_duration(op: &str, dur: Duration) {
         let entry = map.entry(op.to_string()).or_insert((0, 0));
         entry.0 = entry.0.saturating_add(1);
         entry.1 = entry.1.saturating_add(dur.as_millis() as u64);
+    }
+    if dur >= slow_query_threshold() {
+        if let Ok(mut map) = SLOW_QUERY_COUNT.get_or_init(Default::default).lock() {
+            let entry = map.entry(op.to_string()).or_insert(0);
+            *entry = entry.saturating_add(1);
+        }
     }
 }
 

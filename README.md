@@ -59,6 +59,28 @@ cargo run --bin rillflow -- projections run-loop --use-notify true --health-bind
 curl -s http://127.0.0.1:8080/metrics | head -50
 ```
 
+### OpenTelemetry (optional)
+
+Rillflow can emit spans to an OTLP collector when built with the `otel` feature. By default, OTEL is disabled and only Prometheus metrics are exposed.
+
+Build/run with OTEL enabled:
+
+```bash
+cargo run --features "cli otel" --bin rillflow -- schema-plan --database-url "$DATABASE_URL"
+```
+
+Environment variables:
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+export OTEL_SERVICE_NAME=rillflow
+# optional: RUST_LOG=info,rillflow=debug
+```
+
+Notes:
+- If `OTEL_EXPORTER_OTLP_ENDPOINT` is not set, OTEL init is a no-op.
+- Prometheus metrics remain available at the health bind endpoint.
+
 - Streams
 ```bash
 cargo run --bin rillflow -- streams resolve orders:42 --database-url "$DATABASE_URL"

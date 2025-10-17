@@ -506,6 +506,8 @@ enum HealthCmd {
 
 #[tokio::main]
 async fn main() -> rillflow::Result<()> {
+    // Initialize OTEL if configured
+    let _ = rillflow::tracing::init_otlp_from_env();
     let cli = Cli::parse();
 
     let url = match cli

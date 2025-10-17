@@ -1214,9 +1214,10 @@ where
         let query = builder.build_query_as::<(Value,)>();
         let start = std::time::Instant::now();
         let rows = query.fetch_all(&pool).await?;
-        crate::metrics::record_query_duration("docs_fetch_all", start.elapsed());
+        let elapsed = start.elapsed();
+        crate::metrics::record_query_duration("docs_fetch_all", elapsed);
         // slow query logging
-        if start.elapsed() > crate::metrics::slow_query_threshold() {
+        if elapsed > crate::metrics::slow_query_threshold() {
             tracing::warn!(target: "rillflow::slow_query", elapsed_ms = start.elapsed().as_millis() as u64, sql = %sql_captured, "slow document query");
             if crate::metrics::slow_query_explain_enabled() {
                 // Best-effort EXPLAIN (without executing)

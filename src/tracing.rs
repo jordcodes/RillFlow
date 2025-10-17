@@ -2,6 +2,45 @@ use serde_json::json;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
+#[cfg(feature = "otel")]
+pub fn init_otlp_from_env() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use opentelemetry::KeyValue;
+    use opentelemetry_otlp::WithExportConfig;
+    use opentelemetry_sdk::trace as sdktrace;
+    use opentelemetry_sdk::{self, Resource};
+    use tracing_subscriber::prelude::*;
+
+    if std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_err() {
+        return Ok(());
+    }
+
+    let service_name =
+        std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "rillflow".to_string());
+    let tracer =
+        opentelemetry_otlp::new_pipeline()
+            .tracing()
+            .with_exporter(opentelemetry_otlp::new_exporter().tonic())
+            .with_trace_config(sdktrace::config().with_resource(Resource::new(vec![
+                KeyValue::new("service.name", service_name),
+            ])))
+            .install_batch(opentelemetry_sdk::runtime::Tokio)?;
+
+    let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+    let env_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::new(env_filter))
+        .with(tracing_subscriber::fmt::layer().json())
+        .with(otel_layer)
+        .try_init()
+        .ok();
+    Ok(())
+}
+
+#[cfg(not(feature = "otel"))]
+pub fn init_otlp_from_env() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    Ok(())
+}
+
 type TraceEntry = (String, String, serde_json::Value);
 type TraceBuffer = HashMap<String, VecDeque<TraceEntry>>;
 

@@ -906,6 +906,8 @@ impl DocumentSession {
         let mut events_written = 0u64;
         if !event_ops.is_empty() {
             for op in &event_ops {
+                let span = tracing::info_span!("events.append_batch", stream_id = %op.stream_id);
+                let _g = span.enter();
                 let result = self
                     .events_api
                     .append_with_tx(&mut tx, op.stream_id, op.expected, &op.events, &op.options)
