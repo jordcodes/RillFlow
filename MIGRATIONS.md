@@ -23,6 +23,18 @@ The `sql/0001_init.sql` migration creates:
 - `projections`: checkpoint table for projection processors (adds `tenant_id` in conjoined mode)
 - `snapshots`: snapshotting table for aggregates (`stream_id uuid pk, version int, body jsonb, created_at timestamptz`).
 - `stream_aliases`: human-friendly stream aliases (includes `tenant_id` in conjoined mode).
+- `subscriptions`: consumer checkpoints (`tenant_id` support for conjoined mode).
+- `subscription_groups`: per-group checkpoints (`tenant_id` support for conjoined mode).
+- `subscription_group_leases`: cooperative leases (`tenant_id` support for conjoined mode).
+- `subscription_dlq`: dead-letter queue entries (`tenant_id` support for conjoined mode).
+
+> **Upgrading to conjoined tenancy**
+>
+> When you enable conjoined tenancy on an existing database, populate the new `tenant_id`
+> columns on `subscriptions`, `subscription_groups`, `subscription_group_leases`, and
+> `subscription_dlq` before relying on them for isolation. The schema planner will add the
+> columns automatically; you can backfill them with an `update` statement that tags each row
+> with the appropriate tenant identifier.
 
 Rillflow's schema manager (CLI) can also create projection runtime support tables:
 

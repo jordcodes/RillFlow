@@ -58,6 +58,7 @@ pub struct Subscriptions {
     pool: PgPool,
     tenant_strategy: TenantStrategy,
     tenant_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
+    tenant: Option<String>,
 }
 
 impl Subscriptions {
@@ -66,6 +67,7 @@ impl Subscriptions {
             pool,
             tenant_strategy: TenantStrategy::Single,
             tenant_resolver: None,
+            tenant: None,
         }
     }
 
@@ -82,19 +84,28 @@ impl Subscriptions {
         pool: PgPool,
         tenant_strategy: TenantStrategy,
         tenant_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
+        tenant: Option<String>,
     ) -> Self {
         Self {
             pool,
             tenant_strategy,
             tenant_resolver,
+            tenant,
         }
+    }
+
+    pub fn with_tenant(mut self, tenant: impl Into<String>) -> Self {
+        self.tenant = Some(tenant.into());
+        self
     }
 
     fn resolve_schema(&self) -> Result<Option<String>> {
         match self.tenant_strategy {
             TenantStrategy::Single => Ok(None),
             TenantStrategy::Conjoined { .. } => {
-                if let Some(resolver) = &self.tenant_resolver {
+                if self.tenant.is_some() {
+                    Ok(None)
+                } else if let Some(resolver) = &self.tenant_resolver {
                     if (resolver)().is_some() {
                         return Ok(None);
                     }
@@ -142,6 +153,18 @@ impl Subscriptions {
     ) -> Result<(SubscriptionHandle, mpsc::Receiver<EventEnvelope>)> {
         self.create_or_update(name, &filter, opts.start_from)
             .await?;
+        let tenant_value = match &self.tenant_strategy {
+            TenantStrategy::Conjoined { .. } => {
+                if let Some(t) = &self.tenant {
+                    Some(t.clone())
+                } else if let Some(resolver) = &self.tenant_resolver {
+                    (resolver)()
+                } else {
+                    return Err(Error::TenantRequired);
+                }
+            }
+            _ => None,
+        };
 
         let (tx, rx) = mpsc::channel::<EventEnvelope>(opts.channel_capacity);
         let pool = self.pool.clone();

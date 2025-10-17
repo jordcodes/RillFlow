@@ -132,6 +132,11 @@ impl SchemaManager {
         let projections_exists = existing_tables.contains("projections");
         let snapshots_exists = existing_tables.contains("snapshots");
         let stream_aliases_exists = existing_tables.contains("stream_aliases");
+        let subscriptions_exists = existing_tables.contains("subscriptions");
+        let subscription_groups_exists = existing_tables.contains("subscription_groups");
+        let subscription_group_leases_exists =
+            existing_tables.contains("subscription_group_leases");
+        let subscription_dlq_exists = existing_tables.contains("subscription_dlq");
 
         ensure_table(plan, schema, &existing_tables, "docs", |s| {
             build_docs_table_sql(s, tenant_column)
@@ -283,20 +288,46 @@ impl SchemaManager {
         }
 
         // Subscription consumer groups (per-group checkpoints and leases)
-        ensure_table(
-            plan,
-            schema,
-            &existing_tables,
-            "subscription_groups",
-            build_subscription_groups_table_sql,
-        );
+        ensure_table(plan, schema, &existing_tables, "subscriptions", |s| {
+            build_subscriptions_table_sql(s, tenant_column)
+        });
+        if subscriptions_exists {
+            if let Some(column) = tenant_column {
+                self.ensure_tenant_column(plan, schema, "subscriptions", column)
+                    .await?;
+            }
+        }
+        ensure_table(plan, schema, &existing_tables, "subscription_groups", |s| {
+            build_subscription_groups_table_sql(s, tenant_column)
+        });
+        if subscription_groups_exists {
+            if let Some(column) = tenant_column {
+                self.ensure_tenant_column(plan, schema, "subscription_groups", column)
+                    .await?;
+            }
+        }
         ensure_table(
             plan,
             schema,
             &existing_tables,
             "subscription_group_leases",
-            build_subscription_group_leases_table_sql,
+            |s| build_subscription_group_leases_table_sql(s, tenant_column),
         );
+        if subscription_group_leases_exists {
+            if let Some(column) = tenant_column {
+                self.ensure_tenant_column(plan, schema, "subscription_group_leases", column)
+                    .await?;
+            }
+        }
+        ensure_table(plan, schema, &existing_tables, "subscription_dlq", |s| {
+            build_subscription_dlq_table_sql(s, tenant_column)
+        });
+        if subscription_dlq_exists {
+            if let Some(column) = tenant_column {
+                self.ensure_tenant_column(plan, schema, "subscription_dlq", column)
+                    .await?;
+            }
+        }
 
         Ok(())
     }
@@ -941,10 +972,58 @@ fn build_stream_aliases_table_sql(schema: &str, tenant_column: Option<&TenantCol
     )
 }
 
-fn build_subscription_groups_table_sql(schema: &str) -> String {
+fn build_subscriptions_table_sql(schema: &str, tenant_column: Option<&TenantColumn>) -> String {
+    let tenant_column_sql = tenant_column
+        .map(|col| {
+            format!(
+                "            {} {} null,\n",
+                quote_ident(&col.name),
+                col.data_type.as_sql()
+            )
+        })
+        .unwrap_or_default();
+    let primary_key = tenant_column
+        .map(|col| format!("primary key ({}, name)", quote_ident(&col.name)))
+        .unwrap_or_else(|| "primary key (name)".to_string());
     formatdoc!(
         r#"
         create table if not exists {table} (
+{tenant_column}
+            name text not null,
+            last_seq bigint not null default 0,
+            filter jsonb not null default '{{}}'::jsonb,
+            paused boolean not null default false,
+            backoff_until timestamptz null,
+            updated_at timestamptz not null default now(),
+            {primary_key}
+        )
+        "#,
+        table = qualified_name(schema, "subscriptions"),
+        tenant_column = tenant_column_sql,
+        primary_key = primary_key,
+    )
+}
+
+fn build_subscription_groups_table_sql(
+    schema: &str,
+    tenant_column: Option<&TenantColumn>,
+) -> String {
+    let tenant_column_sql = tenant_column
+        .map(|col| {
+            format!(
+                "            {} {} null,\n",
+                quote_ident(&col.name),
+                col.data_type.as_sql()
+            )
+        })
+        .unwrap_or_default();
+    let primary_key = tenant_column
+        .map(|col| format!("primary key ({}, name, grp)", quote_ident(&col.name)))
+        .unwrap_or_else(|| "primary key (name, grp)".to_string());
+    formatdoc!(
+        r#"
+        create table if not exists {table} (
+{tenant_column}
             name text not null,
             grp text not null,
             last_seq bigint not null default 0,
@@ -952,26 +1031,74 @@ fn build_subscription_groups_table_sql(schema: &str) -> String {
             backoff_until timestamptz null,
             max_in_flight int null,
             updated_at timestamptz not null default now(),
-            primary key (name, grp)
+            {primary_key}
         )
         "#,
         table = qualified_name(schema, "subscription_groups"),
+        tenant_column = tenant_column_sql,
+        primary_key = primary_key,
     )
 }
 
-fn build_subscription_group_leases_table_sql(schema: &str) -> String {
+fn build_subscription_group_leases_table_sql(
+    schema: &str,
+    tenant_column: Option<&TenantColumn>,
+) -> String {
+    let tenant_column_sql = tenant_column
+        .map(|col| {
+            format!(
+                "            {} {} null,\n",
+                quote_ident(&col.name),
+                col.data_type.as_sql()
+            )
+        })
+        .unwrap_or_default();
+    let primary_key = tenant_column
+        .map(|col| format!("primary key ({}, name, grp)", quote_ident(&col.name)))
+        .unwrap_or_else(|| "primary key (name, grp)".to_string());
     formatdoc!(
         r#"
         create table if not exists {table} (
+{tenant_column}
             name text not null,
             grp text not null,
             leased_by text not null,
             lease_until timestamptz not null,
             updated_at timestamptz not null default now(),
-            primary key (name, grp)
+            {primary_key}
         )
         "#,
         table = qualified_name(schema, "subscription_group_leases"),
+        tenant_column = tenant_column_sql,
+        primary_key = primary_key,
+    )
+}
+
+fn build_subscription_dlq_table_sql(schema: &str, tenant_column: Option<&TenantColumn>) -> String {
+    let tenant_column_sql = tenant_column
+        .map(|col| {
+            format!(
+                "            {} {} null,\n",
+                quote_ident(&col.name),
+                col.data_type.as_sql()
+            )
+        })
+        .unwrap_or_default();
+    formatdoc!(
+        r#"
+        create table if not exists {table} (
+{tenant_column}
+            id bigserial primary key,
+            name text not null,
+            global_seq bigint not null,
+            event_type text not null,
+            body jsonb not null,
+            error text not null,
+            failed_at timestamptz not null default now()
+        )
+        "#,
+        table = qualified_name(schema, "subscription_dlq"),
+        tenant_column = tenant_column_sql,
     )
 }
 

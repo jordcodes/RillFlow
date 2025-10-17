@@ -178,6 +178,7 @@ create table if not exists snapshots (
 
 -- subscriptions (consumer checkpoints)
 create table if not exists subscriptions (
+    tenant_id text null,
     name text primary key,
     last_seq bigint not null default 0,
     filter jsonb not null default '{}'::jsonb,
@@ -188,6 +189,7 @@ create table if not exists subscriptions (
 
 -- subscription consumer groups (per-group checkpoints)
 create table if not exists subscription_groups (
+    tenant_id text null,
     name text not null,
     grp text not null,
     last_seq bigint not null default 0,
@@ -204,6 +206,7 @@ add column if not exists max_in_flight int null;
 
 -- subscription group leases (single worker per group)
 create table if not exists subscription_group_leases (
+    tenant_id text null,
     name text not null,
     grp text not null,
     leased_by text not null,
@@ -215,6 +218,7 @@ create table if not exists subscription_group_leases (
 -- subscription dead-letter queue
 create table if not exists subscription_dlq (
     id bigserial primary key,
+    tenant_id text null,
     name text not null,
     global_seq bigint not null,
     event_type text not null,

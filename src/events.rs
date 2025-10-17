@@ -1,8 +1,8 @@
 use crate::projections::ProjectionHandler;
-use crate::{Error, Result, metrics};
+use crate::{Error, Result, metrics, schema, store::TenantStrategy};
 use serde::Serialize;
 use serde_json::Value;
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgPool, Postgres, QueryBuilder, Transaction};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use uuid::Uuid;
@@ -41,6 +41,9 @@ pub struct Events {
     pub(crate) pool: PgPool,
     pub(crate) use_advisory_lock: bool,
     pub(crate) apply_inline: bool,
+    tenant_strategy: TenantStrategy,
+    tenant_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
+    tenant: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -60,6 +63,31 @@ pub struct EventEnvelope {
 }
 
 impl Events {
+    pub(crate) fn new(
+        pool: PgPool,
+        tenant_strategy: TenantStrategy,
+        tenant_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
+        tenant: Option<String>,
+    ) -> Self {
+        Self {
+            pool,
+            use_advisory_lock: false,
+            apply_inline: false,
+            tenant_strategy,
+            tenant_resolver,
+            tenant,
+        }
+    }
+
+    pub fn with_tenant(mut self, tenant: impl Into<String>) -> Self {
+        self.tenant = Some(tenant.into());
+        self
+    }
+
+    pub(crate) fn set_tenant(&mut self, tenant: Option<String>) {
+        self.tenant = tenant;
+    }
+
     pub fn with_advisory_locks(mut self) -> Self {
         self.use_advisory_lock = true;
         self
@@ -68,6 +96,50 @@ impl Events {
     pub fn enable_inline_projections(mut self) -> Self {
         self.apply_inline = true;
         self
+    }
+
+    fn tenant_column(&self) -> Option<&str> {
+        match &self.tenant_strategy {
+            TenantStrategy::Conjoined { column } => Some(column.name.as_str()),
+            _ => None,
+        }
+    }
+
+    fn resolve_conjoined_tenant(&self) -> Result<Option<String>> {
+        match &self.tenant_strategy {
+            TenantStrategy::Conjoined { .. } => {
+                if let Some(t) = &self.tenant {
+                    return Ok(Some(t.clone()));
+                }
+                if let Some(resolver) = &self.tenant_resolver {
+                    if let Some(t) = (resolver)() {
+                        return Ok(Some(t));
+                    }
+                }
+                Err(Error::TenantRequired)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn metrics_label(&self) -> Option<&str> {
+        if matches!(self.tenant_strategy, TenantStrategy::Conjoined { .. }) {
+            self.tenant.as_deref()
+        } else {
+            None
+        }
+    }
+
+    fn push_tenant_filter<'a>(
+        &self,
+        qb: &mut QueryBuilder<'a, Postgres>,
+        tenant: Option<&'a String>,
+    ) {
+        if let (Some(column), Some(value)) = (self.tenant_column(), tenant) {
+            qb.push(format!("{} = ", schema::quote_ident(column)));
+            qb.push_bind(value);
+            qb.push(" and ");
+        }
     }
 
     pub async fn append_stream(
@@ -98,12 +170,14 @@ impl Events {
     }
 
     pub async fn read_stream(&self, stream_id: Uuid) -> Result<Vec<(i32, Event)>> {
-        let rows: Vec<(i32, String, Value)> = sqlx::query_as(
-            "select stream_seq, event_type, body from events where stream_id = $1 order by stream_seq asc",
-        )
-        .bind(stream_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let tenant_value = self.resolve_conjoined_tenant()?;
+        let mut qb =
+            QueryBuilder::<Postgres>::new("select stream_seq, event_type, body from events where ");
+        self.push_tenant_filter(&mut qb, tenant_value.as_ref());
+        qb.push("stream_id = ");
+        qb.push_bind(stream_id);
+        qb.push(" order by stream_seq asc");
+        let rows: Vec<(i32, String, Value)> = qb.build_query_as().fetch_all(&self.pool).await?;
 
         Ok(rows
             .into_iter()
@@ -112,7 +186,31 @@ impl Events {
     }
 
     pub async fn read_stream_envelopes(&self, stream_id: Uuid) -> Result<Vec<EventEnvelope>> {
+        let tenant_value = self.resolve_conjoined_tenant()?;
+        let tenant_ref = tenant_value.as_ref();
         #[allow(clippy::type_complexity)]
+        let mut qb = QueryBuilder::<Postgres>::new("with combined as (");
+        qb.push("select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, ");
+        if let Some(column) = self.tenant_column() {
+            qb.push(format!("{} as tenant_id, ", schema::quote_ident(column)));
+        } else {
+            qb.push("null::text as tenant_id, ");
+        }
+        qb.push("user_id, created_at from events where ");
+        self.push_tenant_filter(&mut qb, tenant_ref);
+        qb.push("stream_id = ");
+        qb.push_bind(stream_id);
+        qb.push(" union all select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, ");
+        if let Some(column) = self.tenant_column() {
+            qb.push(format!("{} as tenant_id, ", schema::quote_ident(column)));
+        } else {
+            qb.push("null::text as tenant_id, ");
+        }
+        qb.push("user_id, created_at from events_archive where ");
+        self.push_tenant_filter(&mut qb, tenant_ref);
+        qb.push("stream_id = ");
+        qb.push_bind(stream_id);
+        qb.push(") select * from combined order by stream_seq asc");
         let rows: Vec<(
             i64,
             Uuid,
@@ -126,21 +224,7 @@ impl Events {
             Option<String>,
             Option<String>,
             chrono::DateTime<chrono::Utc>,
-        )> = sqlx::query_as(
-            r#"
-            with combined as (
-              select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, tenant_id, user_id, created_at
-              from events where stream_id = $1
-              union all
-              select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, tenant_id, user_id, created_at
-              from events_archive where stream_id = $1
-            )
-            select * from combined order by stream_seq asc
-            "#,
-        )
-        .bind(stream_id)
-        .fetch_all(&self.pool)
-        .await?;
+        )> = qb.build_query_as().fetch_all(&self.pool).await?;
 
         Ok(rows
             .into_iter()
@@ -205,18 +289,23 @@ impl Events {
             return Ok(());
         }
 
+        let tenant_value = self.resolve_conjoined_tenant()?;
+        let tenant_ref = tenant_value.as_ref();
+        let metrics_label = tenant_ref
+            .map(|s| s.as_str())
+            .or_else(|| self.metrics_label());
         let mut tx = self.pool.begin().await?;
         let res = self
-            .append_with_tx_internal(&mut tx, stream_id, expected, &events, opts)
+            .append_with_tx_internal(&mut tx, stream_id, expected, &events, opts, tenant_ref)
             .await;
         match res {
             Ok(()) => {
                 tx.commit().await?;
-                metrics::record_event_appends(None, events.len() as u64);
+                metrics::record_event_appends(metrics_label, events.len() as u64);
                 Ok(())
             }
             Err(err) => {
-                metrics::record_event_conflict(None);
+                metrics::record_event_conflict(metrics_label);
                 Err(err)
             }
         }
@@ -229,6 +318,7 @@ impl Events {
         expected: Expected,
         events: &[Event],
         opts: &AppendOptions,
+        tenant: Option<&String>,
     ) -> Result<()> {
         if events.is_empty() {
             return Ok(());
@@ -242,13 +332,20 @@ impl Events {
                 .await?;
         }
 
-        let current: i32 = sqlx::query_scalar::<_, Option<i32>>(
-            "select max(stream_seq) from events where stream_id = $1",
-        )
-        .bind(stream_id)
-        .fetch_one(&mut **tx)
-        .await?
-        .unwrap_or(0);
+        if self.tenant_column().is_some() && tenant.is_none() {
+            return Err(Error::TenantRequired);
+        }
+
+        let mut seq_query =
+            QueryBuilder::<Postgres>::new("select max(stream_seq) from events where ");
+        self.push_tenant_filter(&mut seq_query, tenant);
+        seq_query.push("stream_id = ");
+        seq_query.push_bind(stream_id);
+        let current: i32 = seq_query
+            .build_query_scalar::<Option<i32>>()
+            .fetch_one(&mut **tx)
+            .await?
+            .unwrap_or(0);
 
         match expected {
             Expected::Any => {}
@@ -286,19 +383,33 @@ impl Events {
             }
 
             seq += 1;
-            let res = sqlx::query(
-                r#"insert into events (stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, tenant_id, user_id)
-                    values ($1, $2, $3, $4, $5, $6, $7, 1, null, current_user)"#,
-            )
-            .bind(stream_id)
-            .bind(seq)
-            .bind(&event.typ)
-            .bind(&event.body)
-            .bind(&headers)
-            .bind(opts.causation_id)
-            .bind(opts.correlation_id)
-            .execute(&mut **tx)
-            .await;
+            let mut insert = QueryBuilder::<Postgres>::new("insert into events (");
+            if let (Some(column), Some(value)) = (self.tenant_column(), tenant) {
+                insert.push(format!("{}, ", schema::quote_ident(column)));
+                insert.push("stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, user_id) values (");
+                insert.push_bind(value);
+                insert.push(", ");
+            } else {
+                insert.push(
+                    "stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, user_id) values (",
+                );
+            }
+            insert.push_bind(stream_id);
+            insert.push(", ");
+            insert.push_bind(seq);
+            insert.push(", ");
+            insert.push_bind(&event.typ);
+            insert.push(", ");
+            insert.push_bind(&event.body);
+            insert.push(", ");
+            insert.push_bind(&headers);
+            insert.push(", ");
+            insert.push_bind(opts.causation_id);
+            insert.push(", ");
+            insert.push_bind(opts.correlation_id);
+            insert.push(", 1, current_user)");
+
+            let res = insert.build().execute(&mut **tx).await;
 
             if let Err(e) = res {
                 if let sqlx::Error::Database(db_err) = &e {
@@ -332,7 +443,8 @@ impl Events {
         events: &[Event],
         opts: &AppendOptions,
     ) -> Result<()> {
-        self.append_with_tx_internal(tx, stream_id, expected, events, opts)
+        let tenant_value = self.resolve_conjoined_tenant()?;
+        self.append_with_tx_internal(tx, stream_id, expected, events, opts, tenant_value.as_ref())
             .await
     }
 
@@ -351,28 +463,37 @@ impl Events {
         stream_id: Uuid,
         before: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64> {
+        let tenant_value = self.resolve_conjoined_tenant()?;
+        let tenant_ref = tenant_value.as_ref();
         let mut tx = self.pool.begin().await?;
         // Move rows to archive
-        let moved = sqlx::query(
-            r#"
-            insert into events_archive (global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, tenant_id, user_id, created_at)
-            select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, tenant_id, user_id, created_at
-            from events where stream_id = $1 and created_at < $2
-            on conflict (global_seq) do nothing
-            "#,
-        )
-        .bind(stream_id)
-        .bind(before)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+        let mut insert = QueryBuilder::<Postgres>::new("insert into events_archive (");
+        if let (Some(column), Some(value)) = (self.tenant_column(), tenant_ref) {
+            insert.push(format!("{}, ", schema::quote_ident(column)));
+            insert.push("global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, user_id, created_at) select ");
+            insert.push_bind(value);
+            insert.push(", global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, user_id, created_at from events where ");
+        } else {
+            insert.push(
+                "global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, user_id, created_at) select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, user_id, created_at from events where ",
+            );
+        }
+        self.push_tenant_filter(&mut insert, tenant_ref);
+        insert.push("stream_id = ");
+        insert.push_bind(stream_id);
+        insert.push(" and created_at < ");
+        insert.push_bind(before);
+        insert.push(" on conflict (global_seq) do nothing");
+        let moved = insert.build().execute(&mut *tx).await?.rows_affected();
 
         // Delete moved rows from live
-        let _ = sqlx::query("delete from events where stream_id = $1 and created_at < $2")
-            .bind(stream_id)
-            .bind(before)
-            .execute(&mut *tx)
-            .await?;
+        let mut delete = QueryBuilder::<Postgres>::new("delete from events where ");
+        self.push_tenant_filter(&mut delete, tenant_ref);
+        delete.push("stream_id = ");
+        delete.push_bind(stream_id);
+        delete.push(" and created_at < ");
+        delete.push_bind(before);
+        delete.build().execute(&mut *tx).await?;
 
         tx.commit().await?;
         Ok(moved)
@@ -380,25 +501,43 @@ impl Events {
 
     pub async fn append_tombstone(&self, stream_id: Uuid, reason: &str) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        let current: i32 = sqlx::query_scalar::<_, Option<i32>>(
-            "select max(stream_seq) from events where stream_id = $1",
-        )
-        .bind(stream_id)
-        .fetch_one(&mut *tx)
-        .await?
-        .unwrap_or(0);
+        let tenant_value = self.resolve_conjoined_tenant()?;
+        let tenant_ref = tenant_value.as_ref();
+        if self.tenant_column().is_some() && tenant_ref.is_none() {
+            return Err(Error::TenantRequired);
+        }
+        let mut qb = QueryBuilder::<Postgres>::new("select max(stream_seq) from events where ");
+        self.push_tenant_filter(&mut qb, tenant_ref);
+        qb.push("stream_id = ");
+        qb.push_bind(stream_id);
+        let current: i32 = qb
+            .build_query_scalar::<Option<i32>>()
+            .fetch_one(&mut *tx)
+            .await?
+            .unwrap_or(0);
         let next = current + 1;
-        sqlx::query(
-            r#"insert into events (stream_id, stream_seq, event_type, body, headers, is_tombstone, event_version, user_id)
-                values ($1,$2,$3,$4,$5,true,1,current_user)"#,
-        )
-        .bind(stream_id)
-        .bind(next)
-        .bind("$tombstone")
-        .bind(serde_json::json!({"reason": reason}))
-        .bind(serde_json::json!({}))
-        .execute(&mut *tx)
-        .await?;
+        let mut insert = QueryBuilder::<Postgres>::new("insert into events (");
+        if let (Some(column), Some(value)) = (self.tenant_column(), tenant_ref) {
+            insert.push(format!("{}, ", schema::quote_ident(column)));
+            insert.push("stream_id, stream_seq, event_type, body, headers, is_tombstone, event_version, user_id) values (");
+            insert.push_bind(value);
+            insert.push(", ");
+        } else {
+            insert.push(
+                "stream_id, stream_seq, event_type, body, headers, is_tombstone, event_version, user_id) values (",
+            );
+        }
+        insert.push_bind(stream_id);
+        insert.push(", ");
+        insert.push_bind(next);
+        insert.push(", ");
+        insert.push_bind("$tombstone");
+        insert.push(", ");
+        insert.push_bind(serde_json::json!({"reason": reason}));
+        insert.push(", ");
+        insert.push_bind(serde_json::json!({}));
+        insert.push(", true, 1, current_user)");
+        insert.build().execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
     }
