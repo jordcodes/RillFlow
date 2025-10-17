@@ -5,7 +5,7 @@ use crate::{
     store::{TenantStrategy, tenant_schema_name},
 };
 use serde::{Deserialize, Serialize};
-use sqlx::{Acquire, PgPool, Postgres, Row, Transaction, postgres::PgRow};
+use sqlx::{Acquire, PgPool, Postgres, QueryBuilder, Row, Transaction, postgres::PgRow};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant, sleep};
@@ -84,13 +84,12 @@ impl Subscriptions {
         pool: PgPool,
         tenant_strategy: TenantStrategy,
         tenant_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
-        tenant: Option<String>,
     ) -> Self {
         Self {
             pool,
             tenant_strategy,
             tenant_resolver,
-            tenant,
+            tenant: None,
         }
     }
 
@@ -99,12 +98,48 @@ impl Subscriptions {
         self
     }
 
+    fn tenant_column(&self) -> Option<&str> {
+        match &self.tenant_strategy {
+            TenantStrategy::Conjoined { column } => Some(column.name.as_str()),
+            _ => None,
+        }
+    }
+
+    fn resolve_conjoined_tenant(&self) -> Result<Option<String>> {
+        match &self.tenant_strategy {
+            TenantStrategy::Conjoined { .. } => {
+                if let Some(t) = &self.tenant {
+                    return Ok(Some(t.clone()));
+                }
+                if let Some(resolver) = &self.tenant_resolver {
+                    if let Some(t) = (resolver)() {
+                        return Ok(Some(t));
+                    }
+                }
+                Err(Error::TenantRequired)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn push_tenant_filter<'a>(
+        &self,
+        qb: &mut sqlx::QueryBuilder<'a, sqlx::Postgres>,
+        tenant: Option<&'a String>,
+    ) {
+        if let (Some(column), Some(value)) = (self.tenant_column(), tenant) {
+            qb.push(format!("{} = ", schema::quote_ident(column)));
+            qb.push_bind(value);
+            qb.push(" and ");
+        }
+    }
+
     fn resolve_schema(&self) -> Result<Option<String>> {
         match self.tenant_strategy {
             TenantStrategy::Single => Ok(None),
             TenantStrategy::Conjoined { .. } => {
                 if self.tenant.is_some() {
-                    Ok(None)
+                    return Ok(None);
                 } else if let Some(resolver) = &self.tenant_resolver {
                     if (resolver)().is_some() {
                         return Ok(None);
@@ -131,6 +166,7 @@ impl Subscriptions {
         start_from: i64,
     ) -> Result<()> {
         let filter_json = serde_json::to_value(filter)?;
+        // Note: subscriptions table is not tenant-scoped; it's global per subscription name
         sqlx::query(
             r#"insert into subscriptions(name, last_seq, filter)
                 values ($1, $2, $3)
@@ -174,6 +210,7 @@ impl Subscriptions {
         let handle_group = opts.group.clone();
         let tenant_strategy = self.tenant_strategy.clone();
         let tenant_resolver = self.tenant_resolver.clone();
+        let tenant_column_name = self.tenant_column().map(|s| s.to_string());
         tokio::spawn(async move {
             let mut cursor = opts.start_from;
             let mut conn = match pool.acquire().await {
@@ -326,31 +363,37 @@ impl Subscriptions {
 
                 let limit = std::cmp::min(opts.batch_size, opts.max_in_flight as i64);
                 let q_start = Instant::now();
-                let rows: Vec<PgRow> = sqlx::query(
-                    r#"
-                    with f as (
-                      select $2::text[] as types,
-                             $3::uuid[] as ids,
-                             $4::text as prefix
-                    )
-                    select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, created_at
-                      from events, f
-                     where global_seq > $1
-                       and ($2::text[] is null or event_type = any(f.types))
-                       and ($3::uuid[] is null or stream_id = any(f.ids))
-                       and ($4::text is null or stream_id::text like (f.prefix || '%'))
-                     order by global_seq asc
-                     limit $5
-                    "#,
-                )
-                .bind(cursor)
-                .bind(filter.event_types.clone())
-                .bind(filter.stream_ids.clone())
-                .bind(filter.stream_prefix.clone())
-                .bind(limit)
-                .fetch_all(&mut *conn)
-                .await
-                .unwrap_or_default();
+
+                // Build query with optional tenant filter for conjoined mode
+                let mut qb = QueryBuilder::<sqlx::Postgres>::new("with f as (select ");
+                qb.push_bind(&filter.event_types);
+                qb.push("::text[] as types, ");
+                qb.push_bind(&filter.stream_ids);
+                qb.push("::uuid[] as ids, ");
+                qb.push_bind(&filter.stream_prefix);
+                qb.push("::text as prefix) select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, created_at from events, f where ");
+
+                // Add tenant filter if in conjoined mode
+                if let (Some(column), Some(tenant_val)) =
+                    (tenant_column_name.as_ref(), tenant_value.as_ref())
+                {
+                    qb.push(format!("{} = ", schema::quote_ident(column)));
+                    qb.push_bind(tenant_val);
+                    qb.push(" and ");
+                }
+
+                qb.push("global_seq > ");
+                qb.push_bind(cursor);
+                qb.push(" and (");
+                qb.push_bind(&filter.event_types);
+                qb.push("::text[] is null or event_type = any(f.types)) and (");
+                qb.push_bind(&filter.stream_ids);
+                qb.push("::uuid[] is null or stream_id = any(f.ids)) and (");
+                qb.push_bind(&filter.stream_prefix);
+                qb.push("::text is null or stream_id::text like (f.prefix || '%')) order by global_seq asc limit ");
+                qb.push_bind(limit);
+
+                let rows: Vec<PgRow> = qb.build().fetch_all(&mut *conn).await.unwrap_or_default();
                 crate::metrics::record_query_duration(
                     "subscription_fetch_batch",
                     q_start.elapsed(),

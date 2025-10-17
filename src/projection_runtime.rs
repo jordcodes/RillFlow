@@ -4,10 +4,11 @@ use std::time::Duration;
 use crate::{
     Error, Result, SessionContext,
     projections::ProjectionHandler,
+    schema,
     store::{TenantStrategy, tenant_schema_name},
 };
 use serde_json::Value;
-use sqlx::{PgPool, types::Json};
+use sqlx::{PgPool, Postgres, QueryBuilder, types::Json};
 use tracing::{info, instrument, warn};
 
 #[derive(Clone)]
@@ -73,6 +74,42 @@ impl ProjectionDaemon {
             name: name.into(),
             handler,
         });
+    }
+
+    fn tenant_column(&self) -> Option<&str> {
+        match &self.config.tenant_strategy {
+            TenantStrategy::Conjoined { column } => Some(column.name.as_str()),
+            _ => None,
+        }
+    }
+
+    fn resolve_conjoined_tenant(&self, context: &SessionContext) -> Result<Option<String>> {
+        match &self.config.tenant_strategy {
+            TenantStrategy::Conjoined { .. } => {
+                if let Some(ref t) = context.tenant {
+                    return Ok(Some(t.clone()));
+                }
+                if let Some(resolver) = &self.config.tenant_resolver {
+                    if let Some(t) = (resolver)() {
+                        return Ok(Some(t));
+                    }
+                }
+                Err(Error::TenantRequired)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn push_tenant_filter<'a>(
+        &self,
+        qb: &mut QueryBuilder<'a, Postgres>,
+        tenant: Option<&'a String>,
+    ) {
+        if let (Some(column), Some(value)) = (self.tenant_column(), tenant) {
+            qb.push(format!("{} = ", schema::quote_ident(column)));
+            qb.push_bind(value);
+            qb.push(" and ");
+        }
     }
 
     fn resolve_schema(&self, context: &SessionContext) -> Result<Option<String>> {
@@ -187,13 +224,19 @@ impl ProjectionDaemon {
             .unwrap_or(0);
 
         let q_start = std::time::Instant::now();
-        let rows: Vec<(i64, String, Value)> = sqlx::query_as(
-            "select global_seq, event_type, body from events where global_seq > $1 order by global_seq asc limit $2",
-        )
-        .bind(last_seq)
-        .bind(self.config.batch_size)
-        .fetch_all(&mut *tx)
-        .await?;
+
+        // Build query with optional tenant filter for conjoined mode
+        let tenant_value = self.resolve_conjoined_tenant(&context)?;
+        let tenant_ref = tenant_value.as_ref();
+        let mut qb =
+            QueryBuilder::<Postgres>::new("select global_seq, event_type, body from events where ");
+        self.push_tenant_filter(&mut qb, tenant_ref);
+        qb.push("global_seq > ");
+        qb.push_bind(last_seq);
+        qb.push(" order by global_seq asc limit ");
+        qb.push_bind(self.config.batch_size);
+
+        let rows: Vec<(i64, String, Value)> = qb.build_query_as().fetch_all(&mut *tx).await?;
         crate::metrics::record_query_duration("projection_fetch_batch", q_start.elapsed());
 
         if rows.is_empty() {
