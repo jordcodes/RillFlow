@@ -42,7 +42,22 @@ Rillflow's schema manager (CLI) can also create projection runtime support table
 - `projection_leases`: cooperative leases to avoid double processing in multi-worker setups
 - `projection_dlq`: dead-letter queue of failed events for operator review
 
+## Hot/Cold Daemon Migration
+
+The `sql/0002_hotcold_daemon.sql` migration introduces the `rf_daemon_nodes` coordination table used by the hot/cold async daemon mode:
+
+- Tracks node identity, cluster membership, and current role (`hot` or `cold`).
+- Stores heartbeat and lease expiration timestamps so standbys can promote themselves quickly.
+- Persists an opaque `lease_token` that rotates with each new leader to guard checkpoint writes.
+- Records the configured `min_cold_standbys` per cluster so operators can alert on insufficient standby capacity.
+- Enforces one hot node per cluster via a partial unique index.
+- Provides additional indexes for fast lease expiry checks and stable node naming within a cluster.
+
+Roll back with `sql/0002_hotcold_daemon.down.sql` to drop the table and related indexes.
+
 Ensure your application runs this migration before executing any Rillflow APIs.
+
+> **Integration note:** downstream services consuming the Rillflow crate should rerun `sql/0002_hotcold_daemon.sql` after upgrading to pick up the `min_cold_standbys` column (added in Phase 9/10). The migration is idempotent and safe to apply repeatedly.
 
 ### Indexing Guidance
 

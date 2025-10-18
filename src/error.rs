@@ -38,6 +38,8 @@ pub enum Error {
     UpcastingPoolRequired { event_type: String, version: i32 },
     #[error("upcasting cycle detected for {event_type} v{version}")]
     UpcastingCycle { event_type: String, version: i32 },
+    #[error("daemon lease lost while persisting projection checkpoint")]
+    LeaseMismatch,
     #[error("{context}: {source}")]
     Context {
         context: String,

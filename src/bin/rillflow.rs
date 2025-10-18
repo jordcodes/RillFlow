@@ -119,6 +119,230 @@ async fn export_table(
     Ok(())
 }
 
+#[derive(sqlx::FromRow)]
+struct DaemonNodeStatusRow {
+    cluster: String,
+    daemon_id: Uuid,
+    node_name: String,
+    role: String,
+    heartbeat_at: chrono::DateTime<chrono::Utc>,
+    lease_until: chrono::DateTime<chrono::Utc>,
+    lease_token: Option<Uuid>,
+    min_cold_standbys: i32,
+}
+
+struct HotColdNodeStatus {
+    daemon_id: Uuid,
+    node_name: String,
+    role: String,
+    heartbeat_age: String,
+    lease_remaining: String,
+    lease_token: String,
+    min_cold_standbys: i32,
+}
+
+struct HotColdClusterStatus {
+    cluster: String,
+    hot_nodes: u64,
+    standby_nodes: u64,
+    required_standbys: u32,
+    nodes: Vec<HotColdNodeStatus>,
+}
+
+async fn hotcold_cluster_status(
+    pool: &sqlx::PgPool,
+    schema: &str,
+    cluster: Option<&str>,
+) -> rillflow::Result<Vec<HotColdClusterStatus>> {
+    let mut conn = pool.acquire().await?;
+    let set_search_path = format!("set search_path to {}", quote_ident(schema));
+    sqlx::query(&set_search_path).execute(&mut *conn).await?;
+
+    let rows: Vec<DaemonNodeStatusRow> = if let Some(cluster) = cluster {
+        sqlx::query_as(
+            "select cluster, daemon_id, node_name, role, heartbeat_at, lease_until, lease_token, min_cold_standbys
+             from rf_daemon_nodes
+             where cluster = $1
+             order by role desc, lease_until desc, node_name",
+        )
+        .bind(cluster)
+        .fetch_all(&mut *conn)
+        .await?
+    } else {
+        sqlx::query_as(
+            "select cluster, daemon_id, node_name, role, heartbeat_at, lease_until, lease_token, min_cold_standbys
+             from rf_daemon_nodes
+             order by cluster, role desc, lease_until desc, node_name",
+        )
+        .fetch_all(&mut *conn)
+        .await?
+    };
+
+    let now = chrono::Utc::now();
+    let mut grouped: BTreeMap<String, Vec<DaemonNodeStatusRow>> = BTreeMap::new();
+    for row in rows {
+        grouped.entry(row.cluster.clone()).or_default().push(row);
+    }
+
+    let mut clusters = Vec::new();
+    for (cluster_name, nodes) in grouped {
+        let hot_nodes = nodes.iter().filter(|n| n.role == "hot").count() as u64;
+        let total_nodes = nodes.len() as u64;
+        let standby_nodes = total_nodes.saturating_sub(hot_nodes);
+        let required_standbys = nodes
+            .iter()
+            .map(|n| n.min_cold_standbys.max(0) as u32)
+            .max()
+            .unwrap_or(0);
+
+        let node_statuses = nodes
+            .into_iter()
+            .map(|row| HotColdNodeStatus {
+                daemon_id: row.daemon_id,
+                node_name: row.node_name,
+                role: row.role,
+                heartbeat_age: format_duration(now.signed_duration_since(row.heartbeat_at)),
+                lease_remaining: format_duration(row.lease_until.signed_duration_since(now)),
+                lease_token: row
+                    .lease_token
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                min_cold_standbys: row.min_cold_standbys,
+            })
+            .collect();
+
+        clusters.push(HotColdClusterStatus {
+            cluster: cluster_name,
+            hot_nodes,
+            standby_nodes,
+            required_standbys,
+            nodes: node_statuses,
+        });
+    }
+
+    Ok(clusters)
+}
+
+fn format_duration(duration: chrono::Duration) -> String {
+    let millis = duration.num_milliseconds();
+    let sign = if millis < 0 { "-" } else { "" };
+    let abs_millis = millis.abs();
+    if abs_millis >= 60_000 {
+        let minutes = abs_millis / 60_000;
+        let seconds = (abs_millis % 60_000) / 1000;
+        format!("{}{}m{}s", sign, minutes, seconds)
+    } else if abs_millis >= 1_000 {
+        let secs = abs_millis as f64 / 1_000.0;
+        format!("{}{:0.3}s", sign, secs)
+    } else {
+        format!("{}{}ms", sign, abs_millis)
+    }
+}
+
+fn promotion_channel_name(cluster: &str) -> String {
+    let mut sanitized = String::with_capacity(cluster.len());
+    for ch in cluster.chars() {
+        if ch.is_ascii_alphanumeric() {
+            sanitized.push(ch.to_ascii_lowercase());
+        } else if ch == '_' {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
+    }
+    if sanitized.is_empty() {
+        sanitized.push_str("cluster");
+    }
+    let mut channel = format!("rillflow_daemon_{}", sanitized);
+    if channel.len() > 63 {
+        channel.truncate(63);
+    }
+    channel
+}
+
+async fn promote_daemon_node(
+    pool: &sqlx::PgPool,
+    schema: &str,
+    cluster: &str,
+    daemon_id: &Uuid,
+) -> rillflow::Result<()> {
+    let mut conn = pool.acquire().await?;
+    let set_search_path = format!("set search_path to {}", quote_ident(schema));
+    sqlx::query(&set_search_path).execute(&mut *conn).await?;
+
+    let mut tx = conn.begin().await?;
+    sqlx::query(
+        "update rf_daemon_nodes set role = 'cold', lease_token = null, updated_at = now() where cluster = $1 and role = 'hot'",
+    )
+    .bind(cluster)
+    .execute(&mut *tx)
+    .await?;
+
+    let now = chrono::Utc::now();
+    let lease_until = now + chrono::Duration::seconds(30);
+    let lease_token = Uuid::new_v4();
+    let rows = sqlx::query(
+        "update rf_daemon_nodes set role = 'hot', lease_token = $3, heartbeat_at = $4, lease_until = $5, updated_at = now() where cluster = $1 and daemon_id = $2",
+    )
+    .bind(cluster)
+    .bind(daemon_id)
+    .bind(lease_token)
+    .bind(now)
+    .bind(lease_until)
+    .execute(&mut *tx)
+    .await?;
+
+    if rows.rows_affected() == 0 {
+        tx.rollback().await?;
+        anyhow::bail!("no matching node found to promote");
+    }
+
+    let channel = promotion_channel_name(cluster);
+    sqlx::query("select pg_notify($1, $2)")
+        .bind(&channel)
+        .bind(format!("promoted:{}", daemon_id))
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn demote_daemon_node(
+    pool: &sqlx::PgPool,
+    schema: &str,
+    cluster: &str,
+    daemon_id: &Uuid,
+) -> rillflow::Result<()> {
+    let mut conn = pool.acquire().await?;
+    let set_search_path = format!("set search_path to {}", quote_ident(schema));
+    sqlx::query(&set_search_path).execute(&mut *conn).await?;
+
+    let mut tx = conn.begin().await?;
+    let rows = sqlx::query(
+        "update rf_daemon_nodes set role = 'cold', lease_token = null, updated_at = now() where cluster = $1 and daemon_id = $2",
+    )
+    .bind(cluster)
+    .bind(daemon_id)
+    .execute(&mut *tx)
+    .await?;
+
+    if rows.rows_affected() == 0 {
+        tx.rollback().await?;
+        anyhow::bail!("node is not registered in cluster");
+    }
+
+    let channel = promotion_channel_name(cluster);
+    sqlx::query("select pg_notify($1, $2)")
+        .bind(&channel)
+        .bind(format!("demoted:{}", daemon_id))
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+    Ok(())
+}
+
 async fn list_upcasters(registry: Option<Arc<UpcasterRegistry>>) -> Result<()> {
     if let Some(registry) = registry {
         let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -168,8 +392,11 @@ async fn print_upcaster_path(
     }
     Ok(())
 }
-use clap::{ArgAction, Parser, Subcommand};
-use rillflow::projection_runtime::{ProjectionDaemon, ProjectionWorkerConfig};
+use chrono::Utc;
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use rillflow::projection_runtime::{
+    DaemonClusterConfig, HotColdConfig, ProjectionDaemon, ProjectionWorkerConfig,
+};
 use rillflow::subscriptions::{SubscriptionFilter, SubscriptionOptions, Subscriptions};
 use rillflow::{
     SchemaConfig, Store, TenancyMode, TenantSchema, TenantStrategy, upcasting::UpcasterRegistry,
@@ -337,11 +564,42 @@ enum ProjectionsCmd {
         #[arg(long)]
         tenant: Option<String>,
     },
+    /// Show hot/cold daemon cluster membership
+    ClusterStatus {
+        /// Optional cluster name filter
+        #[arg(long)]
+        cluster: Option<String>,
+    },
+    /// Force a cold node to promote to hot (best-effort)
+    Promote { cluster: String, node: String },
+    /// Demote the current hot node (best-effort)
+    Demote {
+        cluster: String,
+        node: Option<String>,
+    },
     /// Run long-lived projection loop
     RunLoop {
         /// Use LISTEN/NOTIFY to wake immediately on new events
         #[arg(long, default_value_t = true)]
         use_notify: bool,
+        /// Cluster coordination mode (`single` or `hotcold`)
+        #[arg(long, value_enum, default_value_t = DaemonClusterModeArg::Single)]
+        cluster_mode: DaemonClusterModeArg,
+        /// Cluster name when using hot/cold mode
+        #[arg(long)]
+        cluster_name: Option<String>,
+        /// Heartbeat interval in seconds for hot/cold mode
+        #[arg(long, default_value_t = 5)]
+        heartbeat_secs: u64,
+        /// Lease TTL in seconds for hot/cold mode
+        #[arg(long, default_value_t = 30)]
+        lease_ttl_secs: u64,
+        /// Additional grace period (seconds) before declaring the leader dead
+        #[arg(long, default_value_t = 5)]
+        lease_grace_secs: u64,
+        /// Minimum number of cold standbys to expect in the cluster
+        #[arg(long, default_value_t = 1)]
+        min_cold_standbys: u32,
         /// Optional health HTTP bind, e.g. 0.0.0.0:8080
         #[arg(long)]
         health_bind: Option<String>,
@@ -623,6 +881,12 @@ enum HealthCmd {
     },
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum DaemonClusterModeArg {
+    Single,
+    Hotcold,
+}
+
 #[tokio::main]
 async fn main() -> rillflow::Result<()> {
     // Initialize OTEL if configured
@@ -893,38 +1157,202 @@ async fn main() -> rillflow::Result<()> {
                         m.name, m.last_seq, m.head_seq, m.lag, m.dlq_count
                     );
                 }
+                ProjectionsCmd::ClusterStatus { cluster } => {
+                    let clusters = hotcold_cluster_status(
+                        store.pool(),
+                        &config.base_schema,
+                        cluster.as_deref(),
+                    )
+                    .await?;
+                    if clusters.is_empty() {
+                        let suffix = cluster
+                            .as_ref()
+                            .map(|c| format!(" for cluster '{}'", c))
+                            .unwrap_or_default();
+                        println!("no daemon nodes registered{}", suffix);
+                    } else {
+                        for cs in clusters {
+                            println!(
+                                "cluster={} hot_nodes={} standby_nodes={} required_standbys={}",
+                                cs.cluster, cs.hot_nodes, cs.standby_nodes, cs.required_standbys
+                            );
+                            for node in cs.nodes {
+                                println!(
+                                    "  node={} id={} role={} heartbeat_age={} lease_remaining={} token={} min_cold_standbys={}",
+                                    node.node_name,
+                                    node.daemon_id,
+                                    node.role,
+                                    node.heartbeat_age,
+                                    node.lease_remaining,
+                                    node.lease_token,
+                                    node.min_cold_standbys
+                                );
+                            }
+                        }
+                    }
+                }
+                ProjectionsCmd::Promote { cluster, node } => {
+                    let clusters =
+                        hotcold_cluster_status(store.pool(), &config.base_schema, Some(&cluster))
+                            .await?;
+                    let target = clusters
+                        .into_iter()
+                        .flat_map(|cs| cs.nodes.into_iter().map(move |n| (cs.cluster.clone(), n)))
+                        .find(|(_, n)| n.node_name == node)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("node '{}' not found in cluster '{}'", node, cluster)
+                        })?;
+                    promote_daemon_node(
+                        store.pool(),
+                        &config.base_schema,
+                        &target.0,
+                        &target.1.daemon_id,
+                    )
+                    .await?;
+                    println!("promotion requested for {} in cluster {}", node, target.0);
+                }
+                ProjectionsCmd::Demote { cluster, node } => {
+                    let clusters =
+                        hotcold_cluster_status(store.pool(), &config.base_schema, Some(&cluster))
+                            .await?;
+                    let target = if let Some(node_name) = node {
+                        clusters
+                            .into_iter()
+                            .flat_map(|cs| {
+                                cs.nodes.into_iter().map(move |n| (cs.cluster.clone(), n))
+                            })
+                            .find(|(_, n)| n.node_name == node_name)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "node '{}' not found in cluster '{}'",
+                                    node_name,
+                                    cluster
+                                )
+                            })?
+                    } else {
+                        clusters
+                            .into_iter()
+                            .flat_map(|cs| {
+                                cs.nodes.into_iter().map(move |n| (cs.cluster.clone(), n))
+                            })
+                            .find(|(_, n)| n.role == "hot")
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("no hot node found in cluster '{}'", cluster)
+                            })?
+                    };
+                    demote_daemon_node(
+                        store.pool(),
+                        &config.base_schema,
+                        &target.0,
+                        &target.1.daemon_id,
+                    )
+                    .await?;
+                    println!(
+                        "demotion requested for {} in cluster {}",
+                        target.1.node_name, target.0
+                    );
+                }
                 ProjectionsCmd::RunLoop {
                     use_notify,
+                    cluster_mode,
+                    cluster_name,
+                    heartbeat_secs,
+                    lease_ttl_secs,
+                    lease_grace_secs,
+                    min_cold_standbys,
                     health_bind,
                     tenant,
                     all_tenants,
                 } => {
+                    let lease_ttl =
+                        std::time::Duration::from_secs(std::cmp::max(lease_ttl_secs, 1));
+                    let cluster_config = match cluster_mode {
+                        DaemonClusterModeArg::Single => DaemonClusterConfig::Single,
+                        DaemonClusterModeArg::Hotcold => {
+                            let name = cluster_name.clone().unwrap_or_else(|| {
+                                eprintln!(
+                                    "error: --cluster-name is required when --cluster-mode=hotcold"
+                                );
+                                std::process::exit(2);
+                            });
+                            let heartbeat =
+                                std::time::Duration::from_secs(std::cmp::max(heartbeat_secs, 1));
+                            let lease_grace = std::time::Duration::from_secs(lease_grace_secs);
+                            DaemonClusterConfig::HotCold(HotColdConfig::new(
+                                name,
+                                heartbeat,
+                                lease_ttl,
+                                lease_grace,
+                                std::cmp::max(min_cold_standbys, 1),
+                            ))
+                        }
+                    };
+
+                    if let DaemonClusterConfig::HotCold(ref cfg) = cluster_config {
+                        if cfg.lease_ttl <= cfg.heartbeat_interval {
+                            eprintln!(
+                                "warning: lease-ttl-secs ({}) should be greater than heartbeat-secs ({})",
+                                lease_ttl_secs, heartbeat_secs
+                            );
+                        }
+                    }
+
+                    let helper = tenant_helper.clone();
+                    let pool = store.pool().clone();
+                    let upcasters = store.upcaster_registry();
+                    let node_name_arg = node_name.clone();
+                    let daemon_id_arg = daemon_id;
                     tenant_helper
-                        .with_selection(tenant, all_tenants, |sel| async move {
-                            for ctx in sel {
-                                let stop =
-                                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                                let stop2 = stop.clone();
-                                tokio::spawn(async move {
-                                    let _ = tokio::signal::ctrl_c().await;
-                                    stop2.store(true, std::sync::atomic::Ordering::Relaxed);
-                                });
+                        .with_selection(tenant, all_tenants, move |sel| {
+                            let helper = helper.clone();
+                            let pool = pool.clone();
+                            let upcasters = upcasters.clone();
+                            let cluster_config = cluster_config.clone();
+                            let health_bind = health_bind.clone();
+                            let node_name_arg = node_name_arg.clone();
+                            async move {
+                                for ctx in sel {
+                                    let mut config = ProjectionWorkerConfig::default();
+                                    config.cluster = cluster_config.clone();
+                                    config.lease_ttl = lease_ttl;
+                                    if let Some(name) = node_name_arg.clone() {
+                                        config.node_name = name;
+                                    }
+                                    if let Some(id) = daemon_id_arg {
+                                        config.daemon_id = Some(id);
+                                    }
+                                    let daemon = helper.projection_daemon_with_config(
+                                        pool.clone(),
+                                        upcasters.clone(),
+                                        config,
+                                    );
 
-                                if let Some(addr) = &health_bind {
-                                    let stop_health = stop.clone();
-                                    let addr = addr.clone();
+                                    let stop = std::sync::Arc::new(
+                                        std::sync::atomic::AtomicBool::new(false),
+                                    );
+                                    let stop2 = stop.clone();
                                     tokio::spawn(async move {
-                                        if let Err(err) = serve_health(addr, stop_health).await {
-                                            eprintln!("health server error: {err}");
-                                        }
+                                        let _ = tokio::signal::ctrl_c().await;
+                                        stop2.store(true, std::sync::atomic::Ordering::Relaxed);
                                     });
-                                }
 
-                                daemon
-                                    .run_loop(use_notify, stop, ctx.tenant_label.as_deref())
-                                    .await?;
+                                    if let Some(addr) = &health_bind {
+                                        let stop_health = stop.clone();
+                                        let addr = addr.clone();
+                                        tokio::spawn(async move {
+                                            if let Err(err) = serve_health(addr, stop_health).await
+                                            {
+                                                eprintln!("health server error: {err}");
+                                            }
+                                        });
+                                    }
+
+                                    daemon
+                                        .run_loop(use_notify, stop, ctx.tenant_label.as_deref())
+                                        .await?;
+                                }
+                                Ok(())
                             }
-                            Ok(())
                         })
                         .await?;
                 }
@@ -1731,15 +2159,67 @@ async fn serve_health(
         let mut _buf = [0u8; 1024];
         let n = sock.read(&_buf).await.unwrap_or(0);
         let req = std::str::from_utf8(&_buf[..n]).unwrap_or("");
-        let (status, body) = if req.starts_with("GET /metrics ") {
-            ("200 OK", rillflow::metrics::render_prometheus())
+        let (status, body, content_type) = if req.starts_with("GET /metrics ") {
+            (
+                "200 OK",
+                rillflow::metrics::render_prometheus(),
+                "text/plain",
+            )
         } else {
-            ("200 OK", "ok".to_string())
+            let clusters = rillflow::metrics::snapshot_daemon_clusters();
+            let now = chrono::Utc::now();
+            let hotcold: Vec<serde_json::Value> = clusters
+                .into_iter()
+                .map(|cluster| {
+                    let nodes: Vec<serde_json::Value> = cluster
+                        .nodes
+                        .into_iter()
+                        .map(|node| {
+                            let heartbeat_ms = now
+                                .signed_duration_since(node.last_heartbeat)
+                                .num_milliseconds();
+                            let lease_remaining_ms = node
+                                .lease_until
+                                .signed_duration_since(now)
+                                .num_milliseconds();
+                            serde_json::json!({
+                                "node": node.node,
+                                "is_hot": node.is_hot,
+                                "last_heartbeat": node.last_heartbeat,
+                                "heartbeat_age_ms": heartbeat_ms,
+                                "lease_until": node.lease_until,
+                                "lease_remaining_ms": lease_remaining_ms,
+                                "min_cold_standbys": node.min_cold_standbys,
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "cluster": cluster.cluster,
+                        "total_nodes": cluster.total_nodes,
+                        "hot_nodes": cluster.hot_nodes,
+                        "standby_nodes": cluster.standby_nodes,
+                        "required_standbys": cluster.required_standbys,
+                        "healthy": cluster.hot_nodes == 1 && cluster.standby_nodes as u32 >= cluster.required_standbys,
+                        "nodes": nodes,
+                    })
+                })
+                .collect();
+            let payload = serde_json::json!({
+                "status": "ok",
+                "hotcold": hotcold,
+            });
+            (
+                "200 OK",
+                serde_json::to_string(&payload)
+                    .unwrap_or_else(|_| "{\"status\":\"ok\"}".to_string()),
+                "application/json",
+            )
         };
         let headers = format!(
-            "HTTP/1.1 {}\r\ncontent-length: {}\r\ncontent-type: text/plain\r\n\r\n",
+            "HTTP/1.1 {}\r\ncontent-length: {}\r\ncontent-type: {}\r\n\r\n",
             status,
-            body.len()
+            body.len(),
+            content_type
         );
         let _ = sock.write_all(headers.as_bytes()).await;
         let _ = sock.write_all(body.as_bytes()).await;
@@ -1873,7 +2353,16 @@ impl TenantHelper {
         pool: PgPool,
         upcasters: Option<Arc<UpcasterRegistry>>,
     ) -> ProjectionDaemon {
-        let mut config = ProjectionWorkerConfig::default();
+        let config = ProjectionWorkerConfig::default();
+        self.projection_daemon_with_config(pool, upcasters, config)
+    }
+
+    fn projection_daemon_with_config(
+        &self,
+        pool: PgPool,
+        upcasters: Option<Arc<UpcasterRegistry>>,
+        mut config: ProjectionWorkerConfig,
+    ) -> ProjectionDaemon {
         config.tenant_strategy = self.strategy.clone();
         config.tenant_resolver = self.resolver.clone();
         let daemon = ProjectionDaemon::new(pool, config);

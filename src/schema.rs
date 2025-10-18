@@ -218,6 +218,7 @@ impl SchemaManager {
             &mut plan,
             base_schema,
             &existing_schemas,
+            true,
             tenant_column,
             &config.duplicated_fields,
         )
@@ -230,6 +231,7 @@ impl SchemaManager {
                     &mut plan,
                     schema,
                     &existing_schemas,
+                    false,
                     None,
                     &config.duplicated_fields,
                 )
@@ -266,6 +268,7 @@ impl SchemaManager {
         plan: &mut SchemaPlan,
         schema: &str,
         schema_exists: bool,
+        is_base_schema: bool,
         tenant_column: Option<&TenantColumn>,
         duplicated_fields: &[DuplicatedField],
     ) -> Result<()> {
@@ -349,6 +352,43 @@ impl SchemaManager {
             }
         }
 
+        if is_base_schema {
+            ensure_table(
+                plan,
+                schema,
+                &existing_tables,
+                "rf_daemon_nodes",
+                build_daemon_nodes_table_sql,
+            );
+            if existing_tables.contains("rf_daemon_nodes") {
+                let columns = self.existing_columns(schema, "rf_daemon_nodes").await?;
+                if !columns.contains("lease_token") {
+                    plan.push_action(
+                        format!(
+                            "add lease_token column to {}",
+                            qualified_name(schema, "rf_daemon_nodes")
+                        ),
+                        format!(
+                            "alter table {} add column if not exists lease_token uuid null",
+                            qualified_name(schema, "rf_daemon_nodes")
+                        ),
+                    );
+                }
+                if !columns.contains("min_cold_standbys") {
+                    plan.push_action(
+                        format!(
+                            "add min_cold_standbys column to {}",
+                            qualified_name(schema, "rf_daemon_nodes")
+                        ),
+                        format!(
+                            "alter table {} add column if not exists min_cold_standbys integer not null default 0",
+                            qualified_name(schema, "rf_daemon_nodes")
+                        ),
+                    );
+                }
+            }
+        }
+
         // event schema registry
         ensure_table(
             plan,
@@ -396,6 +436,30 @@ impl SchemaManager {
             ),
             build_docs_fts_triggers_sql(schema),
         );
+
+        if is_base_schema {
+            ensure_index(
+                plan,
+                schema,
+                &existing_indexes,
+                "rf_daemon_nodes_node_uq",
+                build_daemon_nodes_node_index_sql,
+            );
+            ensure_index(
+                plan,
+                schema,
+                &existing_indexes,
+                "rf_daemon_nodes_hot_role_uq",
+                build_daemon_nodes_hot_index_sql,
+            );
+            ensure_index(
+                plan,
+                schema,
+                &existing_indexes,
+                "rf_daemon_nodes_lease_idx",
+                build_daemon_nodes_lease_index_sql,
+            );
+        }
 
         // Duplicated fields function and triggers
         if !duplicated_fields.is_empty() {
@@ -538,6 +602,7 @@ impl SchemaManager {
         plan: &mut SchemaPlan,
         schema: &str,
         existing_schemas: &HashSet<String>,
+        is_base_schema: bool,
         tenant_column: Option<&TenantColumn>,
         duplicated_fields: &[DuplicatedField],
     ) -> Result<()> {
@@ -558,8 +623,15 @@ impl SchemaManager {
 
         let exists = existing_schemas.contains(schema);
         plan.mark_schema(schema);
-        self.plan_core_schema(plan, schema, exists, tenant_column, duplicated_fields)
-            .await
+        self.plan_core_schema(
+            plan,
+            schema,
+            exists,
+            is_base_schema,
+            tenant_column,
+            duplicated_fields,
+        )
+        .await
     }
 
     async fn existing_tables(&self, schema: &str) -> Result<HashSet<String>> {
@@ -1175,6 +1247,61 @@ fn build_projection_dlq_table_sql(schema: &str) -> String {
         )
         ",
         table = qualified_name(schema, "projection_dlq"),
+    )
+}
+
+fn build_daemon_nodes_table_sql(schema: &str) -> String {
+    formatdoc!(
+        "
+        create table if not exists {table} (
+            daemon_id uuid not null,
+            cluster text not null,
+            node_name text not null,
+            role text not null default 'cold',
+            heartbeat_at timestamptz not null default now(),
+            lease_until timestamptz not null,
+            lease_token uuid null,
+            min_cold_standbys integer not null default 0,
+            created_at timestamptz not null default now(),
+            updated_at timestamptz not null default now(),
+            primary key (cluster, daemon_id)
+        )
+        ",
+        table = qualified_name(schema, "rf_daemon_nodes"),
+    )
+}
+
+fn build_daemon_nodes_node_index_sql(schema: &str) -> String {
+    formatdoc!(
+        "
+        create unique index if not exists {index}
+            on {table} (cluster, node_name)
+        ",
+        index = quote_ident("rf_daemon_nodes_node_uq"),
+        table = qualified_name(schema, "rf_daemon_nodes"),
+    )
+}
+
+fn build_daemon_nodes_hot_index_sql(schema: &str) -> String {
+    formatdoc!(
+        "
+        create unique index if not exists {index}
+            on {table} (cluster)
+            where role = 'hot'
+        ",
+        index = quote_ident("rf_daemon_nodes_hot_role_uq"),
+        table = qualified_name(schema, "rf_daemon_nodes"),
+    )
+}
+
+fn build_daemon_nodes_lease_index_sql(schema: &str) -> String {
+    formatdoc!(
+        "
+        create index if not exists {index}
+            on {table} (cluster, lease_until)
+        ",
+        index = quote_ident("rf_daemon_nodes_lease_idx"),
+        table = qualified_name(schema, "rf_daemon_nodes"),
     )
 }
 

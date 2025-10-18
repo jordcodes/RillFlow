@@ -59,6 +59,31 @@ cargo run --bin rillflow -- projections run-loop --use-notify true --health-bind
 curl -s http://127.0.0.1:8080/metrics | head -50
 ```
 
+#### Hot/Cold daemon runtime
+
+Run multiple `projections run-loop` processes with `--cluster-mode hotcold` and a shared `--cluster-name` to enable high availability. Rillflow keeps one node *hot* while the rest stay *cold* and ready to promote if the leader’s heartbeat expires.
+
+- Apply `sql/0002_hotcold_daemon.sql` (and re-run after upgrades) so the `rf_daemon_nodes` table and the new `min_cold_standbys` column are present before enabling HA.
+- Tune responsiveness with `--heartbeat-secs`, `--lease-ttl-secs`, and `--lease-grace-secs`.
+- Each process publishes cluster state via:
+  1. **Prometheus** (`GET /metrics` on the `--health-bind` address):
+     - `daemon_cluster_healthy{cluster="foo"}` → `1` when exactly one hot node exists and standby coverage meets `min_cold_standbys`; alert on `0`.
+     - `daemon_cluster_standby_nodes{cluster="foo"}` / `daemon_cluster_required_standbys{cluster="foo"}` report available vs. expected cold capacity.
+     - `daemon_node_hot{cluster="foo",node="bar"}` → `1` if that node presently holds the lease.
+     - `daemon_node_heartbeat_age_seconds` / `daemon_node_lease_seconds` expose heartbeat age and remaining lease per node.
+  2. **JSON health endpoint** (`GET /` on `--health-bind`) – returns a `hotcold` section listing clusters, node IDs, heartbeat age (ms), lease expiry timestamps, and the configured `min_cold_standbys`.
+
+CLI helpers:
+
+```bash
+cargo run --bin rillflow -- projections cluster-status --database-url "$DATABASE_URL"
+cargo run --bin rillflow -- projections cluster-status --cluster my-cluster --database-url "$DATABASE_URL"
+cargo run --bin rillflow -- projections promote --cluster my-cluster --node node-b --database-url "$DATABASE_URL"
+cargo run --bin rillflow -- projections demote --cluster my-cluster --database-url "$DATABASE_URL"
+```
+
+Alerting tip: page when `daemon_cluster_healthy == 0` for production clusters (missing leader, insufficient standbys, or split brain) and warn when heartbeat age exceeds your expected failover window. A longer-form operations guide (migration, rollout, alerts) lives in `docs/hotcold_daemon_ops.md`.
+
 ### OpenTelemetry (optional)
 
 Rillflow can emit spans to an OTLP collector when built with the `otel` feature. By default, OTEL is disabled and only Prometheus metrics are exposed.
