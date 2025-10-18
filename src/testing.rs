@@ -1,9 +1,14 @@
 use sqlx::{Pool, Postgres};
+use std::path::Path;
 
 use crate::Result;
 
-pub async fn migrate_core_schema(pool: &Pool<Postgres>) -> Result<()> {
-    let ddl = std::fs::read_to_string("sql/0001_init.sql")?;
+async fn run_sql_file(pool: &Pool<Postgres>, path: &str) -> Result<()> {
+    if !Path::new(path).exists() {
+        return Ok(());
+    }
+
+    let ddl = std::fs::read_to_string(path)?;
     // Split SQL by semicolons, but ignore semicolons inside $$ ... $$ blocks
     let mut stmts: Vec<String> = Vec::new();
     let mut buf = String::new();
@@ -36,7 +41,28 @@ pub async fn migrate_core_schema(pool: &Pool<Postgres>) -> Result<()> {
     }
 
     for stmt in stmts {
-        sqlx::query(&stmt).execute(pool).await?;
+        eprintln!("executing migration stmt: {}", stmt);
+        if let Err(err) = sqlx::query(&stmt).execute(pool).await {
+            if let Some(db_err) = err.as_database_error() {
+                eprintln!("database error: {}", db_err.message());
+            } else {
+                eprintln!("error: {err:?}");
+            }
+            return Err(err.into());
+        }
+    }
+    Ok(())
+}
+
+pub async fn migrate_core_schema(pool: &Pool<Postgres>) -> Result<()> {
+    for file in [
+        "sql/0001_init.sql",
+        "sql/0002_hotcold_daemon.sql",
+        "sql/0003_event_archiving.sql",
+        "sql/0004_event_archiving_partitioning.sql",
+        "sql/0005_event_partitioning.sql",
+    ] {
+        run_sql_file(pool, file).await?;
     }
     Ok(())
 }

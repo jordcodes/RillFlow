@@ -1,7 +1,7 @@
 use crate::{
     Error, Result,
     aggregates::{AggregateRepository, AggregateSession},
-    events::{AppendOptions, Event, Events, Expected},
+    events::{AppendOptions, ArchiveBackend, ArchiveSettings, Event, Events, Expected},
     metrics,
     query::{CompiledQuery, DocumentQuery, DocumentQueryContext},
     schema,
@@ -22,6 +22,8 @@ pub struct Documents {
     tenant_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
     tenant: Option<String>,
     upcaster_registry: Option<Arc<UpcasterRegistry>>,
+    archive_backend: ArchiveBackend,
+    include_archived_by_default: bool,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -42,6 +44,8 @@ impl Documents {
         tenant_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
         tenant: Option<String>,
         upcaster_registry: Option<Arc<UpcasterRegistry>>,
+        archive_backend: ArchiveBackend,
+        include_archived_by_default: bool,
     ) -> Self {
         Self {
             pool,
@@ -49,6 +53,8 @@ impl Documents {
             tenant_resolver,
             tenant,
             upcaster_registry,
+            archive_backend,
+            include_archived_by_default,
         }
     }
 
@@ -438,6 +444,10 @@ impl Documents {
             self.tenant_strategy.clone(),
             self.tenant_resolver.clone(),
             self.tenant.clone(),
+            ArchiveSettings {
+                backend: self.archive_backend,
+                include_archived: self.include_archived_by_default,
+            },
         );
         if let Some(registry) = &self.upcaster_registry {
             events = events.with_upcasters(registry.clone());
@@ -885,6 +895,12 @@ impl DocumentSession {
         self
     }
 
+    /// Allow staged events to append to archived streams (overrides default guard).
+    pub fn allow_archived_stream_appends(&mut self, allow: bool) -> &mut Self {
+        self.context.allow_archived_stream = allow;
+        self
+    }
+
     pub fn context(&self) -> &crate::context::SessionContext {
         &self.context
     }
@@ -961,6 +977,7 @@ impl DocumentSession {
             headers: Some(Value::Object(self.context.headers.clone())),
             causation_id: self.context.causation_id,
             correlation_id: self.context.correlation_id,
+            allow_archived_stream: self.context.allow_archived_stream,
         };
         let options = Self::combine_options(&defaults, &overrides);
         self.event_ops.push(SessionEventOp {
@@ -988,6 +1005,7 @@ impl DocumentSession {
             headers: Some(Value::Object(self.context.headers.clone())),
             causation_id: self.context.causation_id,
             correlation_id: self.context.correlation_id,
+            allow_archived_stream: self.context.allow_archived_stream,
         };
         let options = Self::combine_options(&defaults, &overrides);
         self.event_ops.push(SessionEventOp {
@@ -1218,6 +1236,8 @@ impl DocumentSession {
             headers: Self::merge_headers(&defaults.headers, &overrides.headers),
             causation_id: overrides.causation_id.or(defaults.causation_id),
             correlation_id: overrides.correlation_id.or(defaults.correlation_id),
+            allow_archived_stream: overrides.allow_archived_stream
+                || defaults.allow_archived_stream,
         }
     }
 

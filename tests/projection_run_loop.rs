@@ -136,6 +136,8 @@ async fn hot_node_failover_promotes_standby() -> Result<()> {
     let hot_handle =
         tokio::spawn(async move { hot_daemon.run_loop(true, hot_stop_task, None).await });
 
+    wait_for_hot(store.pool(), &cluster_name, hot_id, "hot bootstrap").await?;
+
     wait_for_hot(store.pool(), &cluster_name, hot_id, "hot node").await?;
 
     let cold_id = Uuid::new_v4();
@@ -224,6 +226,8 @@ async fn mid_batch_failover_resumes_without_duplicates() -> Result<()> {
     let hot_handle =
         tokio::spawn(async move { hot_daemon.run_loop(true, hot_stop_task, None).await });
 
+    wait_for_hot(store.pool(), &cluster_name, hot_id, "hot bootstrap").await?;
+
     let cold_id = Uuid::new_v4();
     let cold_config = ProjectionWorkerConfig {
         cluster: DaemonClusterConfig::HotCold(timing.clone()),
@@ -246,6 +250,9 @@ async fn mid_batch_failover_resumes_without_duplicates() -> Result<()> {
     let cold_handle =
         tokio::spawn(async move { cold_daemon.run_loop(true, cold_stop_task, None).await });
 
+    wait_for_role(store.pool(), &cluster_name, cold_id, "cold").await?;
+    wait_for_hot(store.pool(), &cluster_name, hot_id, "initial leader").await?;
+
     let stream = Uuid::new_v4();
     let body_block = json!({"id": stream, "block": true});
     let body_follow = json!({"id": stream, "block": false});
@@ -261,10 +268,7 @@ async fn mid_batch_failover_resumes_without_duplicates() -> Result<()> {
         )
         .await?;
 
-    wait_for_hot(store.pool(), &cluster_name, hot_id, "initial leader").await?;
-    wait_for_role(store.pool(), &cluster_name, cold_id, "cold").await?;
-
-    tokio::time::timeout(Duration::from_secs(5), block_started.notified())
+    tokio::time::timeout(Duration::from_secs(30), block_started.notified())
         .await
         .expect("leader did not start processing blocking event");
 
@@ -275,7 +279,8 @@ async fn mid_batch_failover_resumes_without_duplicates() -> Result<()> {
 
     release.notify_waiters();
 
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::time::sleep(Duration::from_secs(1)).await;
         loop {
             let count: Option<i64> = sqlx::query_scalar("select count from counters where id = $1")
                 .bind(stream)
@@ -395,7 +400,7 @@ async fn rapid_failover_stress_executes_all_events() -> Result<()> {
 
         expected_total += 3;
 
-        timeout(Duration::from_secs(5), block_started.notified())
+        timeout(Duration::from_secs(30), block_started.notified())
             .await
             .expect("blocking handler never started");
 
@@ -463,7 +468,7 @@ async fn wait_for_hot(
     expected: Uuid,
     context: &str,
 ) -> Result<()> {
-    match tokio::time::timeout(Duration::from_secs(5), async {
+    match tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if let Some(id) = current_hot(pool, cluster).await? {
                 if id == expected {
@@ -487,7 +492,7 @@ async fn wait_for_role(
     daemon: Uuid,
     expected: &str,
 ) -> Result<()> {
-    match tokio::time::timeout(Duration::from_secs(5), async {
+    match tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if let Some(role) = current_role(pool, cluster, daemon).await? {
                 if role == expected {

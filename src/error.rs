@@ -1,4 +1,5 @@
 use thiserror::Error;
+use uuid::Uuid;
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -27,6 +28,8 @@ pub enum Error {
     ConstraintViolation { constraint: String, detail: String },
     #[error("query error: {context}")]
     QueryError { query: String, context: String },
+    #[error("stream {stream_id} is archived")]
+    StreamArchived { stream_id: Uuid },
     #[error("projection `{projection}` failed at event {event_seq}: {source}")]
     ProjectionError {
         projection: String,

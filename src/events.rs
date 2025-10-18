@@ -34,6 +34,47 @@ pub struct AppendOptions {
     pub headers: Option<Value>,
     pub causation_id: Option<Uuid>,
     pub correlation_id: Option<Uuid>,
+    pub allow_archived_stream: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArchiveBackend {
+    DualTable,
+    Partitioned,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ArchiveSettings {
+    pub backend: ArchiveBackend,
+    pub include_archived: bool,
+}
+
+impl Default for ArchiveSettings {
+    fn default() -> Self {
+        Self {
+            backend: ArchiveBackend::DualTable,
+            include_archived: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StreamState {
+    archived_at: Option<chrono::DateTime<chrono::Utc>>,
+    retention_class: String,
+}
+
+impl StreamState {
+    fn hot() -> Self {
+        Self {
+            archived_at: None,
+            retention_class: "hot".to_string(),
+        }
+    }
+
+    fn is_archived(&self) -> bool {
+        self.archived_at.is_some() || self.retention_class.eq_ignore_ascii_case("cold")
+    }
 }
 
 #[derive(Clone)]
@@ -45,6 +86,8 @@ pub struct Events {
     pub(crate) tenant_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
     pub(crate) tenant: Option<String>,
     pub(crate) upcaster_registry: Option<Arc<UpcasterRegistry>>,
+    archive_backend: ArchiveBackend,
+    include_archived: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -64,11 +107,16 @@ pub struct EventEnvelope {
 }
 
 impl Events {
+    fn using_partitioned_backend(&self) -> bool {
+        matches!(self.archive_backend, ArchiveBackend::Partitioned)
+    }
+
     pub(crate) fn new(
         pool: PgPool,
         tenant_strategy: TenantStrategy,
         tenant_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
         tenant: Option<String>,
+        archive_settings: ArchiveSettings,
     ) -> Self {
         Self {
             pool,
@@ -78,6 +126,8 @@ impl Events {
             tenant_resolver,
             tenant,
             upcaster_registry: None,
+            archive_backend: archive_settings.backend,
+            include_archived: archive_settings.include_archived,
         }
     }
 
@@ -89,6 +139,28 @@ impl Events {
     pub fn with_upcasters(mut self, registry: Arc<UpcasterRegistry>) -> Self {
         self.upcaster_registry = Some(registry);
         self
+    }
+
+    pub fn archive_backend(&self) -> ArchiveBackend {
+        self.archive_backend
+    }
+
+    pub fn include_archived(mut self, include: bool) -> Self {
+        self.include_archived = include;
+        self
+    }
+
+    pub fn with_archived(self) -> Self {
+        self.include_archived(true)
+    }
+
+    pub fn hot_only(mut self) -> Self {
+        self.include_archived = false;
+        self
+    }
+
+    pub fn set_include_archived(&mut self, include: bool) {
+        self.include_archived = include;
     }
 
     pub(crate) fn set_upcasters(&mut self, registry: Option<Arc<UpcasterRegistry>>) {
@@ -153,6 +225,382 @@ impl Events {
         }
     }
 
+    pub async fn fetch_after_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        last_seq: i64,
+        limit: i64,
+    ) -> Result<Vec<EventEnvelope>> {
+        let tenant_value = self.resolve_conjoined_tenant()?;
+        let tenant_ref = tenant_value.as_ref();
+
+        let rows: Vec<(
+            i64,
+            Uuid,
+            i32,
+            String,
+            Value,
+            Value,
+            Option<Uuid>,
+            Option<Uuid>,
+            i32,
+            Option<String>,
+            Option<String>,
+            chrono::DateTime<chrono::Utc>,
+        )> = if self.using_partitioned_backend() {
+            let mut qb = QueryBuilder::<Postgres>::new(
+                "select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, ",
+            );
+            if let Some(column) = self.tenant_column() {
+                qb.push(format!("{} as tenant_id, ", schema::quote_ident(column)));
+            } else {
+                qb.push("null::text as tenant_id, ");
+            }
+            qb.push("user_id, created_at from events where ");
+            self.push_tenant_filter(&mut qb, tenant_ref);
+            if !self.include_archived {
+                qb.push("retention_class = 'hot' and ");
+            }
+            qb.push("global_seq > ");
+            qb.push_bind(last_seq);
+            qb.push(" order by global_seq asc limit ");
+            qb.push_bind(limit);
+            qb.build_query_as().fetch_all(&mut **tx).await?
+        } else if self.include_archived {
+            let mut qb = QueryBuilder::<Postgres>::new(
+                "with combined as (select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, ",
+            );
+            if let Some(column) = self.tenant_column() {
+                qb.push(format!("{} as tenant_id, ", schema::quote_ident(column)));
+            } else {
+                qb.push("null::text as tenant_id, ");
+            }
+            qb.push("user_id, created_at from events where ");
+            self.push_tenant_filter(&mut qb, tenant_ref);
+            qb.push("global_seq > ");
+            qb.push_bind(last_seq);
+            qb.push(
+                " union all select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, ",
+            );
+            if let Some(column) = self.tenant_column() {
+                qb.push(format!("{} as tenant_id, ", schema::quote_ident(column)));
+            } else {
+                qb.push("null::text as tenant_id, ");
+            }
+            qb.push("user_id, created_at from events_archive where ");
+            self.push_tenant_filter(&mut qb, tenant_ref);
+            qb.push("global_seq > ");
+            qb.push_bind(last_seq);
+            qb.push(
+                ") select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, tenant_id, user_id, created_at from combined order by global_seq asc limit ",
+            );
+            qb.push_bind(limit);
+            qb.build_query_as().fetch_all(&mut **tx).await?
+        } else {
+            let mut qb = QueryBuilder::<Postgres>::new(
+                "select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, ",
+            );
+            if let Some(column) = self.tenant_column() {
+                qb.push(format!("{} as tenant_id, ", schema::quote_ident(column)));
+            } else {
+                qb.push("null::text as tenant_id, ");
+            }
+            qb.push("user_id, created_at from events where ");
+            self.push_tenant_filter(&mut qb, tenant_ref);
+            qb.push("global_seq > ");
+            qb.push_bind(last_seq);
+            qb.push(" order by global_seq asc limit ");
+            qb.push_bind(limit);
+            qb.build_query_as().fetch_all(&mut **tx).await?
+        };
+
+        let mut envelopes: Vec<EventEnvelope> = rows
+            .into_iter()
+            .map(
+                |(
+                    global_seq,
+                    stream_id,
+                    stream_seq,
+                    typ,
+                    body,
+                    headers,
+                    causation_id,
+                    correlation_id,
+                    event_version,
+                    tenant_id,
+                    user_id,
+                    created_at,
+                )| EventEnvelope {
+                    global_seq,
+                    stream_id,
+                    stream_seq,
+                    typ,
+                    body,
+                    headers,
+                    causation_id,
+                    correlation_id,
+                    event_version,
+                    tenant_id,
+                    user_id,
+                    created_at,
+                },
+            )
+            .collect();
+
+        if let Some(registry) = &self.upcaster_registry {
+            for envelope in &mut envelopes {
+                registry
+                    .upcast_with_pool(envelope, Some(&self.pool))
+                    .await?;
+            }
+        } else {
+            for envelope in &mut envelopes {
+                Self::apply_legacy_upcasters(envelope);
+            }
+        }
+
+        if let Some(value) = tenant_value {
+            for envelope in &mut envelopes {
+                if envelope.tenant_id.is_none() {
+                    envelope.tenant_id = Some(value.clone());
+                }
+            }
+        }
+
+        Ok(envelopes)
+    }
+
+    pub async fn head_sequence_tx(&self, tx: &mut Transaction<'_, Postgres>) -> Result<i64> {
+        let tenant_value = self.resolve_conjoined_tenant()?;
+        let tenant_ref = tenant_value.as_ref();
+
+        let head: i64 = if self.using_partitioned_backend() {
+            let mut qb =
+                QueryBuilder::<Postgres>::new("select coalesce(max(global_seq), 0) from events");
+            if tenant_ref.is_some() || !self.include_archived {
+                qb.push(" where ");
+                self.push_tenant_filter(&mut qb, tenant_ref);
+                if !self.include_archived {
+                    qb.push("retention_class = 'hot' and ");
+                }
+                qb.push("true");
+            }
+            qb.build_query_scalar::<i64>().fetch_one(&mut **tx).await?
+        } else if self.include_archived && matches!(self.archive_backend, ArchiveBackend::DualTable)
+        {
+            let mut qb = QueryBuilder::<Postgres>::new(
+                "select coalesce(max(global_seq), 0) from (select global_seq from events where ",
+            );
+            self.push_tenant_filter(&mut qb, tenant_ref);
+            qb.push("true union all select global_seq from events_archive where ");
+            self.push_tenant_filter(&mut qb, tenant_ref);
+            qb.push("true) as combined");
+            qb.build_query_scalar::<i64>().fetch_one(&mut **tx).await?
+        } else {
+            let mut qb =
+                QueryBuilder::<Postgres>::new("select coalesce(max(global_seq), 0) from events");
+            if tenant_ref.is_some() {
+                qb.push(" where ");
+                self.push_tenant_filter(&mut qb, tenant_ref);
+                qb.push("true");
+            }
+            qb.build_query_scalar::<i64>().fetch_one(&mut **tx).await?
+        };
+
+        Ok(head)
+    }
+
+    pub async fn head_sequence(&self) -> Result<i64> {
+        let mut tx = self.pool.begin().await?;
+        let head = self.head_sequence_tx(&mut tx).await?;
+        tx.commit().await?;
+        Ok(head)
+    }
+
+    pub async fn load_stream_envelopes(
+        &self,
+        stream_id: Uuid,
+        after: Option<i64>,
+        limit: Option<i64>,
+        ascending: bool,
+    ) -> Result<Vec<EventEnvelope>> {
+        let tenant_value = self.resolve_conjoined_tenant()?;
+        let tenant_ref = tenant_value.as_ref();
+
+        let mut envelopes: Vec<EventEnvelope> = if self.using_partitioned_backend() {
+            let mut qb = QueryBuilder::<Postgres>::new(
+                "select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, ",
+            );
+            if let Some(column) = self.tenant_column() {
+                qb.push(format!("{} as tenant_id, ", schema::quote_ident(column)));
+            } else {
+                qb.push("null::text as tenant_id, ");
+            }
+            qb.push("user_id, created_at from events where ");
+            self.push_tenant_filter(&mut qb, tenant_ref);
+            qb.push("stream_id = ");
+            qb.push_bind(stream_id);
+            if let Some(seq) = after {
+                qb.push(" and global_seq > ");
+                qb.push_bind(seq);
+            }
+            if !self.include_archived {
+                qb.push(" and retention_class = 'hot'");
+            }
+            qb.push(" order by stream_seq ");
+            qb.push(if ascending { "asc" } else { "desc" });
+            if let Some(limit) = limit {
+                qb.push(" limit ");
+                qb.push_bind(limit);
+            }
+
+            qb.build_query_as().fetch_all(&self.pool).await?
+        } else {
+            #[allow(clippy::type_complexity)]
+            let mut qb = QueryBuilder::<Postgres>::new("with combined as (");
+            qb.push(
+                "select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, ",
+            );
+            if let Some(column) = self.tenant_column() {
+                qb.push(format!("{} as tenant_id, ", schema::quote_ident(column)));
+            } else {
+                qb.push("null::text as tenant_id, ");
+            }
+            qb.push("user_id, created_at from events where ");
+            self.push_tenant_filter(&mut qb, tenant_ref);
+            qb.push("stream_id = ");
+            qb.push_bind(stream_id);
+            if let Some(seq) = after {
+                qb.push(" and global_seq > ");
+                qb.push_bind(seq);
+            }
+            if self.include_archived
+                && matches!(self.archive_backend, ArchiveBackend::DualTable)
+            {
+                qb.push(
+                    " union all select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, ",
+                );
+                if let Some(column) = self.tenant_column() {
+                    qb.push(format!("{} as tenant_id, ", schema::quote_ident(column)));
+                } else {
+                    qb.push("null::text as tenant_id, ");
+                }
+                qb.push("user_id, created_at from events_archive where ");
+                self.push_tenant_filter(&mut qb, tenant_ref);
+                qb.push("stream_id = ");
+                qb.push_bind(stream_id);
+                if let Some(seq) = after {
+                    qb.push(" and global_seq > ");
+                    qb.push_bind(seq);
+                }
+            }
+            qb.push(") select * from combined order by stream_seq ");
+            qb.push(if ascending { "asc" } else { "desc" });
+            if let Some(limit) = limit {
+                qb.push(" limit ");
+                qb.push_bind(limit);
+            }
+
+            qb.build_query_as().fetch_all(&self.pool).await?
+        }
+            .into_iter()
+            .map(
+                |(
+                    global_seq,
+                    stream_id,
+                    stream_seq,
+                    typ,
+                    body,
+                    headers,
+                    causation_id,
+                    correlation_id,
+                    event_version,
+                    tenant_id,
+                    user_id,
+                    created_at,
+                )| EventEnvelope {
+                    global_seq,
+                    stream_id,
+                    stream_seq,
+                    typ,
+                    body,
+                    headers,
+                    causation_id,
+                    correlation_id,
+                    event_version,
+                    tenant_id,
+                    user_id,
+                    created_at,
+                },
+            )
+            .collect();
+
+        if let Some(value) = tenant_value {
+            for envelope in &mut envelopes {
+                if envelope.tenant_id.is_none() {
+                    envelope.tenant_id = Some(value.clone());
+                }
+            }
+        }
+
+        Ok(envelopes)
+    }
+
+    async fn ensure_stream_state(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        stream_id: Uuid,
+        tenant: Option<&String>,
+        allow_archived: bool,
+    ) -> Result<StreamState> {
+        let row = sqlx::query_as::<
+            _,
+            (
+                Option<chrono::DateTime<chrono::Utc>>,
+                String,
+                Option<String>,
+            ),
+        >(
+            "select archived_at, retention_class, tenant_id from rf_streams where stream_id = $1",
+        )
+        .bind(stream_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+
+        if let Some((archived_at, retention_class, tenant_id)) = row {
+            if tenant_id.is_none() {
+                if let Some(t) = tenant {
+                    sqlx::query(
+                        "update rf_streams set tenant_id = $2, updated_at = now() where stream_id = $1 and tenant_id is null",
+                    )
+                    .bind(stream_id)
+                    .bind(t)
+                    .execute(&mut **tx)
+                    .await?;
+                }
+            }
+
+            let state = StreamState {
+                archived_at,
+                retention_class,
+            };
+            if state.is_archived() && !allow_archived {
+                return Err(Error::StreamArchived { stream_id });
+            }
+            return Ok(state);
+        }
+
+        sqlx::query(
+            "insert into rf_streams (stream_id, tenant_id) values ($1, $2) on conflict (stream_id) do nothing",
+        )
+        .bind(stream_id)
+        .bind(tenant.map(|t| t.as_str()))
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(StreamState::hot())
+    }
+
     pub(crate) fn apply_legacy_upcasters(envelope: &mut EventEnvelope) {
         loop {
             let maybe = {
@@ -200,100 +648,34 @@ impl Events {
             headers: Some(headers.clone()),
             causation_id,
             correlation_id,
+            ..AppendOptions::default()
         };
         self.append_with(stream_id, expected, events, &opts).await
     }
 
     pub async fn read_stream(&self, stream_id: Uuid) -> Result<Vec<(i32, Event)>> {
-        let tenant_value = self.resolve_conjoined_tenant()?;
-        let mut qb =
-            QueryBuilder::<Postgres>::new("select stream_seq, event_type, body from events where ");
-        self.push_tenant_filter(&mut qb, tenant_value.as_ref());
-        qb.push("stream_id = ");
-        qb.push_bind(stream_id);
-        qb.push(" order by stream_seq asc");
-        let rows: Vec<(i32, String, Value)> = qb.build_query_as().fetch_all(&self.pool).await?;
+        let envelopes = self
+            .load_stream_envelopes(stream_id, None, None, true)
+            .await?;
 
-        Ok(rows
+        Ok(envelopes
             .into_iter()
-            .map(|(seq, typ, body)| (seq, Event { typ, body }))
+            .map(|env| {
+                (
+                    env.stream_seq,
+                    Event {
+                        typ: env.typ,
+                        body: env.body,
+                    },
+                )
+            })
             .collect())
     }
 
     pub async fn read_stream_envelopes(&self, stream_id: Uuid) -> Result<Vec<EventEnvelope>> {
-        let tenant_value = self.resolve_conjoined_tenant()?;
-        let tenant_ref = tenant_value.as_ref();
-        #[allow(clippy::type_complexity)]
-        let mut qb = QueryBuilder::<Postgres>::new("with combined as (");
-        qb.push("select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, ");
-        if let Some(column) = self.tenant_column() {
-            qb.push(format!("{} as tenant_id, ", schema::quote_ident(column)));
-        } else {
-            qb.push("null::text as tenant_id, ");
-        }
-        qb.push("user_id, created_at from events where ");
-        self.push_tenant_filter(&mut qb, tenant_ref);
-        qb.push("stream_id = ");
-        qb.push_bind(stream_id);
-        qb.push(" union all select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, ");
-        if let Some(column) = self.tenant_column() {
-            qb.push(format!("{} as tenant_id, ", schema::quote_ident(column)));
-        } else {
-            qb.push("null::text as tenant_id, ");
-        }
-        qb.push("user_id, created_at from events_archive where ");
-        self.push_tenant_filter(&mut qb, tenant_ref);
-        qb.push("stream_id = ");
-        qb.push_bind(stream_id);
-        qb.push(") select * from combined order by stream_seq asc");
-        #[allow(clippy::type_complexity)]
-        let rows: Vec<(
-            i64,
-            Uuid,
-            i32,
-            String,
-            Value,
-            Value,
-            Option<Uuid>,
-            Option<Uuid>,
-            i32,
-            Option<String>,
-            Option<String>,
-            chrono::DateTime<chrono::Utc>,
-        )> = qb.build_query_as().fetch_all(&self.pool).await?;
-
-        let mut envelopes: Vec<EventEnvelope> = rows
-            .into_iter()
-            .map(
-                |(
-                    global_seq,
-                    stream_id,
-                    stream_seq,
-                    typ,
-                    body,
-                    headers,
-                    causation_id,
-                    correlation_id,
-                    event_version,
-                    tenant_id,
-                    user_id,
-                    created_at,
-                )| EventEnvelope {
-                    global_seq,
-                    stream_id,
-                    stream_seq,
-                    typ,
-                    body,
-                    headers,
-                    causation_id,
-                    correlation_id,
-                    event_version,
-                    tenant_id,
-                    user_id,
-                    created_at,
-                },
-            )
-            .collect();
+        let mut envelopes = self
+            .load_stream_envelopes(stream_id, None, None, true)
+            .await?;
 
         if let Some(registry) = &self.upcaster_registry {
             for envelope in &mut envelopes {
@@ -368,6 +750,10 @@ impl Events {
             return Err(Error::TenantRequired);
         }
 
+        let stream_state = self
+            .ensure_stream_state(tx, stream_id, tenant, opts.allow_archived_stream)
+            .await?;
+
         let mut seq_query =
             QueryBuilder::<Postgres>::new("select max(stream_seq) from events where ");
         self.push_tenant_filter(&mut seq_query, tenant);
@@ -391,6 +777,13 @@ impl Events {
             .headers
             .clone()
             .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+        let use_partitioned = self.using_partitioned_backend();
+        let retention_class = if use_partitioned && stream_state.is_archived() {
+            "cold"
+        } else {
+            "hot"
+        };
+
         for event in events {
             // JSON Schema validation if a schema exists
             if let Some((schema_value, ver)) = sqlx::query_as::<_, (Value, i32)>(
@@ -418,13 +811,23 @@ impl Events {
             let mut insert = QueryBuilder::<Postgres>::new("insert into events (");
             if let (Some(column), Some(value)) = (self.tenant_column(), tenant) {
                 insert.push(format!("{}, ", schema::quote_ident(column)));
+                if use_partitioned {
+                    insert.push("retention_class, ");
+                }
                 insert.push("stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, user_id) values (");
                 insert.push_bind(value);
                 insert.push(", ");
             } else {
+                if use_partitioned {
+                    insert.push("retention_class, ");
+                }
                 insert.push(
                     "stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, user_id) values (",
                 );
+            }
+            if use_partitioned {
+                insert.push_bind(retention_class);
+                insert.push(", ");
             }
             insert.push_bind(stream_id);
             insert.push(", ");
@@ -503,34 +906,46 @@ impl Events {
         let tenant_value = self.resolve_conjoined_tenant()?;
         let tenant_ref = tenant_value.as_ref();
         let mut tx = self.pool.begin().await?;
-        // Move rows to archive
-        let mut insert = QueryBuilder::<Postgres>::new("insert into events_archive (");
-        if let (Some(column), Some(value)) = (self.tenant_column(), tenant_ref) {
-            insert.push(format!("{}, ", schema::quote_ident(column)));
-            insert.push("global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, user_id, created_at) select ");
-            insert.push_bind(value);
-            insert.push(", global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, user_id, created_at from events where ");
+        let moved = if self.using_partitioned_backend() {
+            let mut update =
+                QueryBuilder::<Postgres>::new("update events set retention_class = 'cold' where ");
+            self.push_tenant_filter(&mut update, tenant_ref);
+            update.push("stream_id = ");
+            update.push_bind(stream_id);
+            update.push(" and created_at < ");
+            update.push_bind(before);
+            update.push(" and retention_class <> 'cold'");
+            update.build().execute(&mut *tx).await?.rows_affected()
         } else {
-            insert.push(
-                "global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, user_id, created_at) select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, user_id, created_at from events where ",
-            );
-        }
-        self.push_tenant_filter(&mut insert, tenant_ref);
-        insert.push("stream_id = ");
-        insert.push_bind(stream_id);
-        insert.push(" and created_at < ");
-        insert.push_bind(before);
-        insert.push(" on conflict (global_seq) do nothing");
-        let moved = insert.build().execute(&mut *tx).await?.rows_affected();
+            // Move rows to archive table
+            let mut insert = QueryBuilder::<Postgres>::new("insert into events_archive (");
+            if let (Some(column), Some(value)) = (self.tenant_column(), tenant_ref) {
+                insert.push(format!("{}, ", schema::quote_ident(column)));
+                insert.push("global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, user_id, created_at) select ");
+                insert.push_bind(value);
+                insert.push(", global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, user_id, created_at from events where ");
+            } else {
+                insert.push(
+                    "global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, user_id, created_at) select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, user_id, created_at from events where ",
+                );
+            }
+            self.push_tenant_filter(&mut insert, tenant_ref);
+            insert.push("stream_id = ");
+            insert.push_bind(stream_id);
+            insert.push(" and created_at < ");
+            insert.push_bind(before);
+            insert.push(" on conflict (global_seq) do nothing");
+            let moved = insert.build().execute(&mut *tx).await?.rows_affected();
 
-        // Delete moved rows from live
-        let mut delete = QueryBuilder::<Postgres>::new("delete from events where ");
-        self.push_tenant_filter(&mut delete, tenant_ref);
-        delete.push("stream_id = ");
-        delete.push_bind(stream_id);
-        delete.push(" and created_at < ");
-        delete.push_bind(before);
-        delete.build().execute(&mut *tx).await?;
+            let mut delete = QueryBuilder::<Postgres>::new("delete from events where ");
+            self.push_tenant_filter(&mut delete, tenant_ref);
+            delete.push("stream_id = ");
+            delete.push_bind(stream_id);
+            delete.push(" and created_at < ");
+            delete.push_bind(before);
+            delete.build().execute(&mut *tx).await?;
+            moved
+        };
 
         tx.commit().await?;
         Ok(moved)
@@ -543,6 +958,9 @@ impl Events {
         if self.tenant_column().is_some() && tenant_ref.is_none() {
             return Err(Error::TenantRequired);
         }
+        let stream_state = self
+            .ensure_stream_state(&mut tx, stream_id, tenant_ref, false)
+            .await?;
         let mut qb = QueryBuilder::<Postgres>::new("select max(stream_seq) from events where ");
         self.push_tenant_filter(&mut qb, tenant_ref);
         qb.push("stream_id = ");
@@ -553,16 +971,33 @@ impl Events {
             .await?
             .unwrap_or(0);
         let next = current + 1;
+        let use_partitioned = self.using_partitioned_backend();
+        let retention_class = if use_partitioned && stream_state.is_archived() {
+            "cold"
+        } else {
+            "hot"
+        };
+
         let mut insert = QueryBuilder::<Postgres>::new("insert into events (");
         if let (Some(column), Some(value)) = (self.tenant_column(), tenant_ref) {
             insert.push(format!("{}, ", schema::quote_ident(column)));
+            if use_partitioned {
+                insert.push("retention_class, ");
+            }
             insert.push("stream_id, stream_seq, event_type, body, headers, is_tombstone, event_version, user_id) values (");
             insert.push_bind(value);
             insert.push(", ");
         } else {
+            if use_partitioned {
+                insert.push("retention_class, ");
+            }
             insert.push(
                 "stream_id, stream_seq, event_type, body, headers, is_tombstone, event_version, user_id) values (",
             );
+        }
+        if use_partitioned {
+            insert.push_bind(retention_class);
+            insert.push(", ");
         }
         insert.push_bind(stream_id);
         insert.push(", ");
@@ -644,6 +1079,11 @@ impl AppendBuilder {
 
     pub fn correlation_id(mut self, id: Uuid) -> Self {
         self.opts.correlation_id = Some(id);
+        self
+    }
+
+    pub fn allow_archived_stream(mut self, allow: bool) -> Self {
+        self.opts.allow_archived_stream = allow;
         self
     }
 

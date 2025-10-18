@@ -23,8 +23,7 @@ pub use aggregates::{Aggregate, AggregateRepository, AggregateSession};
 pub use context::{SessionContext, SessionContextBuilder};
 pub use documents::DocumentSession;
 pub use error::{Error, Result};
-pub use events::EventEnvelope;
-pub use events::{Event, Expected};
+pub use events::{AppendOptions, ArchiveBackend, Event, EventEnvelope, Expected};
 pub use schema::{
     SchemaConfig, SchemaManager, SchemaPlan, TenancyMode, TenantColumn, TenantColumnType,
     TenantSchema,
@@ -38,7 +37,7 @@ pub use upcasting::{
 pub use upcasting_derive::Upcaster;
 
 pub mod prelude {
-    pub use crate::events::AppendOptions;
+    pub use crate::events::{AppendOptions, ArchiveBackend};
     pub use crate::store::SessionBuilder;
     pub use crate::{
         Event, Expected, Result, Store,

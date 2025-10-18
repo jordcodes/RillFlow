@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use crate::{
-    Aggregate, AggregateRepository, Result, schema,
+    Aggregate, AggregateRepository, Result,
+    events::ArchiveBackend,
+    schema,
     store::{TenantStrategy, tenant_schema_name},
 };
 use serde_json::Value;
@@ -16,6 +18,8 @@ pub struct SnapshotterConfig {
     pub schema: Option<String>,
     pub tenant_strategy: TenantStrategy,
     pub tenant_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
+    pub archive_backend: ArchiveBackend,
+    pub include_archived: bool,
 }
 
 impl Default for SnapshotterConfig {
@@ -26,6 +30,8 @@ impl Default for SnapshotterConfig {
             schema: None,
             tenant_strategy: TenantStrategy::Single,
             tenant_resolver: None,
+            archive_backend: ArchiveBackend::DualTable,
+            include_archived: false,
         }
     }
 }
@@ -108,13 +114,16 @@ impl<F: SnapshotFolder> Snapshotter<F> {
         }
     }
 
-    fn push_tenant_filter<'a>(
+    fn push_tenant_filter_with_alias<'a>(
         &self,
         qb: &mut QueryBuilder<'a, Postgres>,
+        alias: &str,
         tenant: Option<&'a String>,
     ) {
         if let (Some(column), Some(value)) = (self.tenant_column(), tenant) {
-            qb.push(format!("{} = ", schema::quote_ident(column)));
+            qb.push(alias);
+            qb.push(schema::quote_ident(column));
+            qb.push(" = ");
             qb.push_bind(value);
             qb.push(" and ");
         }
@@ -138,6 +147,15 @@ impl<F: SnapshotFolder> Snapshotter<F> {
         }
     }
 
+    fn include_cold(&self) -> bool {
+        if matches!(self.config.archive_backend, ArchiveBackend::Partitioned) {
+            self.config.include_archived
+        } else {
+            self.config.include_archived
+                && matches!(self.config.archive_backend, ArchiveBackend::DualTable)
+        }
+    }
+
     /// Find streams exceeding the snapshot threshold and write snapshots for a batch.
     #[instrument(skip_all, fields(schema = %self.schema_label(), threshold = self.config.threshold_events, batch = self.config.batch_size))]
     pub async fn tick_once(&self) -> Result<u32> {
@@ -150,18 +168,33 @@ impl<F: SnapshotFolder> Snapshotter<F> {
         // Build query with optional tenant filter for conjoined mode
         let tenant_value = self.resolve_conjoined_tenant()?;
         let tenant_ref = tenant_value.as_ref();
+        let include_cold = self.include_cold();
+        let use_partitioned = matches!(self.config.archive_backend, ArchiveBackend::Partitioned);
+
         let mut qb = QueryBuilder::<Postgres>::new(
-            "select e.stream_id, max(e.stream_seq) as head, coalesce(s.version, 0) as snap from events e left join snapshots s on s.stream_id = e.stream_id where ",
+            "with combined as (select stream_id, stream_seq from events e where ",
         );
-        // Add tenant filter with table prefix to avoid ambiguity
-        if let (Some(column), Some(value)) = (self.tenant_column(), tenant_ref) {
-            qb.push(format!("e.{} = ", schema::quote_ident(column)));
-            qb.push_bind(value);
-            qb.push(" and ");
+        self.push_tenant_filter_with_alias(&mut qb, "e.", tenant_ref);
+        qb.push("1=1");
+        if use_partitioned {
+            if !include_cold {
+                qb.push(" and e.retention_class = 'hot'");
+            }
+        } else if include_cold {
+            qb.push(" union all select stream_id, stream_seq from events_archive ea where ");
+            self.push_tenant_filter_with_alias(&mut qb, "ea.", tenant_ref);
+            qb.push("1=1");
         }
-        qb.push("1=1 group by e.stream_id, s.version having max(e.stream_seq) - coalesce(s.version, 0) >= ");
+        qb.push(") select c.stream_id, max(c.stream_seq) as head, coalesce(s.version, 0) as snap from combined c left join snapshots s on s.stream_id = c.stream_id");
+        if let (Some(column), Some(value)) = (self.tenant_column(), tenant_ref) {
+            qb.push(" and s.");
+            qb.push(schema::quote_ident(column));
+            qb.push(" = ");
+            qb.push_bind(value);
+        }
+        qb.push(" group by c.stream_id, s.version having max(c.stream_seq) - coalesce(s.version, 0) >= ");
         qb.push_bind(self.config.threshold_events);
-        qb.push(" limit ");
+        qb.push(" order by head desc limit ");
         qb.push_bind(self.config.batch_size);
 
         let rows: Vec<(Uuid, i32, i32)> = qb.build_query_as().fetch_all(&mut *tx).await?;
@@ -232,18 +265,33 @@ impl<F: SnapshotFolder> Snapshotter<F> {
         let tenant_ref = tenant_value.as_ref();
 
         // Build candidates query with tenant filter
+        let include_cold = self.include_cold();
+        let use_partitioned = matches!(self.config.archive_backend, ArchiveBackend::Partitioned);
         let mut qb_candidates = QueryBuilder::<Postgres>::new(
-            "select count(1) from (select e.stream_id from events e left join snapshots s on s.stream_id = e.stream_id where ",
+            "with combined as (select stream_id, stream_seq from events e where ",
         );
-        // Add tenant filter with table prefix to avoid ambiguity
-        if let (Some(column), Some(value)) = (self.tenant_column(), tenant_ref) {
-            qb_candidates.push(format!("e.{} = ", schema::quote_ident(column)));
-            qb_candidates.push_bind(value);
-            qb_candidates.push(" and ");
+        self.push_tenant_filter_with_alias(&mut qb_candidates, "e.", tenant_ref);
+        qb_candidates.push("1=1");
+        if use_partitioned {
+            if !include_cold {
+                qb_candidates.push(" and e.retention_class = 'hot'");
+            }
+        } else if include_cold {
+            qb_candidates
+                .push(" union all select stream_id, stream_seq from events_archive ea where ");
+            self.push_tenant_filter_with_alias(&mut qb_candidates, "ea.", tenant_ref);
+            qb_candidates.push("1=1");
         }
-        qb_candidates.push("1=1 group by e.stream_id, s.version having max(e.stream_seq) - coalesce(s.version, 0) >= ");
+        qb_candidates.push(") select count(1) from (select c.stream_id from combined c left join snapshots s on s.stream_id = c.stream_id");
+        if let (Some(column), Some(value)) = (self.tenant_column(), tenant_ref) {
+            qb_candidates.push(" and s.");
+            qb_candidates.push(schema::quote_ident(column));
+            qb_candidates.push(" = ");
+            qb_candidates.push_bind(value);
+        }
+        qb_candidates.push(" group by c.stream_id, s.version having max(c.stream_seq) - coalesce(s.version, 0) >= ");
         qb_candidates.push_bind(self.config.threshold_events);
-        qb_candidates.push(") t");
+        qb_candidates.push(") as candidates");
 
         let candidates: i64 = qb_candidates
             .build_query_scalar()
@@ -252,11 +300,28 @@ impl<F: SnapshotFolder> Snapshotter<F> {
 
         // Build max gap query with tenant filter
         let mut qb_gap = QueryBuilder::<Postgres>::new(
-            "select max(max_seq - coalesce(s.version, 0)) as gap from (select e.stream_id, max(e.stream_seq) as max_seq from events e where ",
+            "with combined as (select stream_id, stream_seq from events e where ",
         );
-        self.push_tenant_filter(&mut qb_gap, tenant_ref);
-        qb_gap
-            .push("1=1 group by e.stream_id) h left join snapshots s on s.stream_id = h.stream_id");
+        self.push_tenant_filter_with_alias(&mut qb_gap, "e.", tenant_ref);
+        qb_gap.push("1=1");
+        if use_partitioned {
+            if !include_cold {
+                qb_gap.push(" and e.retention_class = 'hot'");
+            }
+        } else if include_cold {
+            qb_gap.push(" union all select stream_id, stream_seq from events_archive ea where ");
+            self.push_tenant_filter_with_alias(&mut qb_gap, "ea.", tenant_ref);
+            qb_gap.push("1=1");
+        }
+        qb_gap.push(
+            ") select max(h.max_seq - coalesce(s.version, 0)) as gap from (select c.stream_id, max(c.stream_seq) as max_seq from combined c group by c.stream_id) h left join snapshots s on s.stream_id = h.stream_id",
+        );
+        if let (Some(column), Some(value)) = (self.tenant_column(), tenant_ref) {
+            qb_gap.push(" and s.");
+            qb_gap.push(schema::quote_ident(column));
+            qb_gap.push(" = ");
+            qb_gap.push_bind(value);
+        }
 
         let max_gap: Option<i32> = qb_gap.build_query_scalar().fetch_one(&self.pool).await?;
 

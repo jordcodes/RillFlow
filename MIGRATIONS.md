@@ -171,3 +171,52 @@ END $$;
 ```
 
 Apply these via your own migration files after running the base schema.
+
+## Event Archiving Metadata Migration
+
+The `sql/0003_event_archiving.sql` migration lays the groundwork for dual-table hot/cold storage:
+
+- Creates `rf_streams` to track archival metadata (`archived_at`, `archived_by`, `archive_reason`, `retention_class`) with automatic `updated_at` maintenance.
+- Adds `migrated_at` and supporting indexes to the existing `events_archive` cold store so migrations can audit move times and query by stream.
+- Introduces `rf_archive_config` plus helper functions (`rf_archive_set_redirect`, `rf_archive_redirect_enabled`) to toggle the redirect trigger.
+- Installs `rf_events_redirect_archived` trigger that sends archived streams directly to `events_archive` when redirect is enabled.
+- Applications can toggle the redirect at runtime via `Store::set_archive_redirect(true|false)`; `StoreBuilder::archive_redirect_enabled(true)` enables it during startup (ignored gracefully if the migration is not yet applied).
+
+> Verification snippet:
+> ```sql
+> insert into rf_streams (stream_id, archived_at, archived_by, archive_reason)
+> values ('00000000-0000-0000-0000-000000000001', now(), current_user, 'demo')
+> on conflict (stream_id) do update set archived_at = excluded.archived_at;
+> select rf_archive_set_redirect(true);
+> insert into events (stream_id, stream_seq, event_type, body) values ('00000000-0000-0000-0000-000000000001', 1, 'DemoEvent', '{}'::jsonb);
+> select * from events_archive where stream_id = '00000000-0000-0000-0000-000000000001';
+> ```
+
+Roll back with `sql/0003_event_archiving.down.sql` to drop the metadata tables, trigger, and configuration helpers.
+
+## Partition Backend Scaffolding
+
+`sql/0004_event_archiving_partitioning.sql` introduces the `retention_class` column on the primary
+`events` table plus supporting indexes so deployments can steer hot/cold routing without relying on
+the companion archive table. When you flip the archive backend to `Partitioned`, Rillflow writes
+new hot events with `retention_class = 'hot'` and marks archived rows as `cold`, allowing operators
+to attach PostgreSQL LIST partitions on the column (and optional RANGE partitions on
+`created_at`).
+
+The down migration `sql/0004_event_archiving_partitioning.down.sql` removes the column and related
+indexes. Only use it if you are rolling back the partition backend entirely.
+
+## Partitioned Events Table
+
+`sql/0005_event_partitioning.sql` converts the `events` table into a native PostgreSQL partitioned
+table. The parent is partitioned by `retention_class` (hot/cold) and each branch sub-partitions by
+`bucket_month` (a generated column derived from `created_at`). The migration:
+
+- swaps the existing table for a partitioned equivalent, preserving all data and sequences,
+- installs default `events_hot_default` / `events_cold_default` partitions so workloads continue
+  without manual intervention,
+- replays the archive redirect trigger/function so dual-table deployments remain compatible, and
+- creates partition-friendly unique indexes (including `retention_class` to satisfy PostgreSQL’s
+  requirements).
+
+Roll back with `sql/0005_event_partitioning.down.sql`, which restores the non-partitioned layout.

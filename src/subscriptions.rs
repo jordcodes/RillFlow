@@ -1,6 +1,6 @@
 use crate::{
     Error, Result,
-    events::EventEnvelope,
+    events::{ArchiveBackend, EventEnvelope},
     schema,
     store::{TenantStrategy, tenant_schema_name},
 };
@@ -59,6 +59,8 @@ pub struct Subscriptions {
     tenant_strategy: TenantStrategy,
     tenant_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
     tenant: Option<String>,
+    archive_backend: ArchiveBackend,
+    include_archived: bool,
 }
 
 impl Subscriptions {
@@ -68,6 +70,8 @@ impl Subscriptions {
             tenant_strategy: TenantStrategy::Single,
             tenant_resolver: None,
             tenant: None,
+            archive_backend: ArchiveBackend::DualTable,
+            include_archived: false,
         }
     }
 
@@ -77,6 +81,8 @@ impl Subscriptions {
             pool,
             TenantStrategy::SchemaPerTenant,
             Some(Arc::new(move || Some(schema.clone()))),
+            ArchiveBackend::DualTable,
+            false,
         )
     }
 
@@ -84,12 +90,16 @@ impl Subscriptions {
         pool: PgPool,
         tenant_strategy: TenantStrategy,
         tenant_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
+        archive_backend: ArchiveBackend,
+        include_archived: bool,
     ) -> Self {
         Self {
             pool,
             tenant_strategy,
             tenant_resolver,
             tenant: None,
+            archive_backend,
+            include_archived,
         }
     }
 
@@ -119,19 +129,6 @@ impl Subscriptions {
                 Err(Error::TenantRequired)
             }
             _ => Ok(None),
-        }
-    }
-
-    #[allow(dead_code)]
-    fn push_tenant_filter<'a>(
-        &self,
-        qb: &mut sqlx::QueryBuilder<'a, sqlx::Postgres>,
-        tenant: Option<&'a String>,
-    ) {
-        if let (Some(column), Some(value)) = (self.tenant_column(), tenant) {
-            qb.push(format!("{} = ", schema::quote_ident(column)));
-            qb.push_bind(value);
-            qb.push(" and ");
         }
     }
 
@@ -236,6 +233,14 @@ impl Subscriptions {
         let tenant_strategy = self.tenant_strategy.clone();
         let tenant_resolver = self.tenant_resolver.clone();
         let tenant_column_name = self.tenant_column().map(|s| s.to_string());
+        let use_partitioned = matches!(self.archive_backend, ArchiveBackend::Partitioned);
+        let include_cold = if use_partitioned {
+            self.include_archived
+        } else {
+            self.include_archived && matches!(self.archive_backend, ArchiveBackend::DualTable)
+        };
+        let tenant_value_spawn = tenant_value.clone();
+        let tenant_column_spawn = tenant_column_name.clone();
         tokio::spawn(async move {
             let mut cursor = opts.start_from;
             let mut conn = match pool.acquire().await {
@@ -390,41 +395,63 @@ impl Subscriptions {
                 let q_start = Instant::now();
 
                 // Build query with optional tenant filter for conjoined mode
-                let mut qb = QueryBuilder::<sqlx::Postgres>::new("with f as (select ");
+                let mut qb = QueryBuilder::<Postgres>::new("with f as (select ");
                 qb.push_bind(&filter.event_types);
                 qb.push("::text[] as types, ");
                 qb.push_bind(&filter.stream_ids);
                 qb.push("::uuid[] as ids, ");
                 qb.push_bind(&filter.stream_prefix);
-                qb.push("::text as prefix) select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, created_at");
-
-                // Include tenant column in SELECT if in conjoined mode
-                if let Some(column) = tenant_column_name.as_ref() {
-                    qb.push(", ");
+                qb.push(
+                    "::text as prefix), combined as (select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, user_id, created_at",
+                );
+                if let Some(column) = tenant_column_spawn.as_ref() {
+                    qb.push(", e.");
                     qb.push(schema::quote_ident(column));
                     qb.push(" as tenant_id");
+                } else {
+                    qb.push(", null::text as tenant_id");
                 }
-
-                qb.push(" from events, f where ");
-
-                // Add tenant filter if in conjoined mode
-                if let (Some(column), Some(tenant_val)) =
-                    (tenant_column_name.as_ref(), tenant_value.as_ref())
+                qb.push(" from events e where ");
+                if let (Some(column), Some(value)) =
+                    (tenant_column_spawn.as_ref(), tenant_value_spawn.as_ref())
                 {
-                    qb.push(format!("{} = ", schema::quote_ident(column)));
-                    qb.push_bind(tenant_val);
+                    qb.push(" e.");
+                    qb.push(schema::quote_ident(column));
+                    qb.push(" = ");
+                    qb.push_bind(value);
                     qb.push(" and ");
                 }
-
-                qb.push("global_seq > ");
+                qb.push("1=1");
+                if use_partitioned {
+                    if !include_cold {
+                        qb.push(" and e.retention_class = 'hot'");
+                    }
+                } else if include_cold {
+                    qb.push(
+                        " union all select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, user_id, created_at",
+                    );
+                    if let Some(column) = tenant_column_spawn.as_ref() {
+                        qb.push(", ea.");
+                        qb.push(schema::quote_ident(column));
+                        qb.push(" as tenant_id");
+                    } else {
+                        qb.push(", null::text as tenant_id");
+                    }
+                    qb.push(" from events_archive ea where ");
+                    if let (Some(column), Some(value)) =
+                        (tenant_column_spawn.as_ref(), tenant_value_spawn.as_ref())
+                    {
+                        qb.push(" ea.");
+                        qb.push(schema::quote_ident(column));
+                        qb.push(" = ");
+                        qb.push_bind(value);
+                        qb.push(" and ");
+                    }
+                    qb.push("1=1");
+                }
+                qb.push(") select c.global_seq, c.stream_id, c.stream_seq, c.event_type, c.body, c.headers, c.causation_id, c.correlation_id, c.event_version, c.user_id, c.created_at, c.tenant_id from combined c, f where c.global_seq > ");
                 qb.push_bind(cursor);
-                qb.push(" and (");
-                qb.push_bind(&filter.event_types);
-                qb.push("::text[] is null or event_type = any(f.types)) and (");
-                qb.push_bind(&filter.stream_ids);
-                qb.push("::uuid[] is null or stream_id = any(f.ids)) and (");
-                qb.push_bind(&filter.stream_prefix);
-                qb.push("::text is null or stream_id::text like (f.prefix || '%')) order by global_seq asc limit ");
+                qb.push(" and (f.types is null or c.event_type = any(f.types)) and (f.ids is null or c.stream_id = any(f.ids)) and (f.prefix is null or c.stream_id::text like (f.prefix || '%')) order by c.global_seq asc limit ");
                 qb.push_bind(limit);
 
                 let rows: Vec<PgRow> = qb.build().fetch_all(&mut *conn).await.unwrap_or_default();

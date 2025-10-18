@@ -7,6 +7,7 @@ pub struct SessionContext {
     pub causation_id: Option<Uuid>,
     pub correlation_id: Option<Uuid>,
     pub headers: JsonMap<String, Value>,
+    pub allow_archived_stream: bool,
 }
 
 impl SessionContext {
@@ -29,6 +30,7 @@ pub struct SessionContextBuilder {
     causation_id: Option<Uuid>,
     correlation_id: Option<Uuid>,
     headers: JsonMap<String, Value>,
+    allow_archived_stream: bool,
 }
 
 impl SessionContextBuilder {
@@ -59,12 +61,18 @@ impl SessionContextBuilder {
         self
     }
 
+    pub fn allow_archived_stream(mut self, allow: bool) -> Self {
+        self.allow_archived_stream = allow;
+        self
+    }
+
     pub fn build(self) -> SessionContext {
         SessionContext {
             tenant: self.tenant,
             causation_id: self.causation_id,
             correlation_id: self.correlation_id,
             headers: self.headers,
+            allow_archived_stream: self.allow_archived_stream,
         }
     }
 }

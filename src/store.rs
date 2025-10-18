@@ -2,7 +2,7 @@ use crate::{
     Result,
     context::{SessionContext, SessionContextBuilder},
     documents::{DocumentSession, Documents},
-    events::{AppendOptions, Events},
+    events::{AppendOptions, ArchiveBackend, ArchiveSettings, Events},
     projections::Projections,
     schema::{SchemaConfig, TenancyMode, TenantColumn, TenantSchema},
     subscriptions::Subscriptions,
@@ -85,6 +85,8 @@ pub struct Store {
     #[allow(dead_code)]
     prepared_statement_cache_size: Option<usize>,
     upcaster_registry: Option<Arc<UpcasterRegistry>>,
+    archive_backend: ArchiveBackend,
+    include_archived_by_default: bool,
 }
 
 impl Store {
@@ -101,6 +103,8 @@ impl Store {
             enforce_tenant: false,
             prepared_statement_cache_size: None,
             upcaster_registry: None,
+            archive_backend: ArchiveBackend::DualTable,
+            include_archived_by_default: false,
         })
     }
 
@@ -115,6 +119,8 @@ impl Store {
             self.tenant_resolver.clone(),
             self.session_context.tenant.clone(),
             self.upcaster_registry.clone(),
+            self.archive_backend,
+            self.include_archived_by_default,
         )
     }
 
@@ -159,6 +165,47 @@ impl Store {
     pub fn with_session_defaults(mut self, defaults: AppendOptions, advisory_locks: bool) -> Self {
         self.set_session_defaults(defaults, advisory_locks);
         self
+    }
+
+    /// Returns `true` when archive redirect trigger should send archived streams to cold storage.
+    pub async fn archive_redirect_enabled(&self) -> Result<bool> {
+        match sqlx::query_scalar::<_, bool>("select rf_archive_redirect_enabled()")
+            .fetch_one(&self.pool)
+            .await
+        {
+            Ok(enabled) => Ok(enabled),
+            Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("42883") => {
+                Ok(false)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Toggle the archive redirect trigger (see `rf_events_redirect_archived`).
+    pub async fn set_archive_redirect(&self, enabled: bool) -> Result<()> {
+        match sqlx::query("select rf_archive_set_redirect($1)")
+            .bind(enabled)
+            .execute(&self.pool)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("42883") => {
+                Ok(())
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    pub fn archive_backend(&self) -> ArchiveBackend {
+        self.archive_backend
+    }
+
+    pub fn include_archived_by_default(&self) -> bool {
+        self.include_archived_by_default
+    }
+
+    pub fn set_include_archived_by_default(&mut self, include: bool) {
+        self.include_archived_by_default = include;
     }
 
     pub fn session_context(&self) -> &SessionContext {
@@ -292,6 +339,10 @@ impl Store {
             self.tenant_strategy.clone(),
             self.tenant_resolver.clone(),
             self.session_context.tenant.clone(),
+            ArchiveSettings {
+                backend: self.archive_backend,
+                include_archived: self.include_archived_by_default,
+            },
         );
         events.set_upcasters(self.upcaster_registry.clone());
         events
@@ -307,6 +358,8 @@ impl Store {
             self.tenant_strategy.clone(),
             self.tenant_resolver.clone(),
             self.upcaster_registry.clone(),
+            self.archive_backend,
+            self.include_archived_by_default,
         )
     }
 
@@ -319,11 +372,14 @@ impl Store {
             self.pool.clone(),
             self.tenant_strategy.clone(),
             self.tenant_resolver.clone(),
+            self.archive_backend,
+            self.include_archived_by_default,
         )
     }
 
     pub fn schema(&self) -> crate::schema::SchemaManager {
         crate::schema::SchemaManager::new(self.pool.clone())
+            .with_archive_backend(self.archive_backend)
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -381,6 +437,9 @@ pub struct StoreBuilder {
     enforce_tenant: bool,
     prepared_statement_cache_size: Option<usize>,
     upcaster_registry: Option<Arc<UpcasterRegistry>>,
+    archive_backend: ArchiveBackend,
+    include_archived_by_default: bool,
+    archive_redirect_enabled: bool,
 }
 
 /// Builder for `DocumentSession` instances with preconfigured defaults.
@@ -409,6 +468,9 @@ impl StoreBuilder {
             enforce_tenant: true,
             prepared_statement_cache_size: None,
             upcaster_registry: None,
+            archive_backend: ArchiveBackend::DualTable,
+            include_archived_by_default: false,
+            archive_redirect_enabled: false,
         }
     }
 
@@ -453,6 +515,21 @@ impl StoreBuilder {
         ) {
             self.enforce_tenant = true;
         }
+        self
+    }
+
+    pub fn archive_backend(mut self, backend: ArchiveBackend) -> Self {
+        self.archive_backend = backend;
+        self
+    }
+
+    pub fn include_archived_by_default(mut self, include: bool) -> Self {
+        self.include_archived_by_default = include;
+        self
+    }
+
+    pub fn archive_redirect_enabled(mut self, enabled: bool) -> Self {
+        self.archive_redirect_enabled = enabled;
         self
     }
 
@@ -501,7 +578,7 @@ impl StoreBuilder {
         } else {
             opts.connect(&self.url).await?
         };
-        Ok(Store {
+        let store = Store {
             pool,
             session_defaults: self.session_defaults,
             session_advisory_locks: self.session_advisory_locks,
@@ -512,7 +589,15 @@ impl StoreBuilder {
             enforce_tenant: self.enforce_tenant,
             prepared_statement_cache_size: self.prepared_statement_cache_size,
             upcaster_registry: self.upcaster_registry.clone(),
-        })
+            archive_backend: self.archive_backend,
+            include_archived_by_default: self.include_archived_by_default,
+        };
+
+        store
+            .set_archive_redirect(self.archive_redirect_enabled)
+            .await?;
+
+        Ok(store)
     }
 }
 
@@ -633,6 +718,9 @@ impl SessionBuilder {
         }
         session.set_event_causation_id(self.defaults.causation_id);
         session.set_event_correlation_id(self.defaults.correlation_id);
+        if self.defaults.allow_archived_stream {
+            session.allow_archived_stream_appends(true);
+        }
         if let Some(key) = self
             .defaults
             .headers

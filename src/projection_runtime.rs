@@ -7,15 +7,14 @@ use std::time::Duration;
 
 use crate::{
     Error, Result, SessionContext,
-    events::{EventEnvelope, Events},
+    events::{ArchiveBackend, ArchiveSettings, Events},
     projections::ProjectionHandler,
-    schema,
     store::{TenantStrategy, tenant_schema_name},
     upcasting::UpcasterRegistry,
 };
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use sqlx::{PgPool, Postgres, QueryBuilder, types::Json};
+use sqlx::{PgPool, types::Json};
 use tokio::sync::RwLock;
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
@@ -187,6 +186,8 @@ pub struct ProjectionWorkerConfig {
     pub cluster: DaemonClusterConfig,
     pub node_name: String,
     pub daemon_id: Option<Uuid>,
+    pub archive_backend: ArchiveBackend,
+    pub include_archived: bool,
 }
 
 impl Default for ProjectionWorkerConfig {
@@ -204,6 +205,8 @@ impl Default for ProjectionWorkerConfig {
             cluster: DaemonClusterConfig::default(),
             node_name: default_node_name(),
             daemon_id: None,
+            archive_backend: ArchiveBackend::DualTable,
+            include_archived: false,
         }
     }
 }
@@ -286,6 +289,21 @@ impl ProjectionDaemon {
         if let DaemonClusterConfig::HotCold(cfg) = &self.config.cluster {
             crate::metrics::clear_daemon_node_state(&cfg.cluster, &self.node_name);
         }
+    }
+
+    fn events_api(&self) -> Events {
+        let mut events = Events::new(
+            self.pool.clone(),
+            self.config.tenant_strategy.clone(),
+            self.config.tenant_resolver.clone(),
+            None,
+            ArchiveSettings {
+                backend: self.config.archive_backend,
+                include_archived: self.config.include_archived,
+            },
+        );
+        events.set_upcasters(self.upcaster_registry.clone());
+        events
     }
 
     async fn ensure_node_bootstrapped(&self) -> Result<()> {
@@ -823,13 +841,6 @@ impl ProjectionDaemon {
         );
     }
 
-    fn tenant_column(&self) -> Option<&str> {
-        match &self.config.tenant_strategy {
-            TenantStrategy::Conjoined { column } => Some(column.name.as_str()),
-            _ => None,
-        }
-    }
-
     fn resolve_conjoined_tenant(&self, context: &SessionContext) -> Result<Option<String>> {
         match &self.config.tenant_strategy {
             TenantStrategy::Conjoined { .. } => {
@@ -844,18 +855,6 @@ impl ProjectionDaemon {
                 Err(Error::TenantRequired)
             }
             _ => Ok(None),
-        }
-    }
-
-    fn push_tenant_filter<'a>(
-        &self,
-        qb: &mut QueryBuilder<'a, Postgres>,
-        tenant: Option<&'a String>,
-    ) {
-        if let (Some(column), Some(value)) = (self.tenant_column(), tenant) {
-            qb.push(format!("{} = ", schema::quote_ident(column)));
-            qb.push_bind(value);
-            qb.push(" and ");
         }
     }
 
@@ -1060,34 +1059,15 @@ impl ProjectionDaemon {
 
         let q_start = std::time::Instant::now();
 
-        // Build query with optional tenant filter for conjoined mode
         let tenant_value = self.resolve_conjoined_tenant(&context)?;
-        let tenant_ref = tenant_value.as_ref();
-        let mut qb = QueryBuilder::<Postgres>::new(
-            "select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, user_id, created_at from events where ",
-        );
-        self.push_tenant_filter(&mut qb, tenant_ref);
-        qb.push("global_seq > ");
-        qb.push_bind(last_seq);
-        qb.push(" order by global_seq asc limit ");
-        qb.push_bind(self.config.batch_size);
-
-        let rows: Vec<(
-            i64,
-            Uuid,
-            i32,
-            String,
-            Value,
-            Value,
-            Option<Uuid>,
-            Option<Uuid>,
-            i32,
-            Option<String>,
-            chrono::DateTime<chrono::Utc>,
-        )> = qb.build_query_as().fetch_all(&mut *tx).await?;
+        let mut events_api = self.events_api();
+        events_api.set_tenant(tenant_value.clone());
+        let mut envelopes = events_api
+            .fetch_after_tx(&mut tx, last_seq, self.config.batch_size)
+            .await?;
         crate::metrics::record_query_duration("projection_fetch_batch", q_start.elapsed());
 
-        if rows.is_empty() {
+        if envelopes.is_empty() {
             // refresh lease (touch) and exit
             self.refresh_lease(name).await?;
             tx.commit().await?;
@@ -1097,44 +1077,10 @@ impl ProjectionDaemon {
         let mut new_last = last_seq;
         let mut processed: usize = 0;
         let batch_apply_start = std::time::Instant::now();
-        for (
-            seq,
-            stream_id,
-            stream_seq,
-            typ,
-            body,
-            headers,
-            causation_id,
-            correlation_id,
-            event_version,
-            user_id,
-            created_at,
-        ) in rows
-        {
-            // apply within the same transaction to keep read model + checkpoint atomic
-            let mut envelope = EventEnvelope {
-                global_seq: seq,
-                stream_id,
-                stream_seq,
-                typ,
-                body,
-                headers,
-                causation_id,
-                correlation_id,
-                event_version,
-                tenant_id: tenant_value.clone(),
-                user_id,
-                created_at,
-            };
-
-            if let Some(registry) = &self.upcaster_registry {
-                registry
-                    .upcast_with_pool(&mut envelope, Some(&self.pool))
-                    .await?;
-            } else {
-                Events::apply_legacy_upcasters(&mut envelope);
+        for mut envelope in envelopes.drain(..) {
+            if envelope.tenant_id.is_none() {
+                envelope.tenant_id = tenant_value.clone();
             }
-
             if let Err(err) = reg
                 .handler
                 .apply(&envelope.typ, &envelope.body, &mut tx)
@@ -1449,9 +1395,11 @@ impl ProjectionDaemon {
             .await?
             .unwrap_or(0);
 
-        let head_seq: i64 = sqlx::query_scalar("select coalesce(max(global_seq), 0) from events")
-            .fetch_one(&mut *tx)
-            .await?;
+        let mut events_api = self.events_api();
+        if let Some(t) = tenant {
+            events_api.set_tenant(Some(t.to_string()));
+        }
+        let head_seq = events_api.head_sequence_tx(&mut tx).await?;
 
         let dlq_count: i64 =
             sqlx::query_scalar("select count(1) from projection_dlq where name = $1")
@@ -1768,6 +1716,14 @@ impl ProjectionDaemonBuilder {
     pub fn backoff(mut self, base: Duration, max: Duration) -> Self {
         self.config.base_backoff = base;
         self.config.max_backoff = max;
+        self
+    }
+    pub fn archive_backend(mut self, backend: ArchiveBackend) -> Self {
+        self.config.archive_backend = backend;
+        self
+    }
+    pub fn include_archived(mut self, include: bool) -> Self {
+        self.config.include_archived = include;
         self
     }
     pub fn register(

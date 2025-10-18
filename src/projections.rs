@@ -1,7 +1,7 @@
 use crate::{
     Result,
     context::SessionContext,
-    events::{EventEnvelope, Events},
+    events::{ArchiveBackend, ArchiveSettings, Events},
     schema,
     store::{TenantStrategy, tenant_schema_name},
     upcasting::UpcasterRegistry,
@@ -17,6 +17,8 @@ pub struct Projections {
     tenant_strategy: TenantStrategy,
     tenant_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
     upcaster_registry: Option<Arc<UpcasterRegistry>>,
+    archive_backend: ArchiveBackend,
+    include_archived: bool,
 }
 
 impl Projections {
@@ -25,12 +27,16 @@ impl Projections {
         tenant_strategy: TenantStrategy,
         tenant_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
         upcaster_registry: Option<Arc<UpcasterRegistry>>,
+        archive_backend: ArchiveBackend,
+        include_archived: bool,
     ) -> Self {
         Self {
             pool,
             tenant_strategy,
             tenant_resolver,
             upcaster_registry,
+            archive_backend,
+            include_archived,
         }
     }
 }
@@ -88,6 +94,21 @@ impl Projections {
         Ok(last_seq.unwrap_or(0))
     }
 
+    fn events_api(&self) -> Events {
+        let mut events = Events::new(
+            self.pool.clone(),
+            self.tenant_strategy.clone(),
+            self.tenant_resolver.clone(),
+            None,
+            ArchiveSettings {
+                backend: self.archive_backend,
+                include_archived: self.include_archived,
+            },
+        );
+        events.set_upcasters(self.upcaster_registry.clone());
+        events
+    }
+
     async fn persist_checkpoint(
         tx: &mut Transaction<'_, Postgres>,
         name: &str,
@@ -125,69 +146,36 @@ impl Projections {
         }
         let last_seq = Self::load_last_seq(&mut tx, name).await?;
 
-        let rows: Vec<(
-            i64,
-            uuid::Uuid,
-            i32,
-            String,
-            Value,
-            Value,
-            Option<uuid::Uuid>,
-            Option<uuid::Uuid>,
-            i32,
-            Option<String>,
-            chrono::DateTime<chrono::Utc>,
-        )> = sqlx::query_as(
-            "select global_seq, stream_id, stream_seq, event_type, body, headers, causation_id, correlation_id, event_version, user_id, created_at from events where global_seq > $1 order by global_seq asc"
-        )
-        .bind(last_seq)
-        .fetch_all(&mut *tx)
-        .await?;
+        let mut events_api = self.events_api();
+        if let Some(ref tenant) = context.tenant {
+            events_api.set_tenant(Some(tenant.clone()));
+        }
+        if let Some(ref tenant) = schema_tenant {
+            events_api.set_tenant(Some(tenant.clone()));
+        }
 
+        const BATCH_LIMIT: i64 = 512;
         let mut new_last = last_seq;
 
-        for (
-            global_seq,
-            stream_id,
-            stream_seq,
-            event_type,
-            body,
-            headers,
-            causation_id,
-            correlation_id,
-            event_version,
-            user_id,
-            created_at,
-        ) in rows
-        {
-            let mut envelope = EventEnvelope {
-                global_seq,
-                stream_id,
-                stream_seq,
-                typ: event_type,
-                body,
-                headers,
-                causation_id,
-                correlation_id,
-                event_version,
-                tenant_id: schema_tenant.clone(),
-                user_id,
-                created_at,
-            };
-
-            if let Some(registry) = &self.upcaster_registry {
-                registry
-                    .upcast_with_pool(&mut envelope, Some(&self.pool))
-                    .await?;
-            } else {
-                Events::apply_legacy_upcasters(&mut envelope);
+        loop {
+            let batch = events_api
+                .fetch_after_tx(&mut tx, new_last, BATCH_LIMIT)
+                .await?;
+            if batch.is_empty() {
+                break;
             }
 
-            handler
-                .apply(&envelope.typ, &envelope.body, &mut tx)
-                .await?;
-            crate::metrics::record_proj_events_processed(schema_tenant.as_deref(), 1);
-            new_last = envelope.global_seq;
+            for mut envelope in batch {
+                if envelope.tenant_id.is_none() {
+                    envelope.tenant_id = schema_tenant.clone().or_else(|| context.tenant.clone());
+                }
+
+                handler
+                    .apply(&envelope.typ, &envelope.body, &mut tx)
+                    .await?;
+                crate::metrics::record_proj_events_processed(schema_tenant.as_deref(), 1);
+                new_last = envelope.global_seq;
+            }
         }
 
         Self::persist_checkpoint(&mut tx, name, new_last).await?;

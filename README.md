@@ -106,6 +106,16 @@ Notes:
 - If `OTEL_EXPORTER_OTLP_ENDPOINT` is not set, OTEL init is a no-op.
 - Prometheus metrics remain available at the health bind endpoint.
 
+Archive metrics exported:
+- `archive_streams_marked_total`
+- `archive_streams_reactivated_total`
+- `archive_events_moved_total`
+- `archive_move_batches_total`
+- `archive_move_duration_seconds`
+- `archive_events_hot_bytes`
+
+These appear per-tenant when tenancy is enabled.
+
 - Streams
 ```bash
 cargo run --bin rillflow -- streams resolve orders:42 --database-url "$DATABASE_URL"
@@ -233,6 +243,17 @@ use std::time::Duration;
 let store = rillflow::Store::builder(std::env::var("DATABASE_URL")?)
     .max_connections(20)
     .connect_timeout(Duration::from_secs(5))
+    .archive_backend(rillflow::events::ArchiveBackend::DualTable)
+    .archive_redirect_enabled(true)
+    // keep hot reads fast; opt into cold data per-call
+    .include_archived_by_default(false)
+    .build()
+    .await?;
+
+// Partitioned backend: relies on events.retention_class for hot/cold routing
+let partitioned = rillflow::Store::builder(std::env::var("DATABASE_URL")?)
+    .archive_backend(rillflow::events::ArchiveBackend::Partitioned)
+    .include_archived_by_default(false)
     .build()
     .await?;
 ```
@@ -245,13 +266,16 @@ use serde_json::json;
 
 let opts = rillflow::events::AppendOptions {
     headers: Some(json!({"req_id": "r-123"})),
-    causation_id: None,
-    correlation_id: None,
+    ..rillflow::events::AppendOptions::default()
 };
 store
   .events()
   .append_with(stream_id, Expected::Any, vec![Event::new("E1", &json!({}))], &opts)
   .await?;
+
+// Hot reads by default; opt in to archived data per call
+let hot_events = store.events().read_stream(stream_id).await?;
+let all_events = store.events().with_archived().read_stream(stream_id).await?;
 ```
 
 Idempotent appends:
@@ -666,8 +690,7 @@ impl Aggregate for VisitCounter {
 let store = Store::builder(&url)
     .session_defaults(AppendOptions {
         headers: Some(serde_json::json!({"source": "api"})),
-        causation_id: None,
-        correlation_id: None,
+        ..AppendOptions::default()
     })
     .session_advisory_locks(true)
     .build()

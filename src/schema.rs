@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::Result;
+use crate::{Result, events::ArchiveBackend};
 use indoc::formatdoc;
 use sqlx::PgPool;
 
@@ -198,11 +198,20 @@ impl Default for TenantColumn {
 #[derive(Clone, Debug)]
 pub struct SchemaManager {
     pool: PgPool,
+    archive_backend: ArchiveBackend,
 }
 
 impl SchemaManager {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            archive_backend: ArchiveBackend::DualTable,
+        }
+    }
+
+    pub fn with_archive_backend(mut self, backend: ArchiveBackend) -> Self {
+        self.archive_backend = backend;
+        self
     }
 
     pub async fn plan(&self, config: &SchemaConfig) -> Result<SchemaPlan> {
@@ -324,9 +333,24 @@ impl SchemaManager {
                     .await?;
             }
         }
-        ensure_table(plan, schema, &existing_tables, "events", |s| {
-            build_events_table_sql(s, tenant_column)
-        });
+        match self.archive_backend {
+            ArchiveBackend::DualTable => {
+                ensure_table(plan, schema, &existing_tables, "events", |s| {
+                    build_events_table_sql(s, tenant_column)
+                });
+            }
+            ArchiveBackend::Partitioned => {
+                if !events_exists {
+                    plan.push_action(
+                        format!(
+                            "create partitioned events {}",
+                            qualified_name(schema, "events")
+                        ),
+                        build_partitioned_events_block(schema, tenant_column),
+                    );
+                }
+            }
+        }
         if events_exists {
             if let Some(column) = tenant_column {
                 self.ensure_tenant_column(plan, schema, "events", column)
@@ -342,6 +366,9 @@ impl SchemaManager {
                     .await?;
             }
         }
+        ensure_table(plan, schema, &existing_tables, "rf_streams", |s| {
+            build_streams_table_sql(s)
+        });
         ensure_table(plan, schema, &existing_tables, "projections", |s| {
             build_projections_table_sql(s, tenant_column)
         });
@@ -408,9 +435,26 @@ impl SchemaManager {
             plan,
             schema,
             &existing_indexes,
+            "events_stream_partition_uq",
+            build_events_partition_unique_index_sql,
+        );
+        ensure_index(
+            plan,
+            schema,
+            &existing_indexes,
             "docs_gin",
             build_docs_index_sql,
         );
+
+        if is_base_schema {
+            ensure_index(
+                plan,
+                schema,
+                &existing_indexes,
+                "rf_streams_retention_idx",
+                build_streams_retention_index_sql,
+            );
+        }
 
         // Full-text search index
         ensure_index(
@@ -993,6 +1037,7 @@ fn build_events_table_sql(schema: &str, tenant_column: Option<&TenantColumn>) ->
             user_id text null,
             is_tombstone boolean not null default false,
             created_at timestamptz not null default now(),
+            retention_class text not null default 'hot' check (retention_class in ('hot', 'cold')),
             unique (stream_id, stream_seq)
         )
         ",
@@ -1032,6 +1077,109 @@ fn build_events_archive_table_sql(schema: &str, tenant_column: Option<&TenantCol
         ",
         table = qualified_name(schema, "events_archive"),
         tenant_column = tenant_column_sql,
+    )
+}
+
+fn build_events_partition_unique_index_sql(schema: &str) -> String {
+    format!(
+        "create unique index if not exists {} on {} (retention_class, created_at, stream_id, stream_seq)",
+        quote_ident("events_stream_partition_uq"),
+        qualified_name(schema, "events"),
+    )
+}
+
+fn build_partitioned_events_block(schema: &str, tenant_column: Option<&TenantColumn>) -> String {
+    let tenant_column_sql = tenant_column
+        .map(|col| {
+            format!(
+                "        {} {} null,\n",
+                quote_ident(&col.name),
+                col.data_type.as_sql()
+            )
+        })
+        .unwrap_or_default();
+
+    let schema_literal = format!("'{}'", schema.replace('\'', "''"));
+    formatdoc!(
+        r#"
+        do $$
+        declare
+            target_schema constant text := {schema_literal};
+        begin
+            if exists (
+                select 1
+                from information_schema.tables
+                where table_schema = target_schema
+                  and table_name = 'events'
+            ) then
+                return;
+            end if;
+
+            execute format('set local search_path to %I, pg_catalog', target_schema);
+            execute 'create sequence if not exists events_global_seq_seq';
+            execute $evt$
+                create table events (
+{tenant_column}        retention_class text not null default ''hot''
+                        check (retention_class in (''hot'', ''cold'')),
+                    global_seq bigint not null default nextval(''events_global_seq_seq''),
+                    stream_id uuid not null,
+                    stream_seq int not null,
+                    event_type text not null,
+                    body jsonb not null,
+                    headers jsonb not null default ''{{}}''::jsonb,
+                    causation_id uuid null,
+                    correlation_id uuid null,
+                    event_version int not null default 1,
+                    user_id text null,
+                    is_tombstone boolean not null default false,
+                    created_at timestamptz not null default now(),
+                    primary key (retention_class, created_at, global_seq),
+                    unique (retention_class, created_at, stream_id, stream_seq)
+                ) partition by list (retention_class)
+            $evt$;
+            execute 'create table events_hot partition of events for values in (''hot'') partition by range (created_at)';
+            execute 'create table events_cold partition of events for values in (''cold'') partition by range (created_at)';
+            execute 'create table events_hot_default partition of events_hot default';
+            execute 'create table events_cold_default partition of events_cold default';
+            execute ''create unique index if not exists events_idemp_key_uq on events (retention_class, created_at, (headers ->> ''''idempotency_key'''')) where headers ? ''''idempotency_key'''''';
+            execute ''create index if not exists events_stream_retention_idx on events (retention_class, stream_id, stream_seq)'';
+            if exists (select 1 from pg_proc where proname = ''rf_events_redirect_archived'') then
+                execute ''create trigger rf_events_redirect_archived_trg
+                    before insert on events
+                    for each row
+                    execute function rf_events_redirect_archived()'';
+            end if;
+        end;
+        $$;
+        "#,
+        schema_literal = schema_literal,
+        tenant_column = tenant_column_sql,
+    )
+}
+
+fn build_streams_table_sql(schema: &str) -> String {
+    formatdoc!(
+        "
+        create table if not exists {table} (
+            stream_id uuid primary key,
+            tenant_id text null,
+            archived_at timestamptz null,
+            archived_by text null,
+            archive_reason text null,
+            retention_class text not null default 'hot' check (retention_class in ('hot', 'cold')),
+            created_at timestamptz not null default now(),
+            updated_at timestamptz not null default now()
+        )
+        ",
+        table = qualified_name(schema, "rf_streams"),
+    )
+}
+
+fn build_streams_retention_index_sql(schema: &str) -> String {
+    format!(
+        "create index if not exists {} on {} (retention_class, archived_at)",
+        quote_ident("rf_streams_retention_idx"),
+        qualified_name(schema, "rf_streams"),
     )
 }
 

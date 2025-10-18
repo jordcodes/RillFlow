@@ -392,18 +392,27 @@ async fn print_upcaster_path(
     }
     Ok(())
 }
-use chrono::Utc;
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use rillflow::projection_runtime::{
     DaemonClusterConfig, HotColdConfig, ProjectionDaemon, ProjectionWorkerConfig,
 };
 use rillflow::subscriptions::{SubscriptionFilter, SubscriptionOptions, Subscriptions};
 use rillflow::{
-    SchemaConfig, Store, TenancyMode, TenantSchema, TenantStrategy, upcasting::UpcasterRegistry,
+    SchemaConfig, Store, TenancyMode, TenantSchema, TenantStrategy,
+    events::ArchiveBackend,
+    metrics::{
+        record_archive_mark, record_archive_move, record_archive_moved, record_archive_reactivate,
+        set_archive_hot_bytes, set_slow_query_explain, set_slow_query_threshold,
+    },
+    upcasting::UpcasterRegistry,
 };
 use serde_json::Value as JsonValue;
-use sqlx::Row;
+use sqlx::{Executor, PgPool, Postgres, QueryBuilder, Row};
+use std::time::Instant;
 use std::{collections::BTreeMap, sync::Arc};
+use tracing::info;
+use tracing::info;
 use uuid::Uuid;
 
 #[derive(Parser, Debug)]
@@ -462,6 +471,10 @@ enum Commands {
     /// Stream alias helpers
     #[command(subcommand)]
     Streams(StreamsCmd),
+
+    /// Archive lifecycle (hot/cold) helpers
+    #[command(subcommand)]
+    Archive(ArchiveCmd),
 
     /// Documents admin commands
     #[command(subcommand)]
@@ -716,6 +729,73 @@ enum StreamsCmd {
     Resolve { alias: String },
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ArchiveRetention {
+    Hot,
+    Cold,
+}
+
+impl ArchiveRetention {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ArchiveRetention::Hot => "hot",
+            ArchiveRetention::Cold => "cold",
+        }
+    }
+}
+
+#[derive(Subcommand, Debug)]
+enum ArchiveCmd {
+    /// Show archive status (stream counts, table sizes)
+    Status {
+        #[arg(long)]
+        tenant: Option<String>,
+    },
+    /// Mark a stream as archived
+    Mark {
+        stream: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        by: Option<String>,
+        #[arg(long)]
+        tenant: Option<String>,
+    },
+    /// Reactivate a stream (allow hot writes)
+    Reactivate {
+        stream: String,
+        #[arg(long)]
+        tenant: Option<String>,
+    },
+    /// Move eligible events from hot to cold storage
+    Move {
+        #[arg(long)]
+        before: chrono::DateTime<chrono::Utc>,
+        #[arg(long, default_value_t = 100)]
+        batch_size: i64,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        #[arg(long)]
+        tenant: Option<String>,
+        #[arg(long)]
+        stream: Option<String>,
+    },
+    /// Toggle redirect trigger (enable/disable hot->cold routing)
+    Redirect {
+        #[arg(long)]
+        enable: Option<bool>,
+    },
+    /// Create a monthly partition (partitioned backend only)
+    Partition {
+        #[arg(long, value_enum, default_value_t = ArchiveRetention::Hot)]
+        retention: ArchiveRetention,
+        #[arg(long, value_parser = clap::value_parser!(NaiveDate))]
+        month: NaiveDate,
+        #[arg(long)]
+        tenant: Option<String>,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 enum DocsCmd {
     /// Get a document by id
@@ -927,10 +1007,8 @@ async fn main() -> rillflow::Result<()> {
         builder = builder.tenant_strategy(TenantStrategy::SchemaPerTenant);
     }
     let store = builder.build().await?;
-    rillflow::metrics::set_slow_query_threshold(std::time::Duration::from_millis(
-        cli.slow_query_ms,
-    ));
-    rillflow::metrics::set_slow_query_explain(cli.slow_query_explain);
+    set_slow_query_threshold(std::time::Duration::from_millis(cli.slow_query_ms));
+    set_slow_query_explain(cli.slow_query_explain);
     let mgr = store.schema();
 
     let store_tenant_strategy = store.tenant_strategy();
@@ -1375,7 +1453,11 @@ async fn main() -> rillflow::Result<()> {
             }
         },
         Commands::Subscriptions(cmd) => {
-            let subs = tenant_helper.subscriptions(store.pool().clone());
+            let subs = tenant_helper.subscriptions(
+                store.pool().clone(),
+                store.archive_backend(),
+                store.include_archived_by_default(),
+            );
             match cmd {
                 SubscriptionsCmd::Create {
                     name,
@@ -1522,14 +1604,9 @@ async fn main() -> rillflow::Result<()> {
                     }
                 }
                 SubscriptionsCmd::Groups { name, tenant } => {
+                    let global_head = store.events().head_sequence().await?;
                     let rows = sqlx::query(
-                        "select g.grp, g.last_seq, coalesce(h.head, 0) as head
-                           from subscription_groups g
-                           left join (
-                                select stream_id, max(global_seq) as head from events group by stream_id
-                           ) h on true
-                          where g.name=$1
-                          order by g.grp",
+                        "select grp, last_seq, max_in_flight from subscription_groups where name=$1 order by grp",
                     )
                     .bind(&name)
                     .fetch_all(store.pool())
@@ -1537,11 +1614,10 @@ async fn main() -> rillflow::Result<()> {
                     for r in rows {
                         let grp: String = r.get("grp");
                         let last_seq: i64 = r.get::<Option<i64>, _>("last_seq").unwrap_or(0);
-                        let head: i64 = r.get::<Option<i64>, _>("head").unwrap_or(0);
-                        let lag = (head - last_seq).max(0);
+                        let lag = (global_head - last_seq).max(0);
                         println!(
                             "{}:{} last_seq={} head={} lag={}",
-                            name, grp, last_seq, head, lag
+                            name, grp, last_seq, global_head, lag
                         );
                     }
                 }
@@ -1558,10 +1634,7 @@ async fn main() -> rillflow::Result<()> {
                     .fetch_optional(store.pool())
                     .await?
                     .unwrap_or(0);
-                    let head: i64 =
-                        sqlx::query_scalar("select coalesce(max(global_seq), 0) from events")
-                            .fetch_one(store.pool())
-                            .await?;
+                    let head: i64 = store.events().head_sequence().await?;
                     let leased_by: Option<String> = sqlx::query_scalar(
                         "select leased_by from subscription_group_leases where name=$1 and grp=$2",
                     )
@@ -1616,6 +1689,113 @@ async fn main() -> rillflow::Result<()> {
             StreamsCmd::Resolve { alias } => {
                 let id = store.resolve_stream_alias(&alias).await?;
                 println!("{} -> {}", alias, id);
+            }
+        },
+        Commands::Archive(cmd) => match cmd {
+            ArchiveCmd::Status { tenant } => {
+                tenant_helper
+                    .with_selection(tenant, false, |sel| async {
+                        for ctx in sel {
+                            let schema = ctx.schema_or(&cli.schema);
+                            archive_status(&store, &schema, ctx.tenant_label.as_deref()).await?;
+                        }
+                        Ok(())
+                    })
+                    .await?;
+            }
+            ArchiveCmd::Mark {
+                stream,
+                reason,
+                by,
+                tenant,
+            } => {
+                let (ctx, _) = tenant_helper.select_single(tenant.as_deref(), &stream)?;
+                let schema = ctx.schema_or(&cli.schema);
+                archive_mark(
+                    &store,
+                    &schema,
+                    ctx.tenant_label.as_deref(),
+                    &stream,
+                    reason,
+                    by,
+                )
+                .await?;
+            }
+            ArchiveCmd::Reactivate { stream, tenant } => {
+                let (ctx, _) = tenant_helper.select_single(tenant.as_deref(), &stream)?;
+                let schema = ctx.schema_or(&cli.schema);
+                archive_reactivate(&store, &schema, ctx.tenant_label.as_deref(), &stream).await?;
+            }
+            ArchiveCmd::Move {
+                before,
+                batch_size,
+                dry_run,
+                tenant,
+                stream,
+            } => {
+                if let Some(stream) = stream.clone() {
+                    let (ctx, _) = tenant_helper.select_single(tenant.as_deref(), &stream)?;
+                    let schema = ctx.schema_or(&cli.schema);
+                    archive_move(
+                        &store,
+                        &schema,
+                        ctx.tenant_label.as_deref(),
+                        Some(&stream),
+                        before,
+                        batch_size,
+                        dry_run,
+                    )
+                    .await?;
+                } else {
+                    tenant_helper
+                        .with_selection(tenant, false, |sel| async {
+                            for ctx in sel {
+                                let schema = ctx.schema_or(&cli.schema);
+                                archive_move(
+                                    &store,
+                                    &schema,
+                                    ctx.tenant_label.as_deref(),
+                                    None,
+                                    before,
+                                    batch_size,
+                                    dry_run,
+                                )
+                                .await?;
+                            }
+                            Ok(())
+                        })
+                        .await?;
+                }
+            }
+            ArchiveCmd::Partition {
+                retention,
+                month,
+                tenant,
+            } => {
+                tenant_helper
+                    .with_selection(tenant, false, |sel| async {
+                        for ctx in sel {
+                            let schema = ctx.schema_or(&cli.schema);
+                            archive_partition_create(&store, &schema, retention, month).await?;
+                        }
+                        Ok(())
+                    })
+                    .await?;
+            }
+            ArchiveCmd::Redirect { enable } => {
+                if let Some(flag) = enable {
+                    store.set_archive_redirect(flag).await?;
+                    println!(
+                        "archive redirect {}",
+                        if flag { "enabled" } else { "disabled" }
+                    );
+                } else {
+                    let current = store.archive_redirect_enabled().await?;
+                    println!(
+                        "archive redirect is currently {}",
+                        if current { "enabled" } else { "disabled" }
+                    );
+                }
             }
         },
         Commands::Docs(cmd) => match cmd {
@@ -1976,7 +2156,7 @@ async fn main() -> rillflow::Result<()> {
                         let mut total = 0u64;
                         for ctx in sel {
                             let schema = ctx.schema_or(&cli.schema);
-                            total += compact_snapshots_once(store.pool(), &schema, threshold, batch)
+                            total += compact_snapshots_once(&store, &schema, threshold, batch)
                                 .await? as u64;
                         }
                         Ok(total as u32)
@@ -1995,9 +2175,8 @@ async fn main() -> rillflow::Result<()> {
                         for ctx in sel {
                             loop {
                                 let schema = ctx.schema_or(&cli.schema);
-                                let n =
-                                    compact_snapshots_once(store.pool(), &schema, threshold, batch)
-                                        .await?;
+                                let n = compact_snapshots_once(&store, &schema, threshold, batch)
+                                    .await?;
                                 if n == 0 {
                                     break;
                                 }
@@ -2014,33 +2193,63 @@ async fn main() -> rillflow::Result<()> {
                     .map(|t| tenant_helper.require_schema(t))
                     .transpose()?;
                 let schema = schema.as_deref().unwrap_or(&cli.schema);
-                let candidates: i64 = sqlx::query_scalar(
-                    r#"
-                     select count(1) from (
-                       select e.stream_id
-                         from events e
-                         left join snapshots s on s.stream_id = e.stream_id
-                        group by e.stream_id, s.version
-                       having max(e.stream_seq) - coalesce(s.version, 0) >= $1
-                     ) t
-                     "#,
-                )
-                .bind(threshold)
-                .fetch_one(store.pool())
-                .await?;
+                let use_partitioned =
+                    matches!(store.archive_backend(), ArchiveBackend::Partitioned);
+                let include_cold = if use_partitioned {
+                    store.include_archived_by_default()
+                } else {
+                    store.include_archived_by_default()
+                        && matches!(store.archive_backend(), ArchiveBackend::DualTable)
+                };
 
-                let max_gap: Option<i32> = sqlx::query_scalar(
-                    r#"
-                     select max(max_seq - coalesce(s.version, 0)) as gap from (
-                       select e.stream_id, max(e.stream_seq) as max_seq
-                         from events e
-                        group by e.stream_id
-                     ) h
-                     left join snapshots s on s.stream_id = h.stream_id
-                     "#,
-                )
-                .fetch_one(store.pool())
-                .await?;
+                let mut tx = store.pool().begin().await?;
+                let set_search_path = format!("set local search_path to {}", quote_ident(schema));
+                sqlx::query(&set_search_path).execute(&mut *tx).await?;
+
+                let mut qb_candidates = QueryBuilder::<Postgres>::new(
+                    "with combined as (select stream_id, stream_seq from events e where 1=1",
+                );
+                if use_partitioned {
+                    if !include_cold {
+                        qb_candidates.push(" and e.retention_class = 'hot'");
+                    }
+                } else if include_cold {
+                    qb_candidates.push(
+                        " union all select stream_id, stream_seq from events_archive ea where 1=1",
+                    );
+                }
+                qb_candidates.push(
+                    ") select count(1) from (select c.stream_id from combined c left join snapshots s on s.stream_id = c.stream_id",
+                );
+                qb_candidates.push(
+                    " group by c.stream_id, s.version having max(c.stream_seq) - coalesce(s.version, 0) >= ",
+                );
+                qb_candidates.push_bind(threshold);
+                qb_candidates.push(") as candidates");
+
+                let candidates: i64 = qb_candidates
+                    .build_query_scalar()
+                    .fetch_one(&mut *tx)
+                    .await?;
+
+                let mut qb_gap = QueryBuilder::<Postgres>::new(
+                    "with combined as (select stream_id, stream_seq from events e where 1=1",
+                );
+                if use_partitioned {
+                    if !include_cold {
+                        qb_gap.push(" and e.retention_class = 'hot'");
+                    }
+                } else if include_cold {
+                    qb_gap.push(
+                        " union all select stream_id, stream_seq from events_archive ea where 1=1",
+                    );
+                }
+                qb_gap.push(
+                    ") select max(h.max_seq - coalesce(s.version, 0)) as gap from (select c.stream_id, max(c.stream_seq) as max_seq from combined c group by c.stream_id) h left join snapshots s on s.stream_id = h.stream_id",
+                );
+
+                let max_gap: Option<i32> = qb_gap.build_query_scalar().fetch_one(&mut *tx).await?;
+                tx.commit().await?;
 
                 println!(
                     "schema={} threshold={} candidates={} max_gap={}",
@@ -2227,29 +2436,44 @@ async fn serve_health(
 }
 
 async fn compact_snapshots_once(
-    pool: &sqlx::PgPool,
+    store: &Store,
     schema: &str,
     threshold: i32,
     batch: i64,
 ) -> rillflow::Result<u32> {
     let set_search_path = format!("set local search_path to {}", quote_ident(schema));
-    let mut tx = pool.begin().await?;
+    let use_partitioned = matches!(store.archive_backend(), ArchiveBackend::Partitioned);
+    let include_cold = if use_partitioned {
+        store.include_archived_by_default()
+    } else {
+        store.include_archived_by_default()
+            && matches!(store.archive_backend(), ArchiveBackend::DualTable)
+    };
+
+    let mut tx = store.pool().begin().await?;
     sqlx::query(&set_search_path).execute(&mut *tx).await?;
-    let rows: Vec<(uuid::Uuid, i32)> = sqlx::query_as(
-        r#"
-        select e.stream_id,
-               max(e.stream_seq) as head
-          from events e
-          left join snapshots s on s.stream_id = e.stream_id
-         group by e.stream_id, s.version
-        having max(e.stream_seq) - coalesce(s.version, 0) >= $1
-         limit $2
-        "#,
-    )
-    .bind(threshold)
-    .bind(batch)
-    .fetch_all(&mut *tx)
-    .await?;
+    #[allow(clippy::type_complexity)]
+    let mut qb = QueryBuilder::<Postgres>::new(
+        "with combined as (select stream_id, stream_seq from events e where 1=1",
+    );
+    if use_partitioned {
+        if !include_cold {
+            qb.push(" and e.retention_class = 'hot'");
+        }
+    } else if include_cold {
+        qb.push(" union all select stream_id, stream_seq from events_archive ea where 1=1");
+    }
+    qb.push(
+        ") select c.stream_id, max(c.stream_seq) as head from combined c left join snapshots s on s.stream_id = c.stream_id",
+    );
+    qb.push(
+        " group by c.stream_id, s.version having max(c.stream_seq) - coalesce(s.version, 0) >= ",
+    );
+    qb.push_bind(threshold);
+    qb.push(" order by head desc limit ");
+    qb.push_bind(batch);
+
+    let rows: Vec<(uuid::Uuid, i32)> = qb.build_query_as().fetch_all(&mut *tx).await?;
 
     if rows.is_empty() {
         tx.commit().await?;
@@ -2269,6 +2493,487 @@ async fn compact_snapshots_once(
     }
     tx.commit().await?;
     Ok(rows.len() as u32)
+}
+
+async fn archive_status(store: &Store, schema: &str, tenant: Option<&str>) -> rillflow::Result<()> {
+    let mut tx = store.pool().begin().await?;
+    set_search_path(&mut tx, schema).await?;
+
+    let counts_res =
+        sqlx::query("select retention_class, count(*) from rf_streams group by retention_class")
+            .fetch_all(&mut *tx)
+            .await;
+
+    let counts = match counts_res {
+        Ok(rows) => rows,
+        Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("42P01") => {
+            println!(
+                "[schema={}] rf_streams not found (run migration sql/0003_event_archiving.sql)",
+                schema
+            );
+            tx.rollback().await.ok();
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
+
+    let mut archived = 0i64;
+    let mut hot = 0i64;
+    for row in counts {
+        let class: String = row.get(0);
+        let count: i64 = row.get(1);
+        match class.as_str() {
+            "cold" => archived += count,
+            _ => hot += count,
+        }
+    }
+
+    let tenant_label = tenant.unwrap_or("<all>");
+    println!(
+        "Archive status (schema={}, tenant={}):",
+        schema, tenant_label
+    );
+    println!("  hot streams   : {}", hot);
+    println!("  cold streams  : {}", archived);
+
+    let escaped_schema = schema.replace('"', "\"\"");
+    let hot_rel = format!("\"{}\".\"events\"", escaped_schema);
+    let cold_rel = format!("\"{}\".\"events_archive\"", escaped_schema);
+    let use_partitioned = matches!(store.archive_backend(), ArchiveBackend::Partitioned);
+
+    let hot_bytes: i64 =
+        sqlx::query_scalar("select coalesce(pg_total_relation_size($1::regclass), 0)")
+            .bind(&hot_rel)
+            .fetch_one(store.pool())
+            .await
+            .unwrap_or(0);
+
+    let cold_bytes: i64 = if use_partitioned {
+        0
+    } else {
+        sqlx::query_scalar("select coalesce(pg_total_relation_size($1::regclass), 0)")
+            .bind(&cold_rel)
+            .fetch_one(store.pool())
+            .await
+            .unwrap_or(0)
+    };
+
+    println!("  events bytes  : {} B", hot_bytes);
+    println!("  archive bytes : {} B", cold_bytes);
+
+    let redirect = store.archive_redirect_enabled().await.unwrap_or(false);
+    println!(
+        "  redirect      : {}",
+        if redirect { "enabled" } else { "disabled" }
+    );
+    set_archive_hot_bytes(hot_bytes as u64);
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn archive_mark(
+    store: &Store,
+    schema: &str,
+    tenant: Option<&str>,
+    stream_ref: &str,
+    reason: Option<String>,
+    by: Option<String>,
+) -> rillflow::Result<()> {
+    let stream_id = resolve_stream_id(store, stream_ref).await?;
+    let actor = by
+        .or_else(|| std::env::var("USER").ok())
+        .unwrap_or_else(|| "unknown".to_string());
+    let reason = reason.unwrap_or_else(|| "manual mark".to_string());
+    let retention = "cold";
+    let actor_clone = actor.clone();
+    let reason_clone = reason.clone();
+    let mut tx = store.pool().begin().await?;
+    set_search_path(&mut tx, schema).await?;
+    sqlx::query(
+        "insert into rf_streams (stream_id, tenant_id, archived_at, archived_by, archive_reason, retention_class)\
+         values ($1,$2,$3,$4,$5,$6)\
+         on conflict (stream_id) do update set archived_at = EXCLUDED.archived_at, archived_by = EXCLUDED.archived_by, archive_reason = EXCLUDED.archive_reason, retention_class = EXCLUDED.retention_class, updated_at = now()",
+    )
+    .bind(stream_id)
+    .bind(tenant)
+    .bind(Some(Utc::now()))
+    .bind(&actor_clone)
+    .bind(&reason_clone)
+    .bind(retention)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    info!(
+        stream_id = %stream_id,
+        tenant = tenant.unwrap_or("<default>"),
+        archived_by = %actor_clone,
+        reason = %reason_clone,
+        "stream marked archived"
+    );
+    record_archive_mark(tenant);
+    println!("stream {} marked as archived ({})", stream_id, retention);
+    Ok(())
+}
+
+async fn archive_reactivate(
+    store: &Store,
+    schema: &str,
+    tenant: Option<&str>,
+    stream_ref: &str,
+) -> rillflow::Result<()> {
+    let stream_id = resolve_stream_id(store, stream_ref).await?;
+    let mut tx = store.pool().begin().await?;
+    set_search_path(&mut tx, schema).await?;
+    sqlx::query(
+        "insert into rf_streams (stream_id, tenant_id, archived_at, archived_by, archive_reason, retention_class)\
+         values ($1,$2,NULL,NULL,NULL,'hot')\
+         on conflict (stream_id) do update set archived_at = NULL, archived_by = NULL, archive_reason = NULL, retention_class = 'hot', updated_at = now()",
+    )
+    .bind(stream_id)
+    .bind(tenant)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    info!(stream_id = %stream_id, tenant = tenant.unwrap_or("<default>"), "stream reactivated");
+    record_archive_reactivate(tenant);
+    println!("stream {} reactivated", stream_id);
+    Ok(())
+}
+
+async fn archive_move(
+    store: &Store,
+    schema: &str,
+    tenant: Option<&str>,
+    stream_ref: Option<&str>,
+    before: chrono::DateTime<chrono::Utc>,
+    batch_size: i64,
+    dry_run: bool,
+) -> rillflow::Result<()> {
+    let tenant_column = match store.tenant_strategy() {
+        TenantStrategy::Conjoined { ref column } => {
+            if tenant.is_none() {
+                return Err(rillflow::Error::TenantRequired);
+            }
+            Some(column.name.clone())
+        }
+        _ => None,
+    };
+
+    let tenant_col_ref = tenant_column.as_deref();
+
+    if let Some(stream) = stream_ref {
+        process_stream_move(
+            store,
+            schema,
+            tenant,
+            tenant_col_ref,
+            stream,
+            before,
+            dry_run,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let mut total_streams = 0u64;
+    let mut total_events = 0u64;
+    let started = Instant::now();
+
+    loop {
+        let candidates =
+            fetch_candidate_streams(store, schema, tenant, tenant_col_ref, before, batch_size)
+                .await?;
+        if candidates.is_empty() {
+            break;
+        }
+
+        for stream_id in candidates {
+            if dry_run {
+                let count = count_events(
+                    store,
+                    schema,
+                    tenant,
+                    tenant_col_ref,
+                    stream_id,
+                    Some(before),
+                )
+                .await?;
+                if count > 0 {
+                    println!(
+                        "[dry-run] stream {} has {} event(s) before {}",
+                        stream_id, count, before
+                    );
+                }
+                continue;
+            }
+
+            let mut events = store.events();
+            if let Some(t) = tenant {
+                events = events.with_tenant(t.to_string());
+            }
+
+            let moved = events.archive_stream_before(stream_id, before).await? as u64;
+            if moved > 0 {
+                total_streams += 1;
+                total_events += moved;
+
+                let remaining =
+                    count_events(store, schema, tenant, tenant_col_ref, stream_id, None).await?;
+                if remaining == 0 {
+                    upsert_stream_metadata(
+                        store,
+                        schema,
+                        tenant,
+                        stream_id,
+                        Some(Utc::now()),
+                        Some("archive_move"),
+                        Some("auto"),
+                        "cold",
+                    )
+                    .await?;
+                }
+                record_archive_moved(tenant, moved);
+                info!(
+                    stream_id = %stream_id,
+                    tenant = tenant.unwrap_or("<default>"),
+                    moved_events = moved,
+                    before = %before,
+                    "archive move batch"
+                );
+            }
+        }
+    }
+
+    if dry_run {
+        println!("dry-run complete");
+    } else {
+        println!(
+            "moved {} event(s) across {} stream(s)",
+            total_events, total_streams
+        );
+        info!(
+            tenant = tenant.unwrap_or("<default>"),
+            events = total_events,
+            streams = total_streams,
+            "archive move complete"
+        );
+        record_archive_move(started.elapsed());
+    }
+    Ok(())
+}
+
+async fn archive_partition_create(
+    store: &Store,
+    schema: &str,
+    retention: ArchiveRetention,
+    month: NaiveDate,
+) -> rillflow::Result<()> {
+    if !matches!(store.archive_backend(), ArchiveBackend::Partitioned) {
+        return Err(rillflow::Error::QueryError {
+            query: "archive partition".into(),
+            context: "ArchiveBackend::Partitioned required".into(),
+        });
+    }
+    if month.day() != 1 {
+        return Err(rillflow::Error::QueryError {
+            query: "archive partition".into(),
+            context: "--month must use the first day (YYYY-MM-01)".into(),
+        });
+    }
+    let next = if month.month() == 12 {
+        NaiveDate::from_ymd_opt(month.year() + 1, 1, 1)
+    } else {
+        NaiveDate::from_ymd_opt(month.year(), month.month() + 1, 1)
+    }
+    .expect("valid month rollover");
+
+    let partition = format!("events_{}_{}", retention.as_str(), month.format("%Y_%m"));
+    let parent = match retention {
+        ArchiveRetention::Hot => "events_hot",
+        ArchiveRetention::Cold => "events_cold",
+    };
+
+    let mut tx = store.pool().begin().await?;
+    set_search_path(&mut tx, schema).await?;
+    let stmt = format!(
+        "do $$\nbegin\n    if to_regclass('{partition}') is null then\n        execute 'create table {partition} partition of {parent} for values from (''{start}'') to (''{end}'')';\n    end if;\nend;\n$$;",
+        partition = partition,
+        parent = parent,
+        start = month.format("%Y-%m-%d"),
+        end = next.format("%Y-%m-%d"),
+    );
+    sqlx::query(&stmt).execute(&mut *tx).await?;
+    tx.commit().await?;
+    println!(
+        "partition {} covers [{} , {} )",
+        partition,
+        month.format("%Y-%m-%d"),
+        next.format("%Y-%m-%d")
+    );
+    Ok(())
+}
+
+async fn fetch_candidate_streams(
+    store: &Store,
+    schema: &str,
+    tenant: Option<&str>,
+    tenant_column: Option<&str>,
+    before: chrono::DateTime<chrono::Utc>,
+    limit: i64,
+) -> rillflow::Result<Vec<Uuid>> {
+    let mut tx = store.pool().begin().await?;
+    set_search_path(&mut tx, schema).await?;
+    let use_partitioned = matches!(store.archive_backend(), ArchiveBackend::Partitioned);
+    let mut qb =
+        QueryBuilder::<Postgres>::new("select distinct stream_id from events where created_at < ");
+    qb.push_bind(before);
+    if let (Some(col), Some(val)) = (tenant_column, tenant) {
+        qb.push(" and ");
+        qb.push(schema::quote_ident(col));
+        qb.push(" = ");
+        qb.push_bind(val);
+    }
+    if use_partitioned {
+        qb.push(" and retention_class = 'hot'");
+    }
+    qb.push(" order by stream_id asc limit ");
+    qb.push_bind(limit);
+    let ids = qb.build_query_scalar::<Uuid>().fetch_all(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(ids)
+}
+
+async fn process_stream_move(
+    store: &Store,
+    schema: &str,
+    tenant: Option<&str>,
+    tenant_column: Option<&str>,
+    stream: &str,
+    before: chrono::DateTime<chrono::Utc>,
+    dry_run: bool,
+) -> rillflow::Result<()> {
+    let stream_id = resolve_stream_id(store, stream).await?;
+    if dry_run {
+        let count = count_events(
+            store,
+            schema,
+            tenant,
+            tenant_column,
+            stream_id,
+            Some(before),
+        )
+        .await?;
+        println!(
+            "[dry-run] stream {} would move {} event(s) before {}",
+            stream_id, count, before
+        );
+        return Ok(());
+    }
+
+    let mut events = store.events();
+    if let Some(t) = tenant {
+        events = events.with_tenant(t.to_string());
+    }
+    let moved = events.archive_stream_before(stream_id, before).await?;
+    println!(
+        "stream {} moved {} event(s) before {}",
+        stream_id, moved, before
+    );
+
+    let remaining = count_events(store, schema, tenant, tenant_column, stream_id, None).await?;
+    if remaining == 0 {
+        upsert_stream_metadata(
+            store,
+            schema,
+            tenant,
+            stream_id,
+            Some(Utc::now()),
+            Some("archive_move"),
+            Some("auto"),
+            "cold",
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn count_events(
+    store: &Store,
+    schema: &str,
+    tenant: Option<&str>,
+    tenant_column: Option<&str>,
+    stream_id: Uuid,
+    before: Option<chrono::DateTime<chrono::Utc>>,
+) -> rillflow::Result<i64> {
+    let mut tx = store.pool().begin().await?;
+    set_search_path(&mut tx, schema).await?;
+    let mut qb = QueryBuilder::<Postgres>::new("select count(*) from events where stream_id = ");
+    qb.push_bind(stream_id);
+    if let (Some(col), Some(val)) = (tenant_column, tenant) {
+        qb.push(" and ");
+        qb.push(schema::quote_ident(col));
+        qb.push(" = ");
+        qb.push_bind(val);
+    }
+    if matches!(store.archive_backend(), ArchiveBackend::Partitioned) {
+        if let Some(before) = before {
+            qb.push(" and created_at < ");
+            qb.push_bind(before);
+        }
+        qb.push(" and retention_class = 'hot'");
+    } else if let Some(before) = before {
+        qb.push(" and created_at < ");
+        qb.push_bind(before);
+    }
+    let count = qb.build_query_scalar::<i64>().fetch_one(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(count)
+}
+
+async fn upsert_stream_metadata(
+    store: &Store,
+    schema: &str,
+    tenant: Option<&str>,
+    stream_id: Uuid,
+    archived_at: Option<chrono::DateTime<chrono::Utc>>,
+    archived_by: Option<&str>,
+    archive_reason: Option<&str>,
+    retention_class: &str,
+) -> rillflow::Result<()> {
+    let mut tx = store.pool().begin().await?;
+    set_search_path(&mut tx, schema).await?;
+    sqlx::query(
+        "insert into rf_streams (stream_id, tenant_id, archived_at, archived_by, archive_reason, retention_class)\
+         values ($1,$2,$3,$4,$5,$6)\
+         on conflict (stream_id) do update set archived_at = EXCLUDED.archived_at, archived_by = EXCLUDED.archived_by, archive_reason = EXCLUDED.archive_reason, retention_class = EXCLUDED.retention_class, updated_at = now()",
+    )
+    .bind(stream_id)
+    .bind(tenant)
+    .bind(archived_at)
+    .bind(archived_by)
+    .bind(archive_reason)
+    .bind(retention_class)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn set_search_path<'a>(
+    exec: &mut (impl Executor<'a, Database = Postgres>),
+    schema: &str,
+) -> rillflow::Result<()> {
+    let stmt = format!("set local search_path to {}", quote_ident(schema));
+    sqlx::query(&stmt).execute(exec).await?;
+    Ok(())
+}
+
+async fn resolve_stream_id(store: &Store, input: &str) -> rillflow::Result<Uuid> {
+    if let Ok(id) = Uuid::parse_str(input) {
+        Ok(id)
+    } else {
+        store.resolve_stream_alias(input).await
+    }
 }
 
 fn quote_ident(value: &str) -> String {
@@ -2373,11 +3078,19 @@ impl TenantHelper {
         }
     }
 
-    fn subscriptions(&self, pool: PgPool) -> Subscriptions {
-        let mut subs = Subscriptions::new(pool);
-        subs.tenant_strategy = self.strategy.clone();
-        subs.tenant_resolver = self.resolver.clone();
-        subs
+    fn subscriptions(
+        &self,
+        pool: PgPool,
+        backend: ArchiveBackend,
+        include_archived: bool,
+    ) -> Subscriptions {
+        Subscriptions::new_with_strategy(
+            pool,
+            self.strategy.clone(),
+            self.resolver.clone(),
+            backend,
+            include_archived,
+        )
     }
 
     fn select_single<'a>(

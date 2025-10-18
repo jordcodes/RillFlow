@@ -34,8 +34,7 @@ async fn put_get_update_soft_delete_restore() -> Result<()> {
     let store = Store::builder(&url)
         .session_defaults(AppendOptions {
             headers: Some(json!({"source": "test"})),
-            causation_id: None,
-            correlation_id: None,
+            ..AppendOptions::default()
         })
         .session_advisory_locks(true)
         .build()
@@ -122,8 +121,7 @@ async fn session_load_store_delete_roundtrip() -> Result<()> {
     let store = Store::builder(&url)
         .session_defaults(AppendOptions {
             headers: Some(json!({"source": "test"})),
-            causation_id: None,
-            correlation_id: None,
+            ..AppendOptions::default()
         })
         .session_advisory_locks(true)
         .build()
@@ -269,8 +267,7 @@ async fn session_aggregate_commit_and_snapshot() -> Result<()> {
     let store = Store::builder(&url)
         .session_defaults(AppendOptions {
             headers: Some(json!({"source": "test"})),
-            causation_id: None,
-            correlation_id: None,
+            ..AppendOptions::default()
         })
         .session_advisory_locks(true)
         .build()

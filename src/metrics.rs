@@ -27,6 +27,14 @@ pub struct Metrics {
     pub event_appends_total: AtomicU64,
     pub event_conflicts_total: AtomicU64,
 
+    // Archive
+    pub archive_streams_marked_total: AtomicU64,
+    pub archive_streams_reactivated_total: AtomicU64,
+    pub archive_events_moved_total: AtomicU64,
+    pub archive_move_batches_total: AtomicU64,
+    pub archive_move_duration_ms_total: AtomicU64,
+    pub archive_events_hot_bytes_gauge: AtomicU64,
+
     // Pool
     pub pool_total_gauge: AtomicU64,
     pub pool_active_gauge: AtomicU64,
@@ -49,6 +57,12 @@ impl Default for Metrics {
             pool_total_gauge: AtomicU64::new(0),
             pool_active_gauge: AtomicU64::new(0),
             pool_idle_gauge: AtomicU64::new(0),
+            archive_streams_marked_total: AtomicU64::new(0),
+            archive_streams_reactivated_total: AtomicU64::new(0),
+            archive_events_moved_total: AtomicU64::new(0),
+            archive_move_batches_total: AtomicU64::new(0),
+            archive_move_duration_ms_total: AtomicU64::new(0),
+            archive_events_hot_bytes_gauge: AtomicU64::new(0),
         }
     }
 }
@@ -79,6 +93,9 @@ struct TenantCounters {
     pool_total_gauge: u64,
     pool_active_gauge: u64,
     pool_idle_gauge: u64,
+    archive_streams_marked_total: u64,
+    archive_streams_reactivated_total: u64,
+    archive_events_moved_total: u64,
 }
 
 #[derive(Clone)]
@@ -149,6 +166,10 @@ fn snapshot_tenant_metrics() -> Vec<(String, TenantCounters)> {
                 .collect()
         }
     }
+}
+
+fn zero_u64(_: &TenantCounters) -> u64 {
+    0
 }
 
 fn node_metrics_map() -> &'static Mutex<HashMap<(String, String), DaemonNodeMetric>> {
@@ -367,6 +388,52 @@ pub fn record_event_conflict(tenant: Option<&str>) {
     }
 }
 
+pub fn record_archive_mark(tenant: Option<&str>) {
+    metrics()
+        .archive_streams_marked_total
+        .fetch_add(1, Ordering::Relaxed);
+    if let Some(t) = tenant {
+        update_tenant_metrics(t, |c| c.archive_streams_marked_total += 1);
+    }
+}
+
+pub fn record_archive_reactivate(tenant: Option<&str>) {
+    metrics()
+        .archive_streams_reactivated_total
+        .fetch_add(1, Ordering::Relaxed);
+    if let Some(t) = tenant {
+        update_tenant_metrics(t, |c| c.archive_streams_reactivated_total += 1);
+    }
+}
+
+pub fn record_archive_moved(tenant: Option<&str>, count: u64) {
+    if count == 0 {
+        return;
+    }
+    metrics()
+        .archive_events_moved_total
+        .fetch_add(count, Ordering::Relaxed);
+    if let Some(t) = tenant {
+        update_tenant_metrics(t, |c| c.archive_events_moved_total += count);
+    }
+}
+
+pub fn record_archive_move(duration: Duration) {
+    let millis = (duration.as_millis()).min(u128::from(u64::MAX)) as u64;
+    metrics()
+        .archive_move_batches_total
+        .fetch_add(1, Ordering::Relaxed);
+    metrics()
+        .archive_move_duration_ms_total
+        .fetch_add(millis, Ordering::Relaxed);
+}
+
+pub fn set_archive_hot_bytes(bytes: u64) {
+    metrics()
+        .archive_events_hot_bytes_gauge
+        .store(bytes, Ordering::Relaxed);
+}
+
 pub fn record_pool_gauges(total: u64, active: u64, idle: u64) {
     metrics().pool_total_gauge.store(total, Ordering::Relaxed);
     metrics().pool_active_gauge.store(active, Ordering::Relaxed);
@@ -503,6 +570,48 @@ pub fn render_prometheus() -> String {
         &tenants,
         |c| c.event_conflicts_total,
     );
+    write_metric(
+        &mut s,
+        "archive_streams_marked_total",
+        "counter",
+        m.archive_streams_marked_total.load(Ordering::Relaxed),
+        &tenants,
+        |c| c.archive_streams_marked_total,
+    );
+    write_metric(
+        &mut s,
+        "archive_streams_reactivated_total",
+        "counter",
+        m.archive_streams_reactivated_total.load(Ordering::Relaxed),
+        &tenants,
+        |c| c.archive_streams_reactivated_total,
+    );
+    write_metric(
+        &mut s,
+        "archive_events_moved_total",
+        "counter",
+        m.archive_events_moved_total.load(Ordering::Relaxed),
+        &tenants,
+        |c| c.archive_events_moved_total,
+    );
+    write_metric(
+        &mut s,
+        "archive_move_batches_total",
+        "counter",
+        m.archive_move_batches_total.load(Ordering::Relaxed),
+        &tenants,
+        zero_u64,
+    );
+    let duration_ms = m.archive_move_duration_ms_total.load(Ordering::Relaxed);
+    let _ = writeln!(s, "# TYPE archive_move_duration_seconds counter");
+    let _ = writeln!(
+        s,
+        "archive_move_duration_seconds {:.3}",
+        (duration_ms as f64) / 1000.0
+    );
+    let hot_bytes = m.archive_events_hot_bytes_gauge.load(Ordering::Relaxed);
+    let _ = writeln!(s, "# TYPE archive_events_hot_bytes gauge");
+    let _ = writeln!(s, "archive_events_hot_bytes {}", hot_bytes);
     write_gauge(
         &mut s,
         "pool_total_gauge",

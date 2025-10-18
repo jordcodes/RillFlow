@@ -42,8 +42,7 @@ async fn main() -> rillflow::Result<()> {
     let store = Store::builder(&url)
         .session_defaults(AppendOptions {
             headers: Some(json!({"source": "session-example"})),
-            causation_id: None,
-            correlation_id: None,
+            ..AppendOptions::default()
         })
         .session_context(
             SessionContext::builder()
